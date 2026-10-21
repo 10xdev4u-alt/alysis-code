@@ -13,6 +13,8 @@
   with no cloud environment variables, before publishing Python packages.
 - Refresh the sandbox's pinned certificate, curl, and Go security updates on
   both supported architectures, with native image scans and smoke checks.
+- Require patched Certifi and Pillow releases and refresh their locked versions
+  so new and upgraded installations receive the current security fixes.
 
 ## 0.15.1 - 2026-10-15
 
