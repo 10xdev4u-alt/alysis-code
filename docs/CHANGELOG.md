@@ -11,6 +11,8 @@
 - Clarify PowerShell, WSL, pipx prerequisites, and the account sign-in steps.
 - Require a complete simulated device login from the installed release wheel,
   with no cloud environment variables, before publishing Python packages.
+- Refresh the sandbox's pinned certificate, curl, and Go security updates on
+  both supported architectures, with native image scans and smoke checks.
 
 ## 0.15.1 - 2026-10-15
 
