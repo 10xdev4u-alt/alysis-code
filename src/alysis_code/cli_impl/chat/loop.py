@@ -10,10 +10,16 @@ from typing import Any
 
 import typer
 
+from ...agent.steering import ResolvedOperation
+from ...agent.task_evidence import clear_conversation_evidence
+from ...agent.turn.subagent_progress import render_subagent_lifecycle_capsule
 from ...branding import env_get
+from ...cancellation import InteractiveCancellationToken
 from ...compaction.conversation_compactor import CompactionState
 from ...error_text import sanitize_error_text_for_output
 from ...failure_category import exit_code_for_failure
+from ...llm.provider_limits import provider_attempt_counts
+from ...mcp.errors import McpError
 from ...personas import (
     DEFAULT_PERSONA,
     get_persona,
@@ -25,10 +31,13 @@ from ...personas import (
     persona_overlay_user_messages,
     resolve_persona_exec_mode,
 )
+from ...profiles import apply_runtime_base_url_override
 from ...run_outcome import INFRASTRUCTURE_FAILURE_EXIT_CODE
 from ...runtime_kind import RuntimeKind
 from ...surface.console import safe_plain_error
-from .state import _ChatExecutionRequest, _ChatPlanModeState, _ForgeChatState
+from ..commands._shared import Mode
+from .forge_visibility import forge_session_active
+from .state import _ChatExecutionRequest, _ForgeChatState
 
 _PROTECTED_GLOBAL_NAMES: set[str] = set()
 _PATCHABLE_DEPENDENCY_GLOBAL_NAMES: set[str] = {
@@ -46,6 +55,7 @@ _PATCHABLE_DEPENDENCY_GLOBAL_NAMES: set[str] = {
     "paste_clipboard_image",
     "typer",
 }
+_CHAT_PERMISSION_MODES = frozenset(mode.value for mode in Mode)
 
 
 def _sync_cli_globals(cli_mod: Any) -> None:
@@ -156,6 +166,8 @@ def _sync_tui_session_state(
 ) -> None:
     if include_exec_mode:
         tui_state.exec_mode = str(getattr(session, "mode", "") or "").strip()
+        if hasattr(tui_state, "pending_exec_mode"):
+            tui_state.pending_exec_mode = _pending_chat_permissions(session) or ""
         # A persona model swap changes the live client, not cfg.model — the
         # footer should show what will actually answer.
         live_model = str(getattr(getattr(session, "client", None), "model", "") or "")
@@ -204,205 +216,6 @@ def _resolve_forge_entry_root(*, session: Any, fallback_root: Path) -> Path:
     if session_root is None:
         return Path(fallback_root).resolve()
     return Path(resolve_session_active_workdir_path(session)).resolve()
-
-
-def _chat_plan_usage_lines() -> tuple[str, ...]:
-    return (
-        "[yellow]Usage:[/yellow] /plan <task>   default draft/review/approve flow; can execute after approval",
-        "                 /plan mode     secondary persistent readonly planning overlay",
-        "                 /plan approve  only inside Plan Mode; executes the stored draft",
-        "                 /plan off",
-        "                 /plan status",
-        "[dim]Compatibility:[/dim] /plan draft <task>, /plan readonly, /plan on",
-    )
-
-
-def _chat_plan_already_on_message(*, plan_mode_escape_supported: bool) -> str:
-    if plan_mode_escape_supported:
-        return "Plan Mode already on. Press Esc at an empty prompt or use /plan off to leave."
-    return "Plan Mode already on. Use /plan off to leave."
-
-
-def _chat_plan_draft_blocked_by_mode_lines(*, plan_mode_escape_supported: bool) -> tuple[str, ...]:
-    lines = [
-        "Cannot start /plan while Plan Mode is on.",
-        "Use /plan off first, then use /plan <task> for the default draft/review/approve flow.",
-    ]
-    if plan_mode_escape_supported:
-        lines.append("Press Esc at an empty prompt to leave interactively.")
-    return tuple(lines)
-
-
-def _chat_plan_readonly_mode_guidance_lines() -> tuple[str, ...]:
-    return (
-        "Cannot start /plan in Read-Only mode.",
-        "Switch to /mode review, /mode auto, or /mode fullaccess, then use /plan <task> for the default draft/review/approve flow.",
-        "Use /plan mode only when you explicitly want persistent readonly planning.",
-    )
-
-
-_PLAN_MODE_EXECUTE_NOW_RE = re.compile(
-    r"^(?:(?:ok(?:ay)?|yes|yeah|yep|sure|please)\s+)?"
-    r"(?:do it|go ahead|go for it|implement(?: it)?|execute(?: it)?|"
-    r"start(?: implementing| coding)?|proceed|run it|apply it|ship it)"
-    r"(?:\s+(?:now|then|please))?$",
-    re.IGNORECASE,
-)
-_PLAN_MODE_NUMBERED_STEP_RE = re.compile(r"^\s{0,3}\d+[.)]\s+\S")
-_PLAN_MODE_TASK_PREVIEW_CHARS = 96
-
-
-def _chat_plan_mode_latest_task(plan_mode_state: Any) -> str | None:
-    task = getattr(plan_mode_state, "latest_task", None)
-    clean = str(task or "").strip()
-    return clean or None
-
-
-def _chat_plan_mode_latest_draft(plan_mode_state: Any) -> str | None:
-    draft = getattr(plan_mode_state, "latest_draft", None)
-    clean = str(draft or "").strip()
-    return clean or None
-
-
-def _clear_chat_plan_mode_draft_state(plan_mode_state: Any) -> None:
-    if hasattr(plan_mode_state, "latest_task"):
-        plan_mode_state.latest_task = None
-    if hasattr(plan_mode_state, "latest_draft"):
-        plan_mode_state.latest_draft = None
-
-
-def _store_chat_plan_mode_draft_state(
-    plan_mode_state: Any,
-    *,
-    user_message: str,
-    draft: str,
-) -> bool:
-    task = str(user_message or "").strip()
-    clean_draft = str(draft or "").strip()
-    previous_task = _chat_plan_mode_latest_task(plan_mode_state)
-    previous_draft = _chat_plan_mode_latest_draft(plan_mode_state)
-    if hasattr(plan_mode_state, "latest_task"):
-        plan_mode_state.latest_task = task or None
-    if hasattr(plan_mode_state, "latest_draft"):
-        plan_mode_state.latest_draft = clean_draft or None
-    return previous_task != (task or None) or previous_draft != (clean_draft or None)
-
-
-def _chat_plan_task_preview(task: str | None) -> str:
-    clean = re.sub(r"\s+", " ", str(task or "").strip())
-    if len(clean) <= _PLAN_MODE_TASK_PREVIEW_CHARS:
-        return clean
-    return clean[: _PLAN_MODE_TASK_PREVIEW_CHARS - 3].rstrip() + "..."
-
-
-def _looks_like_actionable_plan_mode_draft(text: str) -> bool:
-    clean = str(text or "").strip()
-    if not clean:
-        return False
-    steps = sum(1 for line in clean.splitlines() if _PLAN_MODE_NUMBERED_STEP_RE.match(line.strip()))
-    return steps >= 2
-
-
-def _latest_assistant_text_since(session: Any, *, start_index: int = 0) -> str | None:
-    messages = getattr(session, "messages", None)
-    if not isinstance(messages, list):
-        return None
-    start = max(int(start_index or 0), 0)
-    for entry in reversed(messages[start:]):
-        if not isinstance(entry, dict):
-            continue
-        role = str(entry.get("role") or "").strip().lower()
-        if role != "assistant":
-            continue
-        text = str(entry.get("content") or "").strip()
-        if text:
-            return text
-    return None
-
-
-def _plan_mode_no_stored_draft_lines() -> tuple[str, ...]:
-    return (
-        "No stored actionable Plan Mode draft is available yet.",
-        "Send the concrete implementation request as a normal chat message first.",
-        "/plan <task> remains the default draft/review/approve path outside Plan Mode.",
-        "Once the host captures a numbered draft, use exact /plan approve to execute it or /plan off to leave.",
-    )
-
-
-def _plan_mode_readonly_origin_lines() -> tuple[str, ...]:
-    return (
-        "This Plan Mode overlay was entered from plain Read-Only mode.",
-        "Exact /plan approve cannot execute into a readonly session.",
-        "Use /plan off to leave the overlay, then switch to /mode review, /mode auto, or /mode fullaccess and use /plan <task> for execution.",
-    )
-
-
-def _plan_mode_entry_guidance_lines(
-    *,
-    restore_mode: str,
-) -> tuple[str, ...]:
-    if restore_mode == "readonly":
-        return (
-            "Plan Mode is a persistent readonly planning overlay. It does not execute by itself.",
-            "If you want readonly planning here, send the concrete implementation task as a normal chat message.",
-            "For the default draft/review/approve flow, use /plan off, switch to /mode review, /mode auto, or /mode fullaccess, then use /plan <task>.",
-        )
-    return (
-        "Plan Mode is a persistent readonly planning overlay. It does not execute by itself.",
-        "For the default draft/review/approve flow, leave with /plan off and use /plan <task>.",
-        "If you want readonly planning here, send the concrete implementation task as a normal chat message.",
-        f"When the latest draft looks right, use exact /plan approve to leave Plan Mode, restore {_chat_mode_display(restore_mode)}, and execute it.",
-        "Use /plan off to leave without execution.",
-    )
-
-
-def _plan_mode_execute_now_guidance_lines(
-    *,
-    plan_mode_state: Any,
-    plan_mode_escape_supported: bool,
-) -> tuple[str, ...]:
-    restore_mode = _chat_plan_mode_restore_mode(plan_mode_state) or "readonly"
-    latest_draft = _chat_plan_mode_latest_draft(plan_mode_state)
-    lines = [
-        "Plan Mode is still on and stays read-only.",
-        "/plan <task> remains the default draft/review/approve path outside Plan Mode.",
-    ]
-    if latest_draft is None:
-        lines.extend(_plan_mode_no_stored_draft_lines())
-    elif restore_mode == "readonly":
-        lines.append("A latest actionable draft is already stored for this session.")
-        lines.extend(_plan_mode_readonly_origin_lines())
-    else:
-        lines.append("A latest actionable draft is already stored for this session.")
-        lines.append(
-            f"Use exact /plan approve to leave Plan Mode, restore {_chat_mode_display(restore_mode)}, and execute that draft."
-        )
-        lines.append("Use /plan off to leave without execution.")
-    if plan_mode_escape_supported:
-        lines.append("Press Esc at an empty prompt to leave interactively.")
-    return tuple(lines)
-
-
-def _is_plan_mode_execute_now_follow_up(user_message: str) -> bool:
-    normalized = re.sub(r"\s+", " ", str(user_message or "").strip())
-    if not normalized:
-        return False
-    trimmed = normalized.strip(" \t\r\n.,;:!?")
-    return bool(_PLAN_MODE_EXECUTE_NOW_RE.fullmatch(trimmed))
-
-
-def _parse_chat_plan_command(raw_plan_arg: str) -> tuple[str, str]:
-    clean = str(raw_plan_arg or "").strip()
-    if not clean:
-        return ("draft", "")
-    lowered = clean.lower()
-    if lowered in {"mode", "readonly", "on", "approve", "off", "status"}:
-        return (lowered, "")
-    if lowered == "draft":
-        return ("draft", "")
-    if lowered.startswith("draft "):
-        return ("draft", clean[6:].strip())
-    return ("draft", clean)
 
 
 def _strip_wrapping_quotes(text: str) -> str:
@@ -545,115 +358,185 @@ def _render_labeled_chat_message(*args: Any, **kwargs: Any) -> Any:
     return _rendering._render_labeled_chat_message(*args, **kwargs)
 
 
-def _render_plan_draft(*args: Any, **kwargs: Any) -> Any:
-    from . import rendering as _rendering
-
-    _rendering._sync_rendering_globals(globals())
-    return _rendering._render_plan_draft(*args, **kwargs)
-
-
-def _chat_plan_mode_enabled(plan_mode_state: Any) -> bool:
-    return bool(getattr(plan_mode_state, "enabled", False))
-
-
-def _chat_plan_mode_restore_mode(plan_mode_state: Any) -> str | None:
-    restore_mode = getattr(plan_mode_state, "restore_mode", None)
-    if restore_mode is None:
-        return None
-    normalized = str(restore_mode).strip().lower()
-    return normalized or None
-
-
-def _render_chat_plan_mode_status(*args: Any, **kwargs: Any) -> Any:
-    from . import rendering as _rendering
-
-    _rendering._sync_rendering_globals(globals())
-    return _rendering._render_chat_plan_mode_status(*args, **kwargs)
-
-
-def _disable_chat_plan_mode(
-    *,
-    session: Any,
-    console: Console,
-    plan_mode_state: Any,
-    clear_draft: bool = True,
-) -> str | None:
-    restore_mode = _chat_plan_mode_restore_mode(plan_mode_state) or "review"
-    current_mode = str(getattr(session, "mode", "review")).strip().lower() or "review"
-    previous_task = _chat_plan_mode_latest_task(plan_mode_state)
-    previous_draft = _chat_plan_mode_latest_draft(plan_mode_state)
-    plan_mode_state.enabled = False
-    plan_mode_state.restore_mode = None
-    if clear_draft:
-        _clear_chat_plan_mode_draft_state(plan_mode_state)
-    if current_mode != restore_mode:
-        try:
-            _apply_chat_effective_mode(
-                session=session,
-                next_mode=restore_mode,
-                persist_default_mode=False,
-            )
-        except Exception as e:  # noqa: BLE001
-            plan_mode_state.enabled = True
-            plan_mode_state.restore_mode = restore_mode
-            if hasattr(plan_mode_state, "latest_task"):
-                plan_mode_state.latest_task = previous_task
-            if hasattr(plan_mode_state, "latest_draft"):
-                plan_mode_state.latest_draft = previous_draft
-            console.print(f"[red]Failed to disable Plan Mode:[/red] {e}")
-            return None
-    console.print(
-        f"Plan Mode set for this session: off (restored {_chat_mode_display(restore_mode)})"
-    )
-    return restore_mode
-
-
-def _record_plan_mode_draft_from_turn(
-    *,
-    session: Any,
-    console: Console,
-    plan_mode_state: Any,
-    user_message: str,
-    start_index: int,
-) -> None:
-    latest_reply = _latest_assistant_text_since(session, start_index=start_index)
-    if latest_reply is None or not _looks_like_actionable_plan_mode_draft(latest_reply):
-        return
-    changed = _store_chat_plan_mode_draft_state(
-        plan_mode_state,
-        user_message=user_message,
-        draft=latest_reply,
-    )
-    if not changed:
-        return
-    restore_mode = _chat_plan_mode_restore_mode(plan_mode_state) or "readonly"
-    task_preview = _chat_plan_task_preview(user_message)
-    console.print(f"[dim]Stored latest Plan Mode draft for:[/dim] {task_preview}")
-    if restore_mode == "readonly":
-        console.print(
-            "[dim]This overlay started from Read-Only mode, so exact /plan approve cannot execute it here.[/dim]"
-        )
-        return
-    console.print(
-        f"[dim]Use exact /plan approve to leave Plan Mode, restore {_chat_mode_display(restore_mode)}, and execute it.[/dim]"
-    )
-
-
 def _apply_chat_effective_mode(
     *,
     session: Any,
     next_mode: str,
     persist_default_mode: bool,
 ) -> None:
+    def _record_projection_failure(warning: str, exc: Exception) -> None:
+        append = getattr(getattr(session, "store", None), "append", None)
+        if not callable(append):
+            return
+        try:
+            append(
+                "warning",
+                {
+                    "warning": warning,
+                    "error": sanitize_error_text_for_output(exc),
+                },
+            )
+        except Exception:
+            pass
+
     _rebuild_session_tools_for_mode(session=session, mode=next_mode)
     session.mode = next_mode
     if persist_default_mode and hasattr(session, "cfg"):
         session.cfg.default_mode = next_mode
-    refresh_session_environment_context_message(session)
+    # Tool publication + mode/default assignment above are the authority
+    # commit. Prompt and surface updates are projections of that committed
+    # state; a projection fault must not make callers retry an already-active
+    # permission change.
+    try:
+        refresh_session_environment_context_message(session)
+    except Exception as exc:  # noqa: BLE001 - post-commit projection is best-effort
+        _record_projection_failure("mode_context_refresh_failed", exc)
     surface = getattr(session, "surface", None)
     emit_mode_changed = getattr(surface, "emit_mode_changed", None)
     if callable(emit_mode_changed):
-        emit_mode_changed(next_mode)
+        try:
+            emit_mode_changed(next_mode)
+        except Exception as exc:  # noqa: BLE001 - post-commit projection is best-effort
+            _record_projection_failure("mode_surface_emit_failed", exc)
+
+
+def _pending_chat_permissions(session: Any) -> str | None:
+    """Return the validated next-message Permissions selection, if any.
+
+    This value is intentionally separate from ``session.mode``: merely choosing
+    Permissions must never change the tools or approval gates of a turn that is
+    already running.
+    """
+    value = str(getattr(session, "pending_permissions_mode", "") or "").strip().lower()
+    return value if value in _CHAT_PERMISSION_MODES else None
+
+
+def _stage_chat_permissions(*, session: Any, next_mode: str) -> str | None:
+    """Select Permissions for the next real user message.
+
+    The latest selection replaces the previous one. Selecting the active base
+    mode cancels a pending change; selecting a persona-narrowed effective mode
+    remains meaningful because it redefines the base at activation. No tools,
+    defaults, personas, or surface events are changed here.
+    """
+    normalized = str(next_mode or "").strip().lower()
+    if normalized not in _CHAT_PERMISSION_MODES:
+        raise ValueError(f"unsupported execution mode: {next_mode}")
+    active = str(getattr(session, "mode", "review") or "review").strip().lower()
+    persona_is_narrowing = getattr(session, "persona_restore_mode", None) is not None
+    # While a persona is narrowing the active grant, selecting that same
+    # visible grant is still meaningful: it makes the selection the user's
+    # base Permissions and removes the persona scope at the next boundary.
+    pending = "" if normalized == active and not persona_is_narrowing else normalized
+    session.pending_permissions_mode = pending or None
+    return pending or None
+
+
+def _activate_pending_chat_permissions(*, session: Any) -> str | None:
+    """Activate a staged Permissions selection at a message boundary.
+
+    The pending value is cleared only after the normal mode-application path
+    succeeds, so a tool rebuild/config failure is visible and retryable. The
+    existing explicit-Permissions contract still redefines the user's base scope
+    rather than retaining a persona's temporary narrowing.
+    """
+    pending = _pending_chat_permissions(session)
+    if pending is None:
+        return None
+    active = str(getattr(session, "mode", "review") or "review").strip().lower()
+    if pending == active and getattr(session, "persona_restore_mode", None) is None:
+        session.pending_permissions_mode = None
+        return None
+
+    persona_snapshot = {
+        "allow_write_globs": getattr(session, "allow_write_globs", None),
+        "persona_allow_write_globs": getattr(session, "persona_allow_write_globs", None),
+        "persona_restore_mode": getattr(session, "persona_restore_mode", None),
+        "persona_restore_write_globs": getattr(session, "persona_restore_write_globs", None),
+    }
+    try:
+        _clear_persona_restore(session)
+        _apply_chat_effective_mode(
+            session=session,
+            next_mode=pending,
+            persist_default_mode=True,
+        )
+    except Exception:
+        # _clear_persona_restore runs before the rebuild. Restore that user-visible
+        # scope state if preparation fails; the pending selection remains intact.
+        for name, value in persona_snapshot.items():
+            setattr(session, name, value)
+        raise
+    session.pending_permissions_mode = None
+    return pending
+
+
+def _resolve_tui_step_operation(
+    *,
+    session: Any,
+    text: str,
+) -> ResolvedOperation | None:
+    """Validate a step-tier TUI command without mutating the live session."""
+    from ..commands.chat_terminal import _chat_mode_display
+    from ..commands.startup import _resolve_chat_mode_alias
+
+    stripped = str(text or "").strip()
+    parts = stripped.split(maxsplit=1)
+    if len(parts) != 2:
+        return None
+    command = parts[0].lower()
+    argument = parts[1].strip()
+    if command == "/permissions":
+        normalized_argument = argument.lower()
+        if persona_modes_enabled(getattr(session, "cfg", None)) and is_persona_name(
+            normalized_argument,
+            getattr(session, "persona_registry", None),
+        ):
+            raise ValueError(f"Personas have their own command: /persona {normalized_argument}")
+        value = _resolve_chat_mode_alias(argument)
+        if value is None or value not in {mode.value for mode in Mode}:
+            raise ValueError(
+                "Invalid mode. Try: /permissions 1, /permissions 2, "
+                "/permissions 3, /permissions 4 "
+                "(or safe, fast, read, full)."
+            )
+        display_value = _chat_mode_display(value).split(maxsplit=1)[0]
+        return ResolvedOperation("mode", value, f"permissions: {display_value}")
+    if command == "/stream":
+        normalized = argument.lower()
+        if normalized not in {"on", "off"}:
+            if normalized == "status":
+                return None
+            raise ValueError(
+                "Invalid stream value. Try: /stream on, /stream off, or /stream status."
+            )
+        return ResolvedOperation("stream", normalized == "on", f"stream: {normalized}")
+    return None
+
+
+def _apply_tui_step_operation(
+    *,
+    session: Any,
+    operation: ResolvedOperation,
+    tui_state: Any,
+) -> None:
+    """Handle one validated live-TUI operation.
+
+    Streaming remains a step-boundary mutation. Permissions are only staged;
+    their activation is owned by the next-user-message boundary.
+    """
+    if operation.kind == "mode":
+        value = str(operation.payload)
+        _stage_chat_permissions(session=session, next_mode=value)
+        if hasattr(tui_state, "pending_exec_mode"):
+            tui_state.pending_exec_mode = _pending_chat_permissions(session) or ""
+        return
+    if operation.kind == "stream":
+        from ..commands.startup import _set_chat_stream_enabled
+
+        _set_chat_stream_enabled(session=session, enabled=bool(operation.payload))
+        return
+    raise ValueError(f"unsupported staged operation kind: {operation.kind}")
 
 
 def _apply_chat_persona(
@@ -661,6 +544,7 @@ def _apply_chat_persona(
     session: Any,
     persona: str,
     source: str = "user",
+    permission_ceiling: str | None = None,
 ) -> str:
     """Apply a persona to the live session; returns the effective exec mode.
 
@@ -671,8 +555,18 @@ def _apply_chat_persona(
     default keeps the user's mode (code/debug) restore any mode narrowed by a
     previous persona (architect/ask).
     """
-    from ...agent.prompt_context import refresh_session_environment_context_message
+    from ...agent.prompt_context import (
+        refresh_session_environment_context_message,
+        refresh_session_prompt_guidance,
+    )
 
+    if permission_ceiling is not None and permission_ceiling not in {
+        "readonly",
+        "review",
+        "auto",
+        "fullaccess",
+    }:
+        raise ValueError("Invalid planning permission ceiling.")
     definition = get_persona(persona, _session_persona_registry(session))
     current_mode = str(getattr(session, "mode", "review") or "review").strip().lower()
     restore = getattr(session, "persona_restore_mode", None)
@@ -680,10 +574,21 @@ def _apply_chat_persona(
     base_mode = str(restore or current_mode).strip().lower()
     base_globs = (
         getattr(session, "persona_restore_write_globs", None)
-        if restore_active
+        if restore_active and permission_ceiling is None
         else getattr(session, "allow_write_globs", None)
     )
     target_mode = resolve_persona_exec_mode(definition, base_mode)
+    if permission_ceiling is not None:
+        # Planning entry caps the inherited grant at the current effective mode;
+        # e.g. Ask/readonly must not regain its saved auto grant via Architect.
+        # Explicit /persona behavior remains unchanged when the ceiling is absent.
+        from ...personas import clamp_persona_exec_mode
+
+        target_mode = clamp_persona_exec_mode(target_mode, permission_ceiling)
+        # Planning must retain a newer user scope, including [] = deny all.
+        # Fullaccess ignores base allow globs, so keep those scopes enforceable.
+        if base_globs is not None and target_mode == "fullaccess":
+            target_mode = "review"
     target_persona_globs = (
         list(definition.allow_write_globs) if definition.allow_write_globs else None
     )
@@ -733,11 +638,6 @@ def _apply_chat_persona(
     if prepared_client is not None and prepared_client_key is not None:
         session.client = prepared_client
         session.persona_client_key = prepared_client_key
-        # This is a session-owned main-client transition, so keep the dedicated
-        # selector bound to the new legitimate client. External embedders that
-        # replace only ``session.client`` still trip the turn-time stale guard.
-        if hasattr(session, "_semantic_router_bound_client"):
-            session._semantic_router_bound_client = prepared_client
     if target_mode != current_mode or scope_changed:
         # The rebuild inside _apply_chat_effective_mode re-reads the session's
         # allow_write_globs, so a scope-only change still needs it.
@@ -748,6 +648,7 @@ def _apply_chat_persona(
         )
     else:
         refresh_session_environment_context_message(session)
+    refresh_session_prompt_guidance(session)
     surface = getattr(session, "surface", None)
     emit_persona_changed = getattr(surface, "emit_persona_changed", None)
     if callable(emit_persona_changed):
@@ -762,6 +663,7 @@ def _apply_chat_persona(
                 "effective_mode": target_mode,
                 "source": source,
                 "model": str(getattr(getattr(session, "client", None), "model", "") or ""),
+                "prompt_guidance_profile": getattr(session, "prompt_guidance_profile", None),
             },
         )
     return target_mode
@@ -920,24 +822,27 @@ def _prepare_session_client_for_persona(
     return client, target_key
 
 
-def _load_resumed_persona(session: Any) -> str | None:
+def _load_resumed_persona(session: Any, log_path: Path | None = None) -> str | None:
     """Last applied persona from the resumed session's log, or None.
 
     Resume restores the *base* execution mode from ``session_start`` and
     leaves the persona at the config default; the ``persona_switch_applied``
     events (user switches, Tab cycles, approved switch_mode proposals, and
     the startup application) carry the rest. Last-wins scan, same pattern as
-    the chat-resume runtime-settings loaders.
+    the chat-resume runtime-settings loaders. ``log_path`` reads another
+    session's log instead of the session's own (the IDE bridge's
+    ``session.resume`` replays a different session into a live one).
     """
     from ...session_store import read_session_events
     from ..commands.chat_resume_helpers import _resolve_session_log_path
 
     if not persona_modes_enabled(getattr(session, "cfg", None)):
         return None
-    try:
-        log_path = _resolve_session_log_path(session)
-    except Exception:  # noqa: BLE001 - resume must not fail on persona lookup
-        return None
+    if log_path is None:
+        try:
+            log_path = _resolve_session_log_path(session)
+        except Exception:  # noqa: BLE001 - resume must not fail on persona lookup
+            return None
     if log_path is None:
         return None
     persona: str | None = None
@@ -955,7 +860,9 @@ def _load_resumed_persona(session: Any) -> str | None:
     return persona
 
 
-def _reapply_resumed_persona(*, session: Any, console: Any = None) -> None:
+def _reapply_resumed_persona(
+    *, session: Any, console: Any = None, log_path: Path | None = None
+) -> None:
     """Re-apply the resumed session's last persona after the state swap.
 
     ``session_start`` restores the user's base mode; re-applying the persona
@@ -964,7 +871,7 @@ def _reapply_resumed_persona(*, session: Any, console: Any = None) -> None:
     persona needs no application — the restored base state already is the
     correct state.
     """
-    persona = _load_resumed_persona(session)
+    persona = _load_resumed_persona(session, log_path)
     if not persona:
         return
     normalized = normalize_persona(persona, _session_persona_registry(session))
@@ -984,7 +891,7 @@ def _reapply_resumed_persona(*, session: Any, console: Any = None) -> None:
 
 
 def _clear_persona_restore(session: Any) -> None:
-    """An explicit user /mode <exec> redefines the base: restore any
+    """An explicit user /permissions <exec> redefines the base: restore any
     persona-narrowed write scope first, then drop the restore point."""
     if getattr(session, "persona_restore_mode", None) is not None:
         session.allow_write_globs = getattr(session, "persona_restore_write_globs", None)
@@ -1066,17 +973,23 @@ def _reset_route_local_client_capabilities(client: Any, *, route_changed: bool) 
 
 _RELOAD_SESSION_FIELDS = (
     "cfg",
+    "client",
+    "conversation_compactor",
     "routing_mode",
     "max_steps",
     "api_key",
     "api_key_source",
     "model_registry",
+    "messages",
+    "startup_messages",
+    "prompt_guidance_profile",
 )
 _RELOAD_CLIENT_FIELDS = (
     "base_url",
     "provider_auth",
     "api_key",
     "model",
+    "default_max_tokens",
     "timeout_s",
     "stream_no_progress_timeout_s",
     "temperature",
@@ -1120,7 +1033,6 @@ def _reload_snapshot_value(value: Any) -> Any:
 def _reload_clients(session: Any) -> list[Any]:
     candidates = [
         getattr(session, "client", None),
-        getattr(session, "router_client", None),
         getattr(
             getattr(session, "conversation_compactor", None),
             "compactor_client",
@@ -1195,16 +1107,11 @@ def _apply_config_menu_changes_to_session(*, session: Any, cfg: AppConfig) -> No
 
 
 def _apply_config_menu_changes_to_session_mutating(*, session: Any, cfg: AppConfig) -> None:
-    from ...agent.session import (
-        _SKILL_SELECTOR_TIMEOUT_S,
-        _skill_selector_provider_retry_settings,
-    )
+    from ...agent.prompt_context import refresh_session_prompt_guidance
     from ...config import (
         ConfigError,
         clone_cfg,
         resolve_api_key,
-        resolve_llm_enable_thinking,
-        resolve_llm_reasoning_effort,
         resolve_llm_timeout_s,
         resolve_prompt_cache_key,
         resolve_prompt_cache_retention,
@@ -1212,9 +1119,9 @@ def _apply_config_menu_changes_to_session_mutating(*, session: Any, cfg: AppConf
     )
     from ...llm.cache_capabilities import resolve_effective_cache_capability
     from ...llm.cache_policy import build_prompt_cache_namespace, resolve_prompt_cache_policy
+    from ...llm.factory import _session_routing_headers, make_llm_client, resolve_model_protocol
     from ...llm.metadata import (
         build_provider_route_identity,
-        canonicalize_extra_headers,
         credential_scope_fingerprint,
     )
     from ...llm.protocols import (
@@ -1225,11 +1132,11 @@ def _apply_config_menu_changes_to_session_mutating(*, session: Any, cfg: AppConf
         resolve_reasoning_trace_capability,
     )
     from ...llm.provider_limits import resolve_provider_retry_settings
+    from ...model_reasoning import client_reasoning_settings
     from ...model_registry import ModelRegistry, resolve_model_provider_key
     from ...model_router import (
         ROLE_CODING,
         ROLE_COMPACTOR,
-        ROLE_ROUTER,
         resolve_model_for_role,
     )
     from ...profile_presets import find_preset_for_profile
@@ -1245,7 +1152,7 @@ def _apply_config_menu_changes_to_session_mutating(*, session: Any, cfg: AppConf
     )
     active_profile = get_active_profile(session.cfg)
     effective_base_url = resolve_effective_base_url(cfg=session.cfg, profile=active_profile)
-    protocol = str(active_profile.protocol or OPENAI_COMPAT_PROTOCOL).strip()
+    profile_protocol = str(active_profile.protocol or OPENAI_COMPAT_PROTOCOL).strip()
     resolved_key = resolve_api_key(session.cfg)
     session.api_key = str(resolved_key.key or "")
     session.api_key_source = (
@@ -1256,13 +1163,17 @@ def _apply_config_menu_changes_to_session_mutating(*, session: Any, cfg: AppConf
     provider_auth = (
         create_provider_auth(active_profile.auth_provider) if active_profile.auth_provider else None
     )
-    route_session_scope = credential_scope_fingerprint(
-        getattr(getattr(session, "store", None), "session_id", None)
+    provider_session_id = getattr(session, "provider_session_id", None) or getattr(
+        getattr(session, "store", None), "session_id", None
+    )
+    route_session_scope = credential_scope_fingerprint(provider_session_id)
+    request_headers = _session_routing_headers(
+        base_url=effective_base_url,
+        extra_headers=active_profile.extra_headers,
+        session_id=provider_session_id,
     )
 
     timeout_s = resolve_llm_timeout_s(session.cfg)
-    enable_thinking = resolve_llm_enable_thinking(session.cfg)
-    reasoning_effort = resolve_llm_reasoning_effort(session.cfg)
     prompt_cache_key = getattr(
         session,
         "prompt_cache_stream_key",
@@ -1280,41 +1191,70 @@ def _apply_config_menu_changes_to_session_mutating(*, session: Any, cfg: AppConf
         model: str,
         role: str,
         temperature: float | None = None,
-        disable_reasoning: bool = False,
-        timeout_override_s: float | None = None,
-        stream_no_progress_timeout_override_s: float | None = None,
-        disable_retries: bool = False,
-    ) -> None:
+    ) -> Any:
+        reasoning_effort, enable_thinking = client_reasoning_settings(
+            session.cfg,
+            model=model,
+            profile=active_profile,
+            transport=getattr(client, "_transport", None),
+        )
         existing_route_identity = getattr(client, "route_identity", None)
+        preset = find_preset_for_profile(active_profile)
+        provider_key = str(preset.provider_key or "").strip() if preset is not None else ""
+        if not provider_key:
+            provider_key = resolve_model_provider_key(
+                cfg=session.cfg,
+                model_name=model,
+                base_url=effective_base_url,
+                profile_name=active_profile.name,
+            )
+        protocol = resolve_model_protocol(
+            provider_key=provider_key, model=model, protocol=profile_protocol
+        )
+        existing_protocol = str(getattr(existing_route_identity, "protocol", "") or "")
+        if existing_protocol and existing_protocol != protocol:
+            # Changing model names cannot change a client's wire format. Build the
+            # correct transport before replacing either role's retained client.
+            return make_llm_client(
+                cfg=session.cfg,
+                api_key=session.api_key,
+                model=model,
+                timeout_s=timeout_s,
+                temperature=temperature if temperature is not None else client.temperature,
+                prompt_cache_key=prompt_cache_key,
+                prompt_cache_retention=prompt_cache_retention,
+                prompt_cache_namespace=build_prompt_cache_namespace(
+                    workspace_root=getattr(session, "root", None),
+                    role=role,
+                    profile_name=active_profile.name,
+                ),
+                enable_thinking=enable_thinking,
+                reasoning_effort=reasoning_effort,
+                transport=getattr(client, "_transport", None),
+                profile=active_profile,
+                session_id=provider_session_id,
+            )
         client.base_url = effective_base_url
         if hasattr(client, "provider_auth"):
             client.provider_auth = provider_auth
+        if provider_session_id and hasattr(client, "session_id"):
+            client.session_id = provider_session_id
         client.api_key = session.api_key
         client.model = model
-        client.timeout_s = timeout_s if timeout_override_s is None else timeout_override_s
-        if stream_no_progress_timeout_override_s is not None and hasattr(
-            client, "stream_no_progress_timeout_s"
-        ):
-            client.stream_no_progress_timeout_s = stream_no_progress_timeout_override_s
+        client.timeout_s = timeout_s
         if temperature is not None:
             client.temperature = temperature
-        provider_key = resolve_model_provider_key(
-            cfg=session.cfg,
-            model_name=model,
-            base_url=effective_base_url,
-            profile_name=active_profile.name,
-        )
         capabilities = get_provider_protocol_capabilities(
             provider_key=provider_key,
             protocol=protocol,
         )
-        preset = find_preset_for_profile(active_profile)
         cache_capability = resolve_effective_cache_capability(
             provider_key=provider_key,
             protocol=protocol,
             model=model,
             base_url=effective_base_url,
             transport_capabilities=capabilities,
+            auth_cache_capability=getattr(provider_auth, "cache_capability", None),
             preset_cache_capability=(preset.cache_capability if preset is not None else None),
             profile_cache_capability=active_profile.cache_capability,
         )
@@ -1355,7 +1295,7 @@ def _apply_config_menu_changes_to_session_mutating(*, session: Any, cfg: AppConf
             profile_name=active_profile.name,
             auth_provider=active_profile.auth_provider,
             credential_scope=credential_scope,
-            routing_headers=active_profile.extra_headers,
+            routing_headers=request_headers,
             routing_fields=dict(cache_policy.request_field_values),
             reasoning_state_adapter=active_profile.reasoning_trace_adapter,
             protocol_revision=protocol_revision,
@@ -1423,22 +1363,17 @@ def _apply_config_menu_changes_to_session_mutating(*, session: Any, cfg: AppConf
                     clear_cached_content = getattr(cached_content_by_signature, "clear", None)
                     if callable(clear_cached_content):
                         clear_cached_content()
-        # The automatic-skill selector is built reasoning-off in session.py.
-        # Re-applying session-wide reasoning settings here would silently make
-        # selection inherit the main client's latency, so preserve that contract.
-        if disable_reasoning:
-            client.enable_thinking = False
-            client.reasoning_effort = ""
-        else:
-            client.enable_thinking = enable_thinking
-            client.reasoning_effort = reasoning_effort
+        client.enable_thinking = enable_thinking
+        client.reasoning_effort = reasoning_effort
         if hasattr(client, "extra_headers"):
-            client.extra_headers = canonicalize_extra_headers(active_profile.extra_headers)
+            client.extra_headers = dict(request_headers)
         if hasattr(client, "provider_key"):
             client.provider_key = provider_key
         if hasattr(client, "reasoning_trace_adapter"):
             client.reasoning_trace_adapter = active_profile.reasoning_trace_adapter
         model_meta = model_registry.get(model, include_provider_auth=False)
+        if protocol == ANTHROPIC_MESSAGES_PROTOCOL:
+            client.default_max_tokens = model_meta.max_output_tokens
         model_supports_reasoning = model_meta.supports_reasoning
         model_capability_source = model_meta.field_sources.get("supports_reasoning")
         if active_profile.auth_provider and active_profile.reasoning_effort is not None:
@@ -1454,42 +1389,16 @@ def _apply_config_menu_changes_to_session_mutating(*, session: Any, cfg: AppConf
         if hasattr(client, "provider_concurrency_caps"):
             client.provider_concurrency_caps = dict(session.cfg.provider_concurrency_caps)
         if hasattr(client, "provider_retry_settings"):
-            client.provider_retry_settings = (
-                _skill_selector_provider_retry_settings(session.cfg)
-                if disable_retries
-                else provider_retry_settings
-            )
+            client.provider_retry_settings = provider_retry_settings
+        return client
 
     client = getattr(session, "client", None)
     if client is not None:
-        _apply_client_config(
+        session.client = _apply_client_config(
             client,
             model=str(session.cfg.model or ""),
             role=ROLE_CODING,
             temperature=coding_temperature,
-        )
-
-    router_client = getattr(session, "router_client", None)
-    if router_client is not None:
-        selector_timeout_s = min(timeout_s, _SKILL_SELECTOR_TIMEOUT_S)
-        selector_stream_timeout_s = min(
-            float(session.cfg.llm_stream_no_progress_timeout_s),
-            selector_timeout_s,
-        )
-        router_model = resolve_model_for_role(
-            cfg=session.cfg,
-            role=ROLE_ROUTER,
-            plan=None,
-        )
-        _apply_client_config(
-            router_client,
-            model=router_model,
-            role=ROLE_ROUTER,
-            temperature=0.0,
-            disable_reasoning=True,
-            disable_retries=True,
-            timeout_override_s=selector_timeout_s,
-            stream_no_progress_timeout_override_s=selector_stream_timeout_s,
         )
 
     compactor = getattr(session, "conversation_compactor", None)
@@ -1504,12 +1413,16 @@ def _apply_config_menu_changes_to_session_mutating(*, session: Any, cfg: AppConf
             )
         except ConfigError:
             compactor_model = str(session.cfg.model or "")
-        _apply_client_config(
+        refreshed_compactor_client = _apply_client_config(
             compactor_client,
             model=compactor_model,
             role=ROLE_COMPACTOR,
             temperature=resolve_role_temperature(session.cfg, role=ROLE_COMPACTOR),
         )
+        if refreshed_compactor_client is not compactor_client:
+            # Keep the old wrapper intact so a later refresh failure can restore it.
+            session.conversation_compactor = copy.copy(compactor)
+            session.conversation_compactor.compactor_client = refreshed_compactor_client
 
     _rebuild_session_tools_for_mode(
         session=session,
@@ -1517,31 +1430,17 @@ def _apply_config_menu_changes_to_session_mutating(*, session: Any, cfg: AppConf
     )
     refresh_session_environment_context_message(session)
     _refresh_chat_hud_context_cache(session)
-
-
-def _resolve_interactive_plan_mode_request(
-    *,
-    session: Any,
-    console: Console,
-    plan_mode_state: Any,
-    user_message: str,
-    plan_mode_escape_supported: bool = False,
-) -> str | _ChatExecutionRequest:
-    _ = session
-    if _is_plan_mode_execute_now_follow_up(user_message):
-        for line in _plan_mode_execute_now_guidance_lines(
-            plan_mode_state=plan_mode_state, plan_mode_escape_supported=plan_mode_escape_supported
-        ):
-            console.print(line)
-        return "handled"
-    from ...interactive_plan_mode import INTERACTIVE_PLAN_MODE_SYSTEM_PROMPT
-
-    return _ChatExecutionRequest(
-        instruction=user_message,
-        routing_mode_override="code_only",
-        ephemeral_system_messages=(INTERACTIVE_PLAN_MODE_SYSTEM_PROMPT,),
-        plan_mode_capture_task=user_message,
-    )
+    if refresh_session_prompt_guidance(session):
+        append = getattr(getattr(session, "store", None), "append", None)
+        if callable(append):
+            append(
+                "prompt_guidance_changed",
+                {
+                    "source": "config_reload",
+                    "model": str(getattr(getattr(session, "client", None), "model", "") or ""),
+                    "prompt_guidance_profile": getattr(session, "prompt_guidance_profile", None),
+                },
+            )
 
 
 def _clone_chat_startup_messages(session: Any) -> list[dict[str, Any]]:
@@ -1556,21 +1455,55 @@ def _clone_chat_startup_messages(session: Any) -> list[dict[str, Any]]:
     if not isinstance(messages_obj, list) or pinned_prefix_len <= 0:
         return []
     return [
-        dict(message) for message in messages_obj[:pinned_prefix_len] if isinstance(message, dict)
+        dict(message)
+        for message in messages_obj[:pinned_prefix_len]
+        if isinstance(message, dict)
+        # Do not carry retired objective prompts out of legacy saved context.
+        and not (
+            str(message.get("role") or "") == "user"
+            and isinstance(message.get("content"), str)
+            and str(message.get("content"))
+            .lstrip()
+            .startswith(("<task_brief>", "<task_requirements>"))
+        )
     ]
 
 
-def _clear_chat_conversation(*, session: Any, pending_images: list[str]) -> None:
+def _reset_chat_conversation(
+    *,
+    session: Any,
+    trigger: str,
+    retained_system_messages: tuple[str, ...] = (),
+    pending_images: list[str] | None = None,
+    clear_pending_images: bool = False,
+    event_payload: dict[str, Any] | None = None,
+    reset_evidence: bool = False,
+) -> None:
+    """Replace the model-visible conversation with the startup prefix.
+
+    ``reset_evidence`` starts a new workspace verification baseline.
+    """
+
     startup_messages = _clone_chat_startup_messages(session)
     if not startup_messages:
         raise RuntimeError("session startup messages unavailable")
 
+    retained_messages = [
+        {"role": "system", "content": content}
+        for content in retained_system_messages
+        if isinstance(content, str) and content.strip()
+    ]
+
     store = getattr(session, "store", None)
     if store is None or not hasattr(store, "append"):
         raise RuntimeError("session store unavailable")
-    store.append("conversation_cleared", {"trigger": "user_command"})
-
-    session.messages = startup_messages
+    clear_payload: dict[str, Any] = {"trigger": str(trigger or "unknown")}
+    if event_payload:
+        clear_payload.update(event_payload)
+    store.append("conversation_cleared", clear_payload)
+    if reset_evidence:
+        clear_conversation_evidence(session)
+    session.messages = [*startup_messages, *retained_messages]
     invalidate_request_context = getattr(session, "invalidate_request_context", None)
     if callable(invalidate_request_context):
         invalidate_request_context(reason="conversation_cleared")
@@ -1578,21 +1511,92 @@ def _clear_chat_conversation(*, session: Any, pending_images: list[str]) -> None
         session.request_context_measurement = None
     refresh_session_workspace_binding_context_message(session)
     refresh_session_environment_context_message(session)
-
     compactor = getattr(session, "conversation_compactor", None)
-    if compactor is not None and hasattr(compactor, "state"):
+    reset_compactor = getattr(compactor, "reset_for_model_history_boundary", None)
+    if callable(reset_compactor):
+        reset_compactor()
+    elif compactor is not None and hasattr(compactor, "state"):
         pinned_prefix_len = max(0, int(getattr(compactor.state, "pinned_prefix_len", 0) or 0))
+        history_chunk_index = max(
+            0,
+            int(getattr(compactor.state, "history_chunk_index", 0) or 0),
+        )
         compactor.state = CompactionState(
             summary={},
-            history_chunk_index=0,
+            history_chunk_index=history_chunk_index,
             memory_message_index=None,
             pinned_prefix_len=pinned_prefix_len,
             pins=[],
             pins_message_index=None,
         )
 
-    pending_images.clear()
+    read_ledger = getattr(session, "read_ledger", None)
+    reset_read_ledger = getattr(read_ledger, "reset", None)
+    if callable(reset_read_ledger):
+        store.append(
+            "read_ledger_reset",
+            {
+                "trigger": str(trigger or "unknown"),
+                "cleared_paths": int(reset_read_ledger() or 0),
+            },
+        )
+
+    if clear_pending_images and pending_images is not None:
+        pending_images.clear()
     _refresh_chat_hud_context_cache(session)
+
+
+def _clear_chat_conversation(*, session: Any, pending_images: list[str]) -> None:
+    _reset_chat_conversation(
+        session=session,
+        trigger="user_command",
+        pending_images=pending_images,
+        clear_pending_images=True,
+        reset_evidence=True,
+    )
+
+
+def _apply_pending_subagent_history_rollover(session: Any) -> bool:
+    """Consume one typed TUI rollover without changing the rendered transcript."""
+
+    pending_reader = getattr(session, "pending_subagent_history_rollover", None)
+    if not callable(pending_reader):
+        return False
+    pending = pending_reader()
+    if pending is None:
+        return False
+    if (
+        getattr(session, "runtime_kind", None) != RuntimeKind.INTERACTIVE_CHAT
+        or int(getattr(session, "subagent_depth", 0) or 0) != 0
+        or not bool(getattr(session, "_alysis_tui_interactive", False))
+    ):
+        raise RuntimeError("subagent history rollover is only valid in a depth-0 TUI chat")
+    capsule = pending.get("capsule") if isinstance(pending, dict) else None
+    capsule_sha256 = str(pending.get("capsule_sha256") or "") if isinstance(pending, dict) else ""
+    if not isinstance(capsule, dict) or not capsule_sha256:
+        raise RuntimeError("pending subagent history rollover is malformed")
+    capsule_message = render_subagent_lifecycle_capsule(capsule)
+    _reset_chat_conversation(
+        session=session,
+        trigger="captured_duplicate_subagent_result",
+        retained_system_messages=(capsule_message,),
+        event_payload={
+            "source_event": "captured_duplicate_subagent_turn_terminalized",
+            "capsule_sha256": capsule_sha256,
+        },
+    )
+    store = getattr(session, "store", None)
+    store.append(
+        "subagent_history_rollover_applied",
+        {
+            "trigger": "captured_duplicate_subagent_result",
+            "capsule_sha256": capsule_sha256,
+        },
+    )
+    acknowledge = getattr(session, "acknowledge_subagent_history_rollover", None)
+    if not callable(acknowledge) or not acknowledge(capsule_sha256=capsule_sha256):
+        raise RuntimeError("subagent history rollover acknowledgement failed")
+    return True
 
 
 def _handle_chat_command(*args: Any, **kwargs: Any) -> Any:
@@ -1718,159 +1722,6 @@ def _finish_chat_surface_activity(*, session: Any) -> None:
         return
 
 
-def _run_plan_mode_approval_loop(
-    *,
-    session: Any,
-    console: Console,
-    user_message: str,
-    max_iterations: int | None = None,
-    action_prompt: Any | None = None,
-) -> str | None:
-    limit = max_iterations if max_iterations is not None else MAX_PLAN_ITERATIONS
-    if limit <= 0:
-        return None
-
-    try:
-        from ...llm.types import LLMError as _PlanLLMError
-    except Exception:  # noqa: BLE001
-        _PlanLLMError = RuntimeError
-
-    previous_plan: str | None = None
-    feedback: str | None = None
-    for _iteration in range(limit):
-        console.print("")
-        _render_labeled_chat_message(console=console, label="Request", message=user_message)
-        if feedback:
-            _render_labeled_chat_message(
-                console=console,
-                label="Revision feedback",
-                message=feedback,
-            )
-        console.print("")
-
-        if previous_plan and feedback:
-            _emit_plan_mode_trace(
-                session=session,
-                message="Revising draft plan with your feedback.",
-            )
-        else:
-            _emit_plan_mode_trace(
-                session=session,
-                message="Drafting execution plan for your request.",
-            )
-        _emit_plan_mode_trace(
-            session=session,
-            message="Collecting relevant conversation context for planning.",
-            full_only=True,
-        )
-        _emit_plan_mode_trace(
-            session=session,
-            message="Tools stay disabled while planning this draft.",
-            full_only=True,
-        )
-
-        session_stream = bool(getattr(session, "stream", False))
-        on_text_delta = (
-            _make_plan_mode_delta_trace_callback(session=session) if session_stream else None
-        )
-        stream_plan_draft = session_stream and on_text_delta is not None
-        details: dict[str, Any] = {}
-
-        try:
-            draft = generate_plan_draft(
-                client=getattr(session, "client", None),
-                session_messages=list(getattr(session, "messages", []) or []),
-                user_message=user_message,
-                previous_plan=previous_plan,
-                feedback=feedback,
-                workspace_context=_planner_workspace_context_for_session(session=session),
-                stream=stream_plan_draft,
-                on_text_delta=on_text_delta if stream_plan_draft else None,
-                details=details,
-            )
-        except KeyboardInterrupt:
-            _finish_chat_surface_activity(session=session)
-            console.print("Plan drafting interrupted. Back to chat.")
-            return None
-        except (RuntimeError, _PlanLLMError) as e:
-            if not stream_plan_draft:
-                _finish_chat_surface_activity(session=session)
-                console.print(f"[red]{e}[/red]")
-                return None
-
-            _emit_plan_mode_trace(
-                session=session,
-                message="Planner stream failed; retrying once without streaming.",
-                full_only=True,
-            )
-            details = {}
-            try:
-                draft = generate_plan_draft(
-                    client=getattr(session, "client", None),
-                    session_messages=list(getattr(session, "messages", []) or []),
-                    user_message=user_message,
-                    previous_plan=previous_plan,
-                    feedback=feedback,
-                    workspace_context=_planner_workspace_context_for_session(session=session),
-                    stream=False,
-                    on_text_delta=None,
-                    details=details,
-                )
-            except KeyboardInterrupt:
-                _finish_chat_surface_activity(session=session)
-                console.print("Plan drafting interrupted. Back to chat.")
-                return None
-            except (RuntimeError, _PlanLLMError) as retry_error:
-                _finish_chat_surface_activity(session=session)
-                console.print(f"[red]{retry_error}[/red]")
-                return None
-        _emit_plan_mode_trace(session=session, message="Plan draft ready for review.")
-
-        request_messages = details.get("request_messages")
-        response = details.get("response")
-        if isinstance(request_messages, list) and response is not None:
-            record_plan_usage(
-                session=session,
-                request_messages=request_messages,
-                response=response,
-            )
-            _refresh_chat_hud_context_cache(session)
-
-        _finish_chat_surface_activity(session=session)
-        _render_plan_draft(console=console, draft=draft)
-        console.print("")
-
-        if action_prompt is not None:
-            action = action_prompt(console=console, user_message=user_message, draft=draft)
-        else:
-            action = _prompt_plan_mode_action(console=console)
-        if action is None:
-            return None
-        if action == "approve":
-            return instruction_with_approved_plan(user_message=user_message, approved_plan=draft)
-        if action == "propose":
-            feedback_input = _prompt_plan_mode_feedback(console=console)
-            if feedback_input is None:
-                return None
-            if not feedback_input.strip():
-                console.print("[yellow]Feedback cannot be empty.[/yellow]")
-                continue
-            previous_plan = draft
-            feedback = feedback_input.strip()
-            _emit_plan_mode_trace(
-                session=session,
-                message="Captured feedback and preparing a revised draft.",
-                full_only=True,
-            )
-            console.print("[bold]Regenerating plan with your feedback...[/bold]")
-            continue
-
-        console.print("Discarded plan. What do you want to build next?")
-        return None
-    console.print("[yellow]Plan iteration limit reached. Returning to prompt.[/yellow]")
-    return None
-
-
 def _print_chat_context(*args: Any, **kwargs: Any) -> Any:
     from . import rendering as _rendering
 
@@ -1967,7 +1818,7 @@ def chat(
     cfg = load_config()
     effective = clone_cfg(cfg)
     if base_url is not None:
-        effective.base_url = base_url
+        apply_runtime_base_url_override(effective, base_url)
     if model is not None:
         effective.model = model
     if temperature is not None:
@@ -2050,7 +1901,7 @@ def chat(
                 return
             effective = clone_cfg(load_config())
             if base_url is not None:
-                effective.base_url = base_url
+                apply_runtime_base_url_override(effective, base_url)
             if model is not None:
                 effective.model = model
             if temperature is not None:
@@ -2189,9 +2040,13 @@ def chat(
                     # only authority. ``--yes`` keeps its gate-level meaning (it skips
                     # the fs_delete / needs_confirm confirmations inside `auto` mode,
                     # see agent/tools_assembly.py) and deliberately does NOT blanket
-                    # auto-allow `review` prompts — that is what `/mode full` is for.
+                    # auto-allow `review` prompts — that is what `/permissions full` is for.
                 )
                 _tui_box: dict[str, Any] = {"session": None}
+
+                from ..tui.local_action_lifecycle import TuiLocalActionLifecycle
+
+                _tui_local_actions = TuiLocalActionLifecycle()
 
                 def _tui_session_builder(surface: Any) -> Any:
                     built = create_session(
@@ -2218,6 +2073,9 @@ def chat(
                         workspace_binding=workspace_binding,
                     )
                     built._alysis_tui_interactive = True
+                    append_event = getattr(getattr(built, "store", None), "append", None)
+                    if callable(append_event):
+                        append_event("chat_surface_started", {"surface": "tui"})
                     _set_chat_usage_hud_enabled(built, _resolve_usage_hud_default(effective))
                     _apply_startup_persona(session=built, console=None)
                     _sync_tui_session_state(_tui_state, built, include_exec_mode=True)
@@ -2225,19 +2083,10 @@ def chat(
                     _tui_box["session"] = built
                     return built
 
-                def _tui_on_turn_complete() -> None:
+                def _tui_refresh_hud() -> None:
                     built = _tui_box.get("session")
                     if built is None:
                         return
-                    # An approved switch_mode proposal applies at turn end; the
-                    # classic loop does this in its turn-finally, and this hook
-                    # is the TUI's turn-end equivalent. Silent on success (the
-                    # badge flip is the feedback, matching Tab cycling); the
-                    # badge sync below picks up the new persona + mode.
-                    try:
-                        _apply_pending_persona_switch(session=built, console=None)
-                    except Exception:  # noqa: BLE001 - HUD refresh must still run
-                        pass
                     _sync_tui_session_state(_tui_state, built, include_exec_mode=True)
                     from ..commands.startup import (
                         _chat_context_percent_value,
@@ -2247,8 +2096,8 @@ def chat(
 
                     try:
                         _refresh_chat_hud_context_cache(built)
-                        # The footer reports provider-usable input capacity so
-                        # its "context" label agrees with /context and /status.
+                        # Show conversation space relative to the startup
+                        # baseline; /context retains full-request diagnostics.
                         pct = _chat_context_percent_value(built)
                         if pct is not None:
                             _tui_state.context_pct = float(pct)
@@ -2277,6 +2126,20 @@ def chat(
                     except Exception:
                         pass
                     _sync_tui_session_state(_tui_state, built)
+
+                def _tui_on_turn_complete() -> None:
+                    built = _tui_box.get("session")
+                    if built is None:
+                        return
+                    # These are true turn-boundary operations. They must never
+                    # run from the mid-turn HUD callback, which can fire after
+                    # any tool result while the provider loop is still active.
+                    try:
+                        _apply_pending_persona_switch(session=built, console=None)
+                    except Exception:  # noqa: BLE001 - rollover remains authoritative
+                        pass
+                    _apply_pending_subagent_history_rollover(built)
+                    _tui_refresh_hud()
 
                 def _tui_config_flow_factory() -> Any:
                     # Built fresh each time bare /config opens, so it always reflects
@@ -2314,7 +2177,7 @@ def chat(
 
                             reloaded = clone_cfg(load_config())
                             if base_url is not None:
-                                reloaded.base_url = base_url
+                                apply_runtime_base_url_override(reloaded, base_url)
                             if model is not None:
                                 reloaded.model = model
                             _tui_box["cfg_override"] = reloaded
@@ -2336,7 +2199,7 @@ def chat(
                         # change, and before the live reload so /config cannot silently
                         # replace the active CLI model or endpoint.
                         if base_url is not None:
-                            reloaded.base_url = base_url
+                            apply_runtime_base_url_override(reloaded, base_url)
                         if model is not None:
                             reloaded.model = model
                         if connection_fingerprint(reloaded) != connection_fingerprint(built.cfg):
@@ -2373,7 +2236,6 @@ def chat(
                     return _TuiConfigReloadOutcome.APPLIED
 
                 _tui_forge_state = _ForgeChatState()
-                _tui_plan_state = _ChatPlanModeState()
 
                 def _tui_make_forge_execute(command_text: str):
                     # Build the callable the worker thread runs for "/execute plan":
@@ -2437,8 +2299,6 @@ def chat(
                                 pending_images=[],
                                 console=cap,
                                 forge_state=_tui_forge_state,
-                                plan_mode_state=_tui_plan_state,
-                                plan_mode_escape_supported=False,
                                 forge_execution_report_sink=_report_sink,
                             )
                             completed = True
@@ -2519,8 +2379,6 @@ def chat(
                                 pending_images=[],
                                 console=cap,
                                 forge_state=_tui_forge_state,
-                                plan_mode_state=_tui_plan_state,
-                                plan_mode_escape_supported=False,
                                 forge_planner_reply_sink=_planner_reply_sink,
                             )
                         except Exception as _planner_exc:  # noqa: BLE001
@@ -2647,29 +2505,6 @@ def chat(
                         width=max(20, min(int(width or 100), 120)),
                     )
                     saved_stdin = _sys.stdin
-                    plan_mode_action_prompt = None
-                    surface_for_plan = getattr(sess, "surface", None)
-                    defer_plan_mode_approval = getattr(
-                        surface_for_plan, "defer_plan_mode_approval", None
-                    )
-                    if callable(defer_plan_mode_approval):
-
-                        def _tui_plan_mode_action_prompt(
-                            *, console: Any, user_message: str, draft: str
-                        ) -> str | None:
-                            console.print(_plan_mode_actions_panel())
-                            console.print("Select option [1/2/3]:")
-                            defer_plan_mode_approval(
-                                user_message=user_message,
-                                draft=draft,
-                                approved_instruction=instruction_with_approved_plan(
-                                    user_message=user_message,
-                                    approved_plan=draft,
-                                ),
-                            )
-                            return None
-
-                        plan_mode_action_prompt = _tui_plan_mode_action_prompt
                     try:
                         _sys.stdin = _io.StringIO("")
                         idle_skill_result = _handle_idle_skill_invocation(
@@ -2679,9 +2514,6 @@ def chat(
                             pending_images=[],
                             console=cap,
                             forge_state=_tui_forge_state,
-                            plan_mode_state=_tui_plan_state,
-                            plan_mode_escape_supported=False,
-                            plan_mode_action_prompt=plan_mode_action_prompt,
                         )
                         result = (
                             idle_skill_result
@@ -2693,9 +2525,11 @@ def chat(
                                 pending_images=[],
                                 console=cap,
                                 forge_state=_tui_forge_state,
-                                plan_mode_state=_tui_plan_state,
-                                plan_mode_escape_supported=False,
-                                plan_mode_action_prompt=plan_mode_action_prompt,
+                                # run_tui records every submitted slash/exit
+                                # command before choosing a native overlay or this
+                                # shared handler. Suppress the classic-path marker
+                                # here so routed TUI commands are not double-counted.
+                                record_local_command=False,
                             )
                         )
                     except Exception as _cmd_exc:  # noqa: BLE001
@@ -2704,7 +2538,7 @@ def chat(
                         _sys.stdin = saved_stdin
                     output = buf.getvalue().rstrip("\n")
                     # Keep footer badges in sync after local commands such as
-                    # /mode and /usage hud.
+                    # /permissions and /usage hud.
                     _sync_tui_session_state(_tui_state, sess, include_exec_mode=True)
                     # The forge state machine flips ui_mode inside _enter_forge_mode
                     # (and back to "chat" on /back / /done); this single sync drives
@@ -2734,8 +2568,26 @@ def chat(
                             run_kwargs["ephemeral_user_messages"] = list(
                                 result.ephemeral_user_messages
                             )
+                        if result.mode_override:
+                            run_kwargs["_alysis_mode_override"] = result.mode_override
+                            run_kwargs["_alysis_restore_mode_after_turn"] = (
+                                result.restore_mode_after is not None
+                            )
                         return ("run", output, result.instruction, run_kwargs)
                     return ("handled", output, None, None)
+
+                def _tui_report_flow_factory(sess: Any, feedback: str) -> Any:
+                    from ..tui.report_flow import ReportFlow
+
+                    return ReportFlow(
+                        workspace_root=session_root,
+                        cfg=getattr(sess, "cfg", None) or effective,
+                        active_session=sess,
+                        active_run_paths=(
+                            _tui_forge_state.paths if _tui_forge_state.ui_mode == "forge" else None
+                        ),
+                        feedback_text=feedback,
+                    )
 
                 from ..commands.chat_status import _chat_status_panel_spec
                 from ..commands.chat_tui_panels import (
@@ -2914,7 +2766,7 @@ def chat(
 
                 # --- Forge read-only panels (only fire inside a Forge session) ---
                 def _tui_forge_plan_and_paths() -> tuple[Any, Any] | None:
-                    if _tui_forge_state.ui_mode != "forge":
+                    if not forge_session_active(_tui_forge_state.ui_mode):
                         return None  # chat-mode /plan, /show handled elsewhere
                     plan = getattr(_tui_forge_state, "plan", None)
                     paths = getattr(_tui_forge_state, "paths", None)
@@ -3010,6 +2862,8 @@ def chat(
 
                 # --- Forge assets (picker + detail panel; replaces the stdin modal) ---
                 def _tui_asset_context() -> tuple[Any, Any] | None:
+                    if not forge_session_active(_tui_forge_state.ui_mode):
+                        return None
                     built = _tui_box.get("session")
                     if built is None:
                         return None
@@ -3260,7 +3114,7 @@ def chat(
                     # /execute plan → open the launch gate instead of firing the swarm
                     # blind. Only the bare "plan" form opens it; any other arg returns
                     # None to fall through to the runner.
-                    if _tui_forge_state.ui_mode != "forge":
+                    if not forge_session_active(_tui_forge_state.ui_mode):
                         return None
                     if arg.strip().lower() != "plan":
                         return None
@@ -3303,7 +3157,13 @@ def chat(
 
                 # Slash-command dropdown: same completer the classic prompt uses, so
                 # typing "/" lists commands and /skill completes registered names.
-                from ..chat_slash_completer import ChatSlashCompleter
+                from ..chat_slash_completer import (
+                    DIFF_COMMAND_SPEC,
+                    NAVIGATION_COMMAND_SPECS,
+                    REVIEW_COMMAND_SPEC,
+                    ChatSlashCompleter,
+                )
+                from ..tui.review_client import create_review_engine
 
                 def _tui_skill_names() -> list[str]:
                     built = _tui_box.get("session")
@@ -3312,10 +3172,32 @@ def chat(
                 _tui_completer = ChatSlashCompleter(
                     mode_provider=lambda: _tui_forge_state.ui_mode,
                     skill_names_provider=_tui_skill_names,
+                    extra_specs=(DIFF_COMMAND_SPEC, REVIEW_COMMAND_SPEC, *NAVIGATION_COMMAND_SPECS),
                 )
 
-                # TUI-native /mode picker: bare /mode opens a selectable popup;
-                # "/mode <name>" still applies inline via the command runner.
+                def _tui_review_engine(workspace: Path) -> Any:
+                    from ...config import clone_cfg
+
+                    built = _tui_box.get("session")
+                    cfg = clone_cfg(
+                        getattr(built, "cfg", None) or _tui_box.get("cfg_override") or effective
+                    )
+                    return lambda token: create_review_engine(
+                        workspace, cfg, token, api_key_override=api_key_override
+                    )
+
+                def _tui_completion_workdir() -> Path:
+                    from ...agent.prompt_context import resolve_session_active_workdir_path
+
+                    built = _tui_box.get("session")
+                    return (
+                        Path(resolve_session_active_workdir_path(built))
+                        if built is not None
+                        else Path(focus_path)
+                    )
+
+                # TUI-native /permissions picker: bare /permissions opens a selectable popup;
+                # "/permissions <name>" still applies inline via the command runner.
                 from ..commands.chat_terminal import (
                     _chat_mode_display,
                     _chat_mode_rows,
@@ -3324,7 +3206,6 @@ def chat(
                 )
                 from ..commands.startup import (
                     _chat_trace_level,
-                    _set_chat_stream_enabled,
                     _set_chat_trace_level,
                 )
 
@@ -3332,35 +3213,66 @@ def chat(
                     "full (fullaccess) disables write/shell safety guards and approval prompts."
                 )
 
+                def _tui_step_operation_resolver(built: Any, text: str) -> ResolvedOperation | None:
+                    return _resolve_tui_step_operation(
+                        session=built,
+                        text=text,
+                    )
+
+                def _tui_step_operation_apply(built: Any, operation: ResolvedOperation) -> None:
+                    _apply_tui_step_operation(
+                        session=built,
+                        operation=operation,
+                        tui_state=_tui_state,
+                    )
+                    if operation.kind == "mode" and operation.payload == "fullaccess":
+                        emit_warning = getattr(
+                            getattr(built, "surface", None), "emit_warning", None
+                        )
+                        if callable(emit_warning):
+                            emit_warning(_FULLACCESS_WARNING)
+
                 def _tui_mode_select(value: str) -> list[tuple[str, str]] | None:
                     built = _tui_box.get("session")
                     if built is None:
                         return None
-                    current = str(getattr(built, "mode", "review") or "review").strip().lower()
-                    if _chat_plan_mode_enabled(_tui_plan_state):
-                        if value == "readonly":
-                            return [("system", "Mode already set: Read-Only (Plan Mode is on)")]
-                        return [
-                            (
-                                "warn",
-                                "Cannot change execution mode while Plan Mode is on. "
-                                "Use /plan off first.",
+                    active = str(getattr(built, "mode", "review") or "review").strip().lower()
+                    pending = _pending_chat_permissions(built)
+                    selected = pending or active
+                    persona_is_narrowing = getattr(built, "persona_restore_mode", None) is not None
+                    if value == selected and not (pending is None and persona_is_narrowing):
+                        if pending is not None:
+                            message = (
+                                "Permissions already selected for the next message: "
+                                f"{_chat_mode_display(value)}"
                             )
-                        ]
-                    if value == current:
-                        msgs = [("system", f"Mode already set: {_chat_mode_display(value)}")]
+                        else:
+                            message = f"Permissions already active: {_chat_mode_display(value)}"
+                        msgs = [("system", message)]
                         if value == "fullaccess":
                             msgs.append(("warn", _FULLACCESS_WARNING))
                         return msgs
                     try:
-                        _clear_persona_restore(built)
-                        _apply_chat_effective_mode(
-                            session=built, next_mode=value, persist_default_mode=True
+                        _apply_tui_step_operation(
+                            session=built,
+                            operation=ResolvedOperation("mode", value, f"permissions: {value}"),
+                            tui_state=_tui_state,
                         )
                     except Exception as exc:  # noqa: BLE001
-                        return [("error", f"Failed to change mode: {exc}")]
-                    _tui_state.exec_mode = value
-                    msgs = [("system", f"Mode → {_chat_mode_display(value)}")]
+                        return [("error", f"Failed to select Permissions: {exc}")]
+                    staged = _pending_chat_permissions(built)
+                    if staged is None:
+                        message = (
+                            "Pending Permissions cleared; active Permissions remain "
+                            f"{_chat_mode_display(active)}"
+                        )
+                    else:
+                        message = (
+                            "Permissions for the next message: "
+                            f"{_chat_mode_display(staged)} "
+                            f"(currently {_chat_mode_display(active)})"
+                        )
+                    msgs = [("system", message)]
                     if value == "fullaccess":
                         msgs.append(("warn", _FULLACCESS_WARNING))
                     return msgs
@@ -3371,13 +3283,6 @@ def chat(
                         return None
                     if not persona_modes_enabled(getattr(built, "cfg", None)):
                         return [("warn", "Persona modes are disabled.")]
-                    if _chat_plan_mode_enabled(_tui_plan_state):
-                        return [
-                            (
-                                "warn",
-                                "Cannot change persona while Plan Mode is on. Use /plan off first.",
-                            )
-                        ]
                     registry = _session_persona_registry(built)
                     persona_name = normalize_persona(value, registry)
                     current_persona = normalize_persona(getattr(built, "persona", "code"), registry)
@@ -3413,9 +3318,9 @@ def chat(
                     }
 
                 def _tui_persona_cycle() -> list[tuple[str, str]] | None:
-                    # Kilo/OpenCode-style shortcut: Tab on an empty input cycles
+                    # Persona shortcut: Tab on an empty input cycles
                     # code -> architect -> ask -> debug -> code. Same primitive,
-                    # clamp, and events as /mode <persona>. Success is SILENT:
+                    # clamp, and events as /persona <name>. Success is SILENT:
                     # the footer badge flipping is the feedback — the transcript
                     # only ever sees warnings and errors.
                     built = _tui_box.get("session")
@@ -3423,13 +3328,6 @@ def chat(
                         return None
                     if not persona_modes_enabled(getattr(built, "cfg", None)):
                         return None
-                    if _chat_plan_mode_enabled(_tui_plan_state):
-                        return [
-                            (
-                                "warn",
-                                "Cannot change persona while Plan Mode is on. Use /plan off first.",
-                            )
-                        ]
                     target = next_persona(
                         getattr(built, "persona", "code"), _session_persona_registry(built)
                     )
@@ -3443,35 +3341,104 @@ def chat(
                     _tui_state.exec_mode = effective
                     return None
 
-                def _tui_mode_cycle() -> list[tuple[str, str]] | None:
-                    # Shift+Tab shortcut: advance the execution mode one notch
-                    # (read -> safe -> fast -> full -> read). Routed through
-                    # _tui_mode_select so it shares the /mode picker's plan-mode
-                    # guard, persistence, and fullaccess warning — the mode is the
-                    # only approval authority, so this must not be a footer-only
-                    # flip. Unlike the persona cycle this is NOT silent: landing on
-                    # fullaccess has to announce itself.
+                def _tui_persona_stage_target(staged_persona: str | None) -> str | None:
                     built = _tui_box.get("session")
                     if built is None:
                         return None
-                    current = str(getattr(built, "mode", "review") or "review").strip().lower()
+                    if not persona_modes_enabled(getattr(built, "cfg", None)):
+                        return None
+                    current = staged_persona or getattr(built, "persona", "code")
+                    return next_persona(current, _session_persona_registry(built))
+
+                def _tui_mode_cycle() -> list[tuple[str, str]] | None:
+                    # Shift+Tab shortcut: advance the pending-or-active selection
+                    # one notch
+                    # (read -> safe -> fast -> full -> read). Routed through
+                    # _tui_mode_select so it shares the /permissions picker's
+                    # staging and fullaccess warning. Selection never changes the
+                    # active turn's tool surface. Unlike the persona cycle this is
+                    # NOT silent: choosing fullaccess has to announce itself.
+                    built = _tui_box.get("session")
+                    if built is None:
+                        return None
+                    current = (
+                        _pending_chat_permissions(built)
+                        or str(getattr(built, "mode", "review") or "review").strip().lower()
+                    )
                     return _tui_mode_select(_next_exec_mode(current))
 
                 def _tui_mode_picker() -> dict[str, Any] | None:
                     built = _tui_box.get("session")
-                    current = str(getattr(built, "mode", "review") or "review").strip().lower()
+                    active = str(getattr(built, "mode", "review") or "review").strip().lower()
+                    pending = _pending_chat_permissions(built)
+                    selected = pending or active
                     rows: list[dict[str, Any]] = []
                     for value, label, desc in _chat_mode_rows():
                         clean = label.split(") ", 1)[-1] if ") " in label else label
+                        tag = ""
+                        if value == pending:
+                            tag = "(next message)"
+                        elif value == active:
+                            tag = "(active)"
                         rows.append(
                             {
                                 "label": clean,
                                 "description": desc,
                                 "value": value,
-                                "current": value == current,
+                                "current": value == selected,
+                                "tag": tag,
                             }
                         )
-                    return {"title": "Mode", "rows": rows, "on_select": _tui_mode_select}
+                    return {
+                        "title": "Permissions",
+                        "rows": rows,
+                        "on_select": _tui_mode_select,
+                    }
+
+                def _tui_before_turn(
+                    built: Any,
+                    run_kwargs: dict[str, Any],
+                ) -> Any:
+                    # A post-turn callback failure must not allow the next
+                    # provider request to see stale lifecycle history. Retry
+                    # the consume-once rollover here and reject the turn if it
+                    # still cannot be applied.
+                    _apply_pending_subagent_history_rollover(built)
+                    temporary_mode = str(run_kwargs.pop("_alysis_mode_override", "") or "").strip()
+                    restore_after = bool(run_kwargs.pop("_alysis_restore_mode_after_turn", False))
+                    # A staged base Permissions choice becomes authoritative at
+                    # this message boundary. Per-turn scopes still apply, and
+                    # their private transport metadata must never leak through
+                    # to session.run_turn.
+                    _activate_pending_chat_permissions(session=built)
+                    restore_mode = str(getattr(built, "mode", "review") or "review").strip()
+                    if temporary_mode and temporary_mode != restore_mode:
+                        _apply_chat_effective_mode(
+                            session=built,
+                            next_mode=temporary_mode,
+                            persist_default_mode=False,
+                        )
+                    _sync_tui_session_state(
+                        _tui_state,
+                        built,
+                        include_exec_mode=True,
+                    )
+                    if not temporary_mode or not restore_after or temporary_mode == restore_mode:
+                        return None
+
+                    def _restore_turn_permissions() -> None:
+                        _apply_chat_effective_mode(
+                            session=built,
+                            next_mode=restore_mode,
+                            persist_default_mode=False,
+                        )
+                        _sync_tui_session_state(
+                            _tui_state,
+                            built,
+                            include_exec_mode=True,
+                        )
+
+                    return _restore_turn_permissions
 
                 # TUI-native /stream picker: bare /stream opens a selectable popup;
                 # "/stream on|off|status" still applies inline via the command runner.
@@ -3483,7 +3450,11 @@ def chat(
                     current = bool(getattr(built, "stream", True))
                     if enabled == current:
                         return [("system", f"Streaming already set: {value}")]
-                    _set_chat_stream_enabled(session=built, enabled=enabled)
+                    _apply_tui_step_operation(
+                        session=built,
+                        operation=ResolvedOperation("stream", enabled, f"stream: {value}"),
+                        tui_state=_tui_state,
+                    )
                     return [("system", f"Streaming → {value}")]
 
                 def _tui_stream_picker() -> dict[str, Any] | None:
@@ -3554,7 +3525,7 @@ def chat(
                 # panel/runner path applies with no extra Enter. They fire only in a
                 # Forge session; in chat mode they return None and fall through.
                 def _tui_forge_plan_picker() -> dict[str, Any] | None:
-                    if _tui_forge_state.ui_mode != "forge":
+                    if not forge_session_active(_tui_forge_state.ui_mode):
                         return None
                     rows = [
                         {
@@ -3584,7 +3555,7 @@ def chat(
                     }
 
                 def _tui_forge_assistant_picker() -> dict[str, Any] | None:
-                    if _tui_forge_state.ui_mode != "forge":
+                    if not forge_session_active(_tui_forge_state.ui_mode):
                         return None
                     enabled = bool(getattr(_tui_forge_state, "assistant_enabled", False))
                     rows = [
@@ -3649,7 +3620,7 @@ def chat(
                         getattr(store, "git_root", None),
                     )
 
-                def _tui_resume_apply(target_session_id: str) -> None:
+                def _tui_resume_apply(target_session_id: str) -> bool:
                     # Swap the live session to the chosen one (mutated in place, so the
                     # app's session reference + surface stay valid), reload its history
                     # into the transcript, and refresh the footer HUD/model/mode. Writes
@@ -3668,20 +3639,25 @@ def chat(
                                 pass
 
                     if built is None:
-                        return
+                        return False
                     store = getattr(built, "store", None)
                     current_before = str(getattr(store, "session_id", "") or "")
+                    pending_permissions = _pending_chat_permissions(built)
                     try:
+                        provider = _tui_session_search_provider()
+                        if provider is None:
+                            raise RuntimeError("Session workspace is unavailable.")
+                        provider.resolve(str(target_session_id))
                         resumed, message, history = _resume_chat_session(
                             session=built, target_session_id=str(target_session_id)
                         )
                     except Exception as exc:  # noqa: BLE001 - never crash the UI
                         _note(f"Resume failed: {exc}", role="error")
-                        return
+                        return False
                     plain = _strip_rich_markup(message)
                     if not resumed:
                         _note(plain or "Resume failed.", role="error")
-                        return
+                        return False
                     current_after = str(
                         getattr(getattr(built, "store", None), "session_id", "") or ""
                     )
@@ -3691,7 +3667,7 @@ def chat(
                         # current session, but a typed "/resume <current-id>" can land
                         # here via the direct-id fallback.)
                         _note(plain or "Session already active.", role="system")
-                        return
+                        return True
                     # Real swap: reload the prior conversation + refresh HUD/footer.
                     loader = getattr(surface, "replace_history", None)
                     if callable(loader):
@@ -3705,6 +3681,11 @@ def chat(
                         _reapply_resumed_persona(session=built, console=None)
                     except Exception:  # noqa: BLE001 - resume must still land
                         pass
+                    if pending_permissions is not None:
+                        _stage_chat_permissions(
+                            session=built,
+                            next_mode=pending_permissions,
+                        )
                     try:
                         _tui_on_turn_complete()  # refresh tokens/cost/context
                     except Exception:
@@ -3725,6 +3706,8 @@ def chat(
                         for m in (history or [])
                     )
                     _note(plain or "Resumed.", role="system" if has_visible else "assistant")
+
+                    return True
 
                 def _tui_resume_select(value: str) -> None:
                     _tui_resume_apply(str(value))
@@ -3750,9 +3733,20 @@ def chat(
                     spec["on_select"] = _tui_resume_select
                     return spec
 
+                def _tui_session_search_provider():
+                    from ..tui.session_navigation import SessionPickerProvider
+
+                    ctx = _tui_resume_context()
+                    if ctx is None:
+                        return None
+                    _, sessions_dir, _, workspace, git_root = ctx
+                    return SessionPickerProvider(
+                        sessions_dir, workspace_root=workspace, git_root=git_root
+                    )
+
                 _tui_picker_providers = {
                     "/login": _tui_login_picker,
-                    "/mode": _tui_mode_picker,
+                    "/permissions": _tui_mode_picker,
                     "/persona": _tui_persona_picker,
                     "/stream": _tui_stream_picker,
                     "/trace": _tui_trace_picker,
@@ -3762,6 +3756,17 @@ def chat(
                     "/assets": _tui_assets_picker,
                 }
 
+                from ..commands.forge_helpers import _enter_forge_mode as _planning_enter_forge
+                from ..tui.planning_backend import ChatPlanningBackend
+
+                _planning_backend = ChatPlanningBackend(
+                    lambda: _tui_box.get("session"),
+                    _tui_forge_state,
+                    _tui_state,
+                    apply_persona=_apply_chat_persona,
+                    enter_forge=_planning_enter_forge,
+                )
+
                 _tui_ok = False
                 _tui_result: Any = None
                 try:
@@ -3769,14 +3774,19 @@ def chat(
                         _tui_state,
                         session_builder=None if subscription_blocked else _tui_session_builder,
                         on_turn_complete=None if subscription_blocked else _tui_on_turn_complete,
-                        on_hud_refresh=None if subscription_blocked else _tui_on_turn_complete,
+                        on_hud_refresh=None if subscription_blocked else _tui_refresh_hud,
                         command_runner=_tui_command_runner,
                         panel_providers=_tui_panel_providers,
                         picker_providers=_tui_picker_providers,
                         persona_cycle=_tui_persona_cycle,
+                        persona_stage_target=_tui_persona_stage_target,
                         mode_cycle=_tui_mode_cycle,
+                        before_turn=_tui_before_turn,
+                        step_operation_resolver=_tui_step_operation_resolver,
+                        step_operation_apply=_tui_step_operation_apply,
                         completer=_tui_completer,
                         config_flow_factory=_tui_config_flow_factory,
+                        report_flow_factory=_tui_report_flow_factory,
                         on_config_saved=_tui_on_config_saved,
                         unavailable_message=(
                             subscription_availability.message if subscription_blocked else None
@@ -3790,9 +3800,38 @@ def chat(
                         open_config_on_start=bool(
                             subscription_blocked and subscription_availability.selection_required
                         ),
+                        workspace_root=focus_path,
+                        workdir_provider=_tui_completion_workdir,
+                        review_engine_factory=_tui_review_engine,
+                        session_search_provider=_tui_session_search_provider,
+                        resume_session=_tui_resume_apply,
+                        local_lifecycle=_tui_local_actions,
+                        planning_backend=_planning_backend,
+                        history_persistence=not no_log,
                     )
                     _tui_ok = True
+                    built = _tui_box.get("session")
+                    append_event = getattr(getattr(built, "store", None), "append", None)
+                    if callable(append_event):
+                        append_event(
+                            "chat_surface_finished",
+                            {"surface": "tui", "status": "completed"},
+                        )
                 except Exception as _tui_exc:  # pragma: no cover - defensive fallback
+                    built = _tui_box.get("session")
+                    append_event = getattr(getattr(built, "store", None), "append", None)
+                    if callable(append_event):
+                        try:
+                            append_event(
+                                "chat_surface_finished",
+                                {"surface": "tui", "status": "failed"},
+                            )
+                        except Exception:
+                            pass
+                    if isinstance(_tui_exc, McpError):
+                        # Rebuilding the same MCP session in classic chat cannot
+                        # repair a server startup failure. Report it once below.
+                        raise
                     console.print(
                         f"[yellow]TUI unavailable ({_tui_exc}); using classic chat.[/yellow]"
                     )
@@ -3920,6 +3959,9 @@ def chat(
     except ConfigError as e:
         console.print(f"[red]Config error:[/red] {e}")
         raise typer.Exit(code=2) from e
+    except McpError as e:
+        console.print(f"MCP error: {sanitize_error_text_for_output(e)}", style="red", markup=False)
+        raise typer.Exit(code=1) from e
     except WorkspaceBindingError as e:
         console.print(f"[red]Workspace error:[/red] {e}")
         raise typer.Exit(code=1) from e
@@ -3931,7 +3973,6 @@ def chat(
             )
         pending_images = [os.fspath(p) for p in (image or [])]
         forge_state = _ForgeChatState()
-        plan_mode_state = _ChatPlanModeState()
         _apply_startup_persona(session=session, console=console)
         prompt_session = _maybe_make_chat_prompt_session(
             console=console,
@@ -3939,7 +3980,6 @@ def chat(
             pending_images=pending_images,
             forge_state=forge_state,
             session=session,
-            plan_mode_state=plan_mode_state,
         )
         if pending_images:
             console.print(f"Queued {len(pending_images)} image(s) for your next message.")
@@ -3957,20 +3997,15 @@ def chat(
                             session=session,
                             pending_images=_pending_images,
                             forge_state=forge_state,
-                            plan_mode_enabled=_chat_plan_mode_enabled(plan_mode_state),
                         )
 
-                    prompt_result = prompt_session.prompt(
+                    user_msg = prompt_session.prompt(
                         _chat_prompt_label_formatted(
                             ui_mode=forge_state.ui_mode,
                             mode=str(getattr(session, "mode", "")),
                         ),
                         bottom_toolbar=_bottom_toolbar,
                     )
-                    if prompt_result is _CHAT_PROMPT_RESULT_PLAN_MODE_OFF:
-                        user_msg = "/plan off"
-                    else:
-                        user_msg = prompt_result
                     if not prompt_session_erases and isinstance(user_msg, str):
                         _clear_submitted_prompt_line(
                             submitted_text=user_msg,
@@ -4000,8 +4035,6 @@ def chat(
                 pending_images=pending_images,
                 console=console,
                 forge_state=forge_state,
-                plan_mode_state=plan_mode_state,
-                plan_mode_escape_supported=prompt_session is not None,
             )
             if command_result is None:
                 command_result = _handle_chat_command(
@@ -4011,23 +4044,11 @@ def chat(
                     pending_images=pending_images,
                     console=console,
                     forge_state=forge_state,
-                    plan_mode_state=plan_mode_state,
-                    plan_mode_escape_supported=prompt_session is not None,
                 )
             if command_result == "exit":
                 return
             if command_result == "handled":
                 continue
-            if command_result == "send" and _chat_plan_mode_enabled(plan_mode_state):
-                command_result = _resolve_interactive_plan_mode_request(
-                    session=session,
-                    console=console,
-                    plan_mode_state=plan_mode_state,
-                    user_message=user_msg,
-                    plan_mode_escape_supported=prompt_session is not None,
-                )
-                if command_result == "handled":
-                    continue
 
             execution_instruction = (
                 command_result.instruction
@@ -4061,26 +4082,37 @@ def chat(
                 if isinstance(command_result, _ChatExecutionRequest)
                 else None
             )
-            plan_mode_capture_task = (
-                command_result.plan_mode_capture_task
-                if isinstance(command_result, _ChatExecutionRequest)
-                else None
-            )
             chat_only_turn = (
                 bool(command_result.chat_only)
                 if isinstance(command_result, _ChatExecutionRequest)
                 else False
             )
-
             images_for_turn = pending_images.copy()
             interrupted = False
             llm_failed = False
             restored_mode_after_turn = False
-            turn_start_messages = (
-                len(getattr(session, "messages", []) or [])
-                if plan_mode_capture_task is not None
-                else 0
-            )
+            # A Permissions selection becomes authoritative exactly once, here,
+            # after local commands have resolved to a real user turn and before
+            # any temporary /ask overlay is prepared.
+            try:
+                activated_mode = _activate_pending_chat_permissions(session=session)
+            except Exception as e:  # noqa: BLE001 - selection remains retryable
+                console.print(f"[red]Failed to activate Permissions for this message:[/red] {e}")
+                console.print(
+                    "[yellow]The message was not sent; your selection is pending.[/yellow]"
+                )
+                continue
+            if activated_mode is not None:
+                from ..commands.chat_terminal import (
+                    _chat_mode_display as _display_activated_mode,
+                )
+
+                console.print(f"Permissions activated: {_display_activated_mode(activated_mode)}")
+                # /ask resolves its one-turn restore target before this
+                # message-boundary activation. Restore to the newly active
+                # user base, not the mode that was active while selecting.
+                if temporary_mode_override is not None and restore_mode_after is not None:
+                    restore_mode_after = activated_mode
             if temporary_mode_override is not None:
                 try:
                     _apply_chat_effective_mode(
@@ -4091,9 +4123,13 @@ def chat(
                 except Exception as e:  # noqa: BLE001
                     console.print(f"[red]Failed to prepare approved execution:[/red] {e}")
                     continue
+            turn_cancellation = InteractiveCancellationToken()
             try:
-                with _chat_turn_interrupt_monitor():
-                    run_turn_kwargs: dict[str, Any] = {"image_paths": images_for_turn or None}
+                with _chat_turn_interrupt_monitor(cancellation_token=turn_cancellation):
+                    run_turn_kwargs: dict[str, Any] = {
+                        "image_paths": images_for_turn or None,
+                        "cancellation_token": turn_cancellation,
+                    }
                     if routing_mode_override is not None:
                         run_turn_kwargs["routing_mode_override"] = routing_mode_override
                     combined_ephemeral_system = list(ephemeral_system_messages or [])
@@ -4136,7 +4172,7 @@ def chat(
                         restored_mode_after_turn = True
                     except Exception as e:  # noqa: BLE001
                         console.print(
-                            f"[red]Failed to restore Plan Mode after execution:[/red] {e}"
+                            f"[red]Failed to restore the execution mode after the turn:[/red] {e}"
                         )
                 # An approved switch_mode proposal applies after mode-override
                 # restoration so the persona's clamp works from the user's
@@ -4155,14 +4191,6 @@ def chat(
             _refresh_chat_hud_context_cache(session)
             if interrupted:
                 continue
-            if plan_mode_capture_task is not None:
-                _record_plan_mode_draft_from_turn(
-                    session=session,
-                    console=console,
-                    plan_mode_state=plan_mode_state,
-                    user_message=plan_mode_capture_task,
-                    start_index=turn_start_messages,
-                )
             _ensure_session_summary_metadata(session=session, allow_model_summary=False)
             usage_result = _chat_turn_usage_line(session)
             if usage_result is not None:
@@ -4177,6 +4205,63 @@ def chat(
                     )
     finally:
         session.close()
+
+
+def _load_run_seed_messages(
+    *,
+    session_id: str | None,
+    session_dir: Path | None,
+    managed_session_persistence: Any = None,
+) -> list[dict[str, Any]] | None:
+    """Load prior turns for a standalone named run without duplicating App-owned context."""
+
+    if not session_id:
+        return None
+    owned_persistence = None
+    try:
+        from ...managed_session import (
+            normalize_managed_session_id,
+            prepare_managed_session_persistence,
+        )
+        from ..commands.chat_resume_helpers import _load_chat_resume_messages
+
+        normalized = normalize_managed_session_id(session_id)
+        persistence = managed_session_persistence
+        if persistence is None:
+            if session_dir is not None:
+                sessions_dir = Path(session_dir)
+            else:
+                from ...config import default_sessions_dir
+
+                sessions_dir = default_sessions_dir()
+            owned_persistence = prepare_managed_session_persistence(
+                sessions_dir=sessions_dir,
+                session_id=normalized,
+                append=False,
+            )
+            owned_persistence.seal()
+            persistence = owned_persistence
+        if persistence.session_id != normalized:
+            return None
+        persistence.require_sealed()
+        loaded = _load_chat_resume_messages(
+            None,
+            event_records=persistence.events_snapshot(),
+        )
+        if owned_persistence is not None:
+            owned_persistence.close()
+        return loaded or None
+    except Exception:  # noqa: BLE001 - a corrupt prior log must not block a fresh turn.
+        try:
+            if owned_persistence is not None:
+                owned_persistence.close()
+        except Exception:  # noqa: BLE001
+            pass
+        if managed_session_persistence is not None:
+            # An explicit App-managed boundary is fail-closed; only legacy
+            # implicit/default history loading retains best-effort semantics.
+            raise
+        return None
 
 
 def run(
@@ -4289,7 +4374,19 @@ def run(
         "--diagnostic-log",
         help="Append minimal crash-safe diagnostic events to this JSONL path.",
     ),
+    session_id: str | None = typer.Option(
+        None,
+        "--session",
+        help="Resume (or start) a named session id. Used by the desktop chat.",
+    ),
+    session_dir: Path | None = typer.Option(
+        None,
+        "--session-dir",
+        help="Directory holding session JSONL logs (defaults to the standard sessions dir).",
+    ),
     cli_ctx: Any = None,
+    strict_provenance: bool = False,
+    managed_session_persistence: Any = None,
 ) -> None:
     console = _console()
     cfg = load_config()
@@ -4312,7 +4409,7 @@ def run(
     if raw_benchmark_profile:
         _apply_raw_benchmark_profile(effective)
     if base_url is not None:
-        effective.base_url = base_url
+        apply_runtime_base_url_override(effective, base_url)
     if model is not None:
         effective.model = model
     if temperature is not None:
@@ -4326,6 +4423,14 @@ def run(
         effective.max_steps = max_steps
     if subagents is not None:
         effective.subagents_enabled = subagents
+    if strict_provenance is True:
+        problems = _strict_provenance_problems(stream=stream, cfg=effective)
+        if problems:
+            console.print(
+                "[red]Config error:[/red] --strict-provenance refuses to start: "
+                + "; ".join(problems)
+            )
+            raise typer.Exit(code=2)
 
     effective_mode = (mode.value if mode else effective.default_mode) or "review"
     effective_yes = bool(yes or raw_benchmark_profile)
@@ -4342,6 +4447,23 @@ def run(
     binding_source = _path_binding_source(path_source, path)
 
     try:
+        if session_id is not None:
+            from ...managed_session import normalize_managed_session_id
+
+            session_id = normalize_managed_session_id(session_id)
+            if managed_session_persistence is None:
+                raise ConfigError("Managed session filesystem boundary is unavailable")
+            if managed_session_persistence.session_id != session_id:
+                raise ConfigError("Managed session filesystem boundary does not match --session")
+            managed_session_persistence.require_sealed()
+            session_dir = managed_session_persistence.sessions_dir
+        elif session_dir is not None or managed_session_persistence is not None:
+            raise ConfigError("--session-dir requires --session")
+        if delegated_execution and session_id is not None:
+            raise ConfigError(
+                "--session/--session-dir managed persistence is not supported with "
+                "delegated execution"
+            )
         if not delegated_execution and not effective.model:
             raise ConfigError("Model is not set. Run: alysis config set model <MODEL>")
         api_key_override = None
@@ -4488,6 +4610,18 @@ def run(
                 console=console,
             )
         else:
+            app_managed_context = instruction.lstrip().startswith(
+                ("[Alysis Desktop context", "[Alysis Desktop context")
+            )
+            seed_messages = (
+                None
+                if app_managed_context
+                else _load_run_seed_messages(
+                    session_id=session_id,
+                    session_dir=session_dir,
+                    managed_session_persistence=managed_session_persistence,
+                )
+            )
             code = run_agent(
                 cfg=effective,
                 root=workspace_binding.workspace_context.workspace_root,
@@ -4497,7 +4631,9 @@ def run(
                 persona_allow_write_globs=run_persona_globs,
                 ephemeral_system_messages=run_persona_overlays,
                 ephemeral_user_messages=run_persona_user_overlays,
-                runtime_kind=RuntimeKind.ONE_SHOT,
+                runtime_kind=(
+                    RuntimeKind.INTERACTIVE_CHAT if app_managed_context else RuntimeKind.ONE_SHOT
+                ),
                 yes=effective_yes,
                 max_steps=effective.max_steps,
                 no_log=no_log,
@@ -4507,7 +4643,11 @@ def run(
                 non_interactive=non_interactive,
                 usage_role="run",
                 subagents_enabled=effective.subagents_enabled,
-                one_shot_execution=True,
+                # Desktop Chat owns a persistent conversation and may contain
+                # ordinary questions. Keep strict one-shot apply/verify gates
+                # for canonical ``alysis run`` while allowing the observed-
+                # activity interactive gate to govern app-managed turns.
+                one_shot_execution=not app_managed_context,
                 enable_chat_turn_step_budget=True,
                 chat_turn_fixed_override=fixed_step_override,
                 enable_tool_output_offload=(True if raw_benchmark_profile else None),
@@ -4518,6 +4658,10 @@ def run(
                 no_run_deadline=no_deadline,
                 require_run_deadline=require_deadline,
                 crash_diagnostic_log_path=diagnostic_log,
+                session_log_dir_override=session_dir,
+                session_id_override=session_id,
+                seed_messages=seed_messages,
+                managed_session_persistence=managed_session_persistence,
             )
     except ConfigError as e:
         console.print(f"[red]Config error:[/red] {e}")
@@ -4537,7 +4681,7 @@ def run(
             pass
         exit_code = exit_code_for_failure(e)
         label = (
-            "Infrastructure error after retries"
+            _infrastructure_failure_label(e)
             if exit_code == INFRASTRUCTURE_FAILURE_EXIT_CODE
             else "Error"
         )
@@ -4554,6 +4698,43 @@ def run(
     raise typer.Exit(code=code)
 
 
+def _strict_provenance_problems(*, stream: bool | None, cfg: Any) -> list[str]:
+    """What a scored run would otherwise leave to a default, one line each.
+
+    Streaming must be chosen on the command line, because ``run`` otherwise
+    streams by default without recording that anyone chose it. Thinking must
+    resolve to true or false, because an unset value leaves the provider's own
+    default in force while the session records ``None``.
+    """
+    from ...config import resolve_llm_enable_thinking
+
+    problems: list[str] = []
+    if stream is None:
+        problems.append("streaming is not explicit (pass --stream or --no-stream)")
+    if resolve_llm_enable_thinking(cfg) is None:
+        problems.append(
+            "thinking is not explicit (set ALYSIS_LLM_ENABLE_THINKING=true|false "
+            "or llm_enable_thinking)"
+        )
+    return problems
+
+
+def _infrastructure_failure_label(error: BaseException) -> str:
+    """Console label for an infrastructure failure, with the real counts.
+
+    States attempts and retries as numbers whenever the provider retry loop
+    recorded them, so a failure that was never retried cannot be reported as
+    having been retried.
+    """
+    counts = provider_attempt_counts(error)
+    if counts is None:
+        return "Infrastructure error"
+    attempts, retries = counts
+    attempt_word = "attempt" if attempts == 1 else "attempts"
+    retry_word = "retry" if retries == 1 else "retries"
+    return f"Infrastructure error after {attempts} {attempt_word} ({retries} {retry_word})"
+
+
 def _handle_chat_command_impl(cli_mod: Any, *args: Any, **kwargs: Any) -> Any:
     _sync_cli_globals(cli_mod)
     return _handle_chat_command(*args, **kwargs)
@@ -4562,11 +4743,6 @@ def _handle_chat_command_impl(cli_mod: Any, *args: Any, **kwargs: Any) -> Any:
 def _handle_forge_chat_command_impl(cli_mod: Any, *args: Any, **kwargs: Any) -> Any:
     _sync_cli_globals(cli_mod)
     return _handle_forge_chat_command(*args, **kwargs)
-
-
-def _run_plan_mode_approval_loop_impl(cli_mod: Any, *args: Any, **kwargs: Any) -> Any:
-    _sync_cli_globals(cli_mod)
-    return _run_plan_mode_approval_loop(*args, **kwargs)
 
 
 def _print_chat_context_impl(cli_mod: Any, *args: Any, **kwargs: Any) -> Any:

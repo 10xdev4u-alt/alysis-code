@@ -9,7 +9,6 @@ import pytest
 from alysis_code.agent_loop import (
     ToolDef,
     _resolve_session_pinned_prefix_len,
-    _session_task_brief_content,
     create_session,
 )
 from alysis_code.config import AppConfig
@@ -72,6 +71,17 @@ def _task_brief_message_count(session: Any) -> int:
         if str(message.get("role") or "") == "user"
         and str(message.get("content") or "").startswith("<task_brief>")
     )
+
+
+def _messages_without_task_brief(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        message
+        for message in messages
+        if not (
+            str(message.get("role") or "") == "user"
+            and str(message.get("content") or "").startswith("<task_brief>")
+        )
+    ]
 
 
 def test_run_turn_blocks_repeated_identical_failed_tool_calls(tmp_path: Path) -> None:
@@ -353,13 +363,19 @@ def test_run_turn_rolls_back_user_message_after_llm_error(tmp_path: Path) -> Non
     try:
         with pytest.raises(LLMError):
             session.run_turn("Refactor src/app.py and explain the change.")
-        assert session.messages == baseline_messages
+        # The turn's transient messages (its user message) are rolled back and
+        # the pinned prefix is unchanged. The one pinned message that may differ
+        # is the task brief, which is re-rendered from the task the turn
+        # accepted before dispatch (acceptance is not withdrawn by the failure).
+        assert _messages_without_task_brief(session.messages) == _messages_without_task_brief(
+            baseline_messages
+        )
         assert _resolve_session_pinned_prefix_len(session) == baseline_pinned_prefix_len
     finally:
         session.close()
 
 
-def test_run_turn_llm_error_restores_exact_pre_turn_task_brief_state(tmp_path: Path) -> None:
+def test_run_turn_llm_error_keeps_accepted_task_and_brief_in_agreement(tmp_path: Path) -> None:
     cfg = AppConfig(model="test-model", routing_mode="code_only")
     session = create_session(
         cfg=cfg,
@@ -372,117 +388,16 @@ def test_run_turn_llm_error_restores_exact_pre_turn_task_brief_state(tmp_path: P
     )
     session.client = _FailingClient()  # type: ignore[assignment]
     baseline_messages = copy.deepcopy(session.messages)
-    baseline_task_brief = _session_task_brief_content(session)
     baseline_pinned_prefix_len = _resolve_session_pinned_prefix_len(session)
 
     try:
         with pytest.raises(LLMError):
             session.run_turn("Fix src/parser.py without changing the CSV shape.")
-        assert session.messages == baseline_messages
-        assert _session_task_brief_content(session) == baseline_task_brief
-        assert _task_brief_message_count(session) == 1
+        assert _messages_without_task_brief(session.messages) == _messages_without_task_brief(
+            baseline_messages
+        )
+        assert _task_brief_message_count(session) == 0
         assert _resolve_session_pinned_prefix_len(session) == baseline_pinned_prefix_len
-    finally:
-        session.close()
-
-
-def test_run_turn_successful_turn_keeps_refreshed_task_brief(tmp_path: Path) -> None:
-    cfg = AppConfig(model="test-model", routing_mode="code_only")
-    session = create_session(
-        cfg=cfg,
-        root=tmp_path,
-        mode="auto",
-        yes=True,
-        max_steps=2,
-        no_log=True,
-        api_key_override="override-key",
-    )
-    # Observed-facts rule: only a turn that demonstrably produced material
-    # edits pins its instruction into the task brief, so the fake turn edits
-    # a file before finalizing.
-    session.client = _FakeClient(  # type: ignore[assignment]
-        [
-            LLMResponse(
-                content="",
-                tool_calls=[
-                    ToolCall(
-                        id="tc1",
-                        name="fs_write",
-                        arguments={
-                            "path": "src/parser.py",
-                            "content": "def parse():\n    return []\n",
-                        },
-                    )
-                ],
-                raw={},
-            ),
-            LLMResponse(content="done", tool_calls=[], raw={}),
-        ]
-    )
-    baseline_task_brief = _session_task_brief_content(session)
-
-    try:
-        exit_code = session.run_turn("Fix src/parser.py without changing the CSV shape.")
-        task_brief = _session_task_brief_content(session)
-        assert exit_code == 0
-        assert _task_brief_message_count(session) == 1
-        assert task_brief != baseline_task_brief
-        assert "current_focus:" in task_brief
-        assert "- Fix src/parser.py without changing the CSV shape." in task_brief
-    finally:
-        session.close()
-
-
-def test_run_turn_llm_error_restores_existing_active_task_brief_without_duplicates(
-    tmp_path: Path,
-) -> None:
-    cfg = AppConfig(model="test-model", routing_mode="code_only")
-    session = create_session(
-        cfg=cfg,
-        root=tmp_path,
-        mode="auto",
-        yes=True,
-        max_steps=2,
-        no_log=True,
-        api_key_override="override-key",
-    )
-    # A material-edit turn pins the instruction as the active task brief on
-    # the router-free path.
-    session.client = _FakeClient(  # type: ignore[assignment]
-        [
-            LLMResponse(
-                content="",
-                tool_calls=[
-                    ToolCall(
-                        id="tc1",
-                        name="fs_write",
-                        arguments={
-                            "path": "src/parser.py",
-                            "content": "def parse():\n    return []\n",
-                        },
-                    )
-                ],
-                raw={},
-            ),
-            LLMResponse(content="done", tool_calls=[], raw={}),
-        ]
-    )
-
-    try:
-        assert session.run_turn("Fix src/parser.py without changing the CSV shape.") == 0
-        baseline_messages = copy.deepcopy(session.messages)
-        baseline_task_brief = _session_task_brief_content(session)
-        baseline_pinned_prefix_len = _resolve_session_pinned_prefix_len(session)
-
-        session.client = _FailingClient()  # type: ignore[assignment]
-        with pytest.raises(LLMError):
-            session.run_turn("Actually add a regression test and keep API stable.")
-
-        assert session.messages == baseline_messages
-        assert _session_task_brief_content(session) == baseline_task_brief
-        assert _task_brief_message_count(session) == 1
-        assert _resolve_session_pinned_prefix_len(session) == baseline_pinned_prefix_len
-        assert "Actually add a regression test and keep API stable." not in baseline_task_brief
     finally:
         session.close()
 

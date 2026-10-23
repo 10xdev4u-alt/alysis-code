@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 import webbrowser
 from pathlib import Path
 
@@ -24,7 +25,7 @@ def is_wsl() -> bool:
         return False
 
 
-def open_url(url: str) -> bool:
+def open_url(url: str, *, quiet: bool = False) -> bool:
     """Open *url* in the host browser, including the Windows browser from WSL."""
 
     target = str(url or "").strip()
@@ -32,6 +33,34 @@ def open_url(url: str) -> bool:
         return False
     if is_wsl() and _open_url_from_wsl(target):
         return True
+    if quiet:
+        # Browser helpers can print directly to inherited file descriptors. Run
+        # the fallback in an isolated process so they cannot overwrite a TUI or
+        # read its input. Never redirect the parent process's shared streams.
+        # A frozen sys.executable is the CLI, so let its entry point dispatch
+        # the helper before initializing the application instead of passing -c.
+        command = (
+            [sys.executable, "--alysis-internal-open-url", target]
+            if getattr(sys, "frozen", False)
+            else [
+                sys.executable,
+                "-c",
+                "import sys, webbrowser; sys.exit(0 if webbrowser.open(sys.argv[1], new=2) else 1)",
+                target,
+            ]
+        )
+        try:
+            result = subprocess.run(
+                command,
+                check=False,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=_LAUNCH_TIMEOUT_SECONDS,
+            )
+            return result.returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            return False
     try:
         return bool(webbrowser.open(target))
     except Exception:  # noqa: BLE001 - browser launch is best-effort

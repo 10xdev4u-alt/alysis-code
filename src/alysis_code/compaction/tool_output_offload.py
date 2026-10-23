@@ -1,15 +1,13 @@
 from __future__ import annotations
 
 import json
-import os
 import re
-import stat
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from ..ide.protocol import redact_secrets
+from ..private_artifact_io import _atomic_private_write_text
 from ..session_artifacts import SessionArtifactLayout
 from ..tools.registry import summarize_tool_output_chunk
 
@@ -50,115 +48,6 @@ def _path_is_under_root(*, path: Path, root: Path | None) -> bool:
     except ValueError:
         return False
     return True
-
-
-def _is_link_like(path: Path) -> bool:
-    try:
-        if path.is_symlink():
-            return True
-        is_junction = getattr(path, "is_junction", None)
-        if callable(is_junction) and is_junction():
-            return True
-        attributes = int(getattr(path.lstat(), "st_file_attributes", 0) or 0)
-        return bool(attributes & int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)))
-    except OSError:
-        return True
-
-
-def _has_safe_directory_ancestors(*, path: Path, root: Path) -> bool:
-    """Require every existing descendant of root to be a real contained directory."""
-
-    root_abs = root.resolve()
-    try:
-        relative = path.absolute().relative_to(root_abs)
-    except (OSError, RuntimeError, ValueError):
-        return False
-    current = root_abs
-    for component in relative.parts:
-        current = current / component
-        try:
-            exists = current.exists()
-        except OSError:
-            return False
-        if not exists:
-            continue
-        if _is_link_like(current) or not current.is_dir():
-            return False
-        try:
-            current.resolve().relative_to(root_abs)
-        except (OSError, RuntimeError, ValueError):
-            return False
-    return True
-
-
-def _ensure_private_directory(path: Path) -> None:
-    path.mkdir(parents=True, exist_ok=True, mode=0o700)
-    try:
-        path.chmod(0o700)
-    except OSError:
-        # Windows ACLs are not represented completely by POSIX mode bits.
-        pass
-
-
-def _atomic_private_write_text(
-    path: Path,
-    content: str,
-    *,
-    containment_root: Path | None = None,
-) -> None:
-    """Publish one complete private artifact or leave the old path untouched."""
-
-    if containment_root is not None and not _has_safe_directory_ancestors(
-        path=path.parent,
-        root=containment_root,
-    ):
-        raise OSError("tool output artifact directory is not safely contained")
-    _ensure_private_directory(path.parent)
-    if containment_root is not None and not _has_safe_directory_ancestors(
-        path=path.parent,
-        root=containment_root,
-    ):
-        raise OSError("tool output artifact directory is not safely contained")
-    fd, temp_name = tempfile.mkstemp(
-        dir=path.parent,
-        prefix=f".{path.name}.",
-        suffix=".tmp",
-    )
-    temp_path = Path(temp_name)
-    try:
-        try:
-            os.chmod(temp_path, 0o600)
-        except OSError:
-            pass
-        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
-            fd = -1
-            handle.write(content)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temp_path, path)
-        try:
-            path.chmod(0o600)
-        except OSError:
-            pass
-        # A directory fsync makes the rename durable on filesystems that support it.
-        try:
-            directory_fd = os.open(path.parent, os.O_RDONLY)
-        except OSError:
-            directory_fd = -1
-        if directory_fd >= 0:
-            try:
-                os.fsync(directory_fd)
-            except OSError:
-                pass
-            finally:
-                os.close(directory_fd)
-    finally:
-        if fd >= 0:
-            os.close(fd)
-        try:
-            temp_path.unlink(missing_ok=True)
-        except OSError:
-            pass
 
 
 class ToolOutputOffloader:
@@ -234,6 +123,7 @@ class ToolOutputOffloader:
         offloaded: bool,
         transcript_shaped: bool,
         artifact_locator: str | None = None,
+        artifact_handle: str | None = None,
         artifact_saved: bool = False,
         artifact_readable_via_fs: bool = False,
         artifact_location: str | None = None,
@@ -241,6 +131,17 @@ class ToolOutputOffloader:
         error: str | None = None,
         continuation_metadata: dict[str, Any] | None = None,
     ) -> str:
+        file_preview = None
+        if tool_name in {"fs_read", "fs_read_lines"}:
+            try:
+                parsed = json.loads(content_json)
+                if isinstance(parsed, dict) and isinstance(parsed.get("content"), str):
+                    file_preview = parsed["content"][: self._preview_chars]
+            except (ValueError, TypeError):
+                pass
+        if file_preview is not None:
+            preview_text = file_preview
+            preview_chars = len(file_preview)
         payload: dict[str, Any] = {
             "tool": tool_name,
             "tool_call_id": tool_call_id,
@@ -253,12 +154,18 @@ class ToolOutputOffloader:
             "content_truncated": original_chars > preview_chars,
             "raw_saved_in_session_log": False,
         }
+        if file_preview is not None:
+            payload["preview_format"] = "file_content"
+            payload["preview_utf8_bytes"] = len(str(payload["preview"]).encode("utf-8"))
         if transcript_shaped and not offloaded:
             payload["transcript_shaped"] = True
         if continuation_metadata:
             payload.update(continuation_metadata)
         if offloaded:
             payload["artifact_locator"] = artifact_locator
+            if artifact_handle:
+                payload["artifact_handle"] = artifact_handle
+                payload["artifact_read"] = {"handle": artifact_handle}
             payload["artifact_saved"] = artifact_saved
             payload["artifact_readable_via_fs"] = artifact_readable_via_fs
             payload["artifact_location"] = artifact_location
@@ -306,6 +213,88 @@ class ToolOutputOffloader:
                 for key in ("total_lines", "returned_range", "next_range")
                 if key in result
             }
+        if tool_name == "git_diff" and isinstance(result, dict):
+            # Preserve pagination even when a diff page is stored as an artifact,
+            # including next_offset=None on the final page.
+            continuation_metadata = {
+                key: result[key]
+                for key in ("diff_id", "offset", "next_offset", "total_chars")
+                if key in result
+            }
+        if tool_name in {
+            "embedded_browser_open",
+            "embedded_browser_read",
+            "embedded_browser_navigate",
+            "embedded_browser_back",
+            "embedded_browser_forward",
+            "embedded_browser_reload",
+            "embedded_browser_snapshot",
+            "embedded_browser_click",
+            "embedded_browser_type",
+            "embedded_browser_select",
+            "embedded_browser_scroll",
+            "embedded_browser_key",
+        } and isinstance(result, dict):
+            # A stored page still needs its tab and cursor visible to the model,
+            # so it can continue reading without opening the wrong tab or restarting.
+            continuation_metadata = {
+                key: result[key]
+                for key in (
+                    "tab_id",
+                    "title",
+                    "url",
+                    "next_offset",
+                    "snapshot_id",
+                    "viewport",
+                    "focused_ref",
+                )
+                if key in result
+            }
+        if (
+            tool_name.startswith("embedded_browser_")
+            and continuation_metadata is not None
+            and isinstance(result, dict)
+            and isinstance(result.get("elements"), list)
+        ):
+            # Keep observed control refs usable after page text is offloaded. Never
+            # synthesize refs or shorten option values, which would change targets.
+            controls = []
+            for element in result["elements"][:20]:
+                if not isinstance(element, dict):
+                    continue
+                control = {
+                    key: element[key]
+                    for key in (
+                        "ref",
+                        "role",
+                        "name",
+                        "bounds",
+                        "editable",
+                        "disabled",
+                        "checked",
+                        "type",
+                        "input_type",
+                    )
+                    if key in element
+                }
+                if len(json.dumps([*controls, control], ensure_ascii=False)) > 3500:
+                    break
+                with_options = {
+                    **control,
+                    **{key: element[key] for key in ("options", "value") if key in element},
+                }
+                if len(json.dumps([*controls, with_options], ensure_ascii=False)) <= 3500:
+                    control = with_options
+                elif "options" in element or "value" in element:
+                    control["details_omitted"] = True
+                if len(json.dumps([*controls, control], ensure_ascii=False)) > 3500:
+                    break
+                controls.append(control)
+            continuation_metadata["elements"] = controls
+            continuation_metadata["elements_truncated"] = len(controls) < len(result["elements"])
+            continuation_metadata["element_details"] = (
+                "Use these observed refs with snapshot_id. Read the linked artifact for omitted controls or option values; never guess them."
+            )
         preview_text, preview_chars = _truncated_preview(content_json, self._preview_chars)
         shape_threshold_chars = self._transcript_shape_threshold_chars()
         if original_chars < shape_threshold_chars:
@@ -378,6 +367,7 @@ class ToolOutputOffloader:
                 artifact_path=artifact_abs,
                 workspace_root=self._workspace_root,
             )
+            artifact_handle = storage_layout.register_artifact(artifact_abs)
             fs_read_path = None
             if artifact_ref.artifact_readable_via_fs and self._workspace_root is not None:
                 fs_read_path = (
@@ -394,6 +384,7 @@ class ToolOutputOffloader:
                 offloaded=True,
                 transcript_shaped=True,
                 artifact_locator=artifact_ref.locator,
+                artifact_handle=artifact_handle,
                 artifact_saved=True,
                 artifact_readable_via_fs=artifact_ref.artifact_readable_via_fs,
                 artifact_location=artifact_ref.artifact_location,

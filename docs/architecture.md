@@ -69,7 +69,7 @@ The session runtime owns:
 - session logging and local artifacts
 
 `alysis chat` is interactive and supports commands such as `/status`,
-`/mode`, `/pwd`, `/plan`, `/subagents`, and `/forge`.
+`/permissions`, `/persona`, `/pwd`, `/subagents`, and `/forge`.
 
 `alysis run` is the one-shot entrypoint. It is best for focused tasks that
 can be completed from a single instruction. For exploratory or highly iterative
@@ -487,6 +487,7 @@ and the rules that apply to them.
 - [Plugins](plugins.md): extension packaging.
 - [Custom tools](custom_tools.md): trusted Python tools.
 - [Lifecycle hooks](hooks.md): command-based policy and automation.
+- [Release process](RELEASING.md): maintainer release steps.
 - [Release checklist](release_checklist.md): completion-gate regression and
-  compatibility checklist.
+  compatibility checks.
 - [Server mode](server.md): HTTP API operation.

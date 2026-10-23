@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 
 import alysis_code.compaction.tool_output_offload as offload_module
+from alysis_code import private_artifact_io
 from alysis_code.agent_loop import create_session
 from alysis_code.compaction.settings import resolve_compaction_settings
 from alysis_code.compaction.tool_output_offload import ToolOutputOffloader
@@ -268,18 +269,18 @@ def test_session_artifact_reader_returns_clean_error_for_unknown_locator(
 ) -> None:
     layout = SessionArtifactLayout(filesystem_root=tmp_path / "session")
 
-    with pytest.raises(SessionArtifactReadError, match="not present in this session") as exc_info:
+    with pytest.raises(SessionArtifactReadError, match="not found in this session") as exc_info:
         session_artifact_read(
             artifact_layout=layout,
             locator="session_artifacts/tool_outputs/missing.json",
         )
 
     payload = exc_info.value.result_payload
-    assert payload["error_code"] == "session_artifact_session_mismatch"
+    assert payload["error_code"] == "session_artifact_not_found"
     assert payload["terminal"] is True
     assert payload["retryable"] is False
-    assert "different session" in payload["error"]
-    assert "produced the locator must read it" in payload["error"]
+    assert "other sessions are not authorized" in payload["error"]
+    assert payload["available_handles"] == []
 
 
 def test_child_runtime_rejects_parent_session_artifact_locator_terminally(
@@ -346,17 +347,17 @@ def test_child_runtime_rejects_parent_session_artifact_locator_terminally(
         message for message in client.calls[1]["messages"] if message.get("role") == "tool"
     )
     result = json.loads(str(tool_message["content"]))
-    assert result["error_code"] == "session_artifact_session_mismatch"
+    assert result["error_code"] == "session_artifact_not_found"
     assert result["terminal"] is True
     assert result["retryable"] is False
-    assert "different session" in result["error"]
-    assert "produced the locator must read it" in result["error"]
+    assert "other sessions are not authorized" in result["error"]
+    assert result["available_handles"] == []
     assert "parent-only" not in str(result)
 
     mismatch_events = [
         event
         for event in read_session_events(child_log_path)
-        if event.get("type") == "session_artifact_read_session_mismatch"
+        if event.get("type") == "session_artifact_read_not_found"
     ]
     assert len(mismatch_events) == 1
     assert mismatch_events[0]["payload"] == {
@@ -411,7 +412,7 @@ def test_session_artifact_reader_pages_without_gaps_or_overlap(tmp_path: Path) -
     artifact_path = layout.artifact_fs_path("tool_outputs", "paged.txt")
     artifact_path.parent.mkdir(parents=True)
     original = "".join(f"record-{index:04d}\n" for index in range(100))
-    artifact_path.write_text(original, encoding="utf-8")
+    artifact_path.write_bytes(original.encode("utf-8"))
     locator = layout.locator_for_path(artifact_path)
 
     offset = 0
@@ -585,6 +586,84 @@ def test_offloaded_truncated_read_keeps_continuation_and_artifact_reference(
     assert stub["next_range"] == {"start_line": 9, "end_line": 20}
 
 
+@pytest.mark.parametrize("next_offset", [20000, None])
+def test_offloaded_diff_preserves_pagination_and_full_patch(
+    tmp_path: Path, next_offset: int | None
+) -> None:
+    layout = SessionArtifactLayout(filesystem_root=tmp_path / "session-store")
+    offloader = ToolOutputOffloader(
+        artifact_layout=layout, workspace_root=tmp_path, threshold_chars=50, preview_chars=20
+    )
+    payload = {
+        "diff_id": "a" * 64,
+        "offset": 0,
+        "next_offset": next_offset,
+        "total_chars": 40000,
+        "truncated": next_offset is not None,
+        "diff": "patch" * 4000,
+    }
+    result = offloader.maybe_offload(
+        tool_name="git_diff",
+        tool_call_id="diff-page",
+        step=1,
+        result=payload,
+        content_json=json.dumps(payload),
+    )
+    stub = json.loads(result.content_for_message)
+    assert stub["diff_id"] == payload["diff_id"]
+    assert stub["next_offset"] == next_offset
+    assert stub["total_chars"] == 40000
+    assert stub["artifact_locator"]
+    saved = json.loads(Path(result.artifact_fs_path).read_text(encoding="utf-8"))
+    assert json.loads(saved["content_json"])["diff"] == payload["diff"]
+
+
+@pytest.mark.parametrize(
+    "tool_name",
+    [
+        "embedded_browser_open",
+        "embedded_browser_read",
+        "embedded_browser_navigate",
+        "embedded_browser_back",
+        "embedded_browser_forward",
+        "embedded_browser_reload",
+    ],
+)
+@pytest.mark.parametrize("next_offset", [6000, None])
+def test_offloaded_browser_page_preserves_tab_and_continuation(
+    tmp_path: Path,
+    tool_name: str,
+    next_offset: int | None,
+) -> None:
+    offloader = ToolOutputOffloader(
+        artifact_layout=SessionArtifactLayout(filesystem_root=tmp_path / "session-store"),
+        workspace_root=tmp_path,
+        threshold_chars=6000,
+        preview_chars=200,
+    )
+    payload = {
+        "tab_id": "tab-1",
+        "title": "Example page",
+        "url": "https://example.com/",
+        "text": "x" * 6000,
+        "links": [],
+        "next_offset": next_offset,
+    }
+    result = offloader.maybe_offload(
+        tool_name=tool_name,
+        tool_call_id="browser-page",
+        step=1,
+        result=payload,
+        content_json=json.dumps(payload),
+    )
+    assert result.offloaded is True
+    stub = json.loads(result.content_for_message)
+    for key in ("tab_id", "title", "url", "next_offset"):
+        assert stub[key] == payload[key]
+    saved = json.loads(Path(result.artifact_fs_path).read_text(encoding="utf-8"))
+    assert json.loads(saved["content_json"]) == payload
+
+
 def test_session_data_dir_override_keeps_offloads_outside_workspace(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -701,7 +780,7 @@ def test_offloader_atomic_publish_preserves_old_artifact_after_replace_failure(
     def _crash_before_replace(_source: Path, _target: Path) -> None:
         raise OSError("simulated crash before rename")
 
-    monkeypatch.setattr(offload_module.os, "replace", _crash_before_replace)
+    monkeypatch.setattr(private_artifact_io.os, "replace", _crash_before_replace)
     second = offloader.maybe_offload(
         tool_name="shell_run",
         tool_call_id="same-call",
@@ -773,8 +852,13 @@ def test_offloader_is_session_scoped_and_artifact_read_is_bounded_and_redacted(
     assert outputs[0][0].artifact_root != outputs[1][0].artifact_root
     first_store = ArtifactStore([ArtifactRoot("session", outputs[0][0].artifact_root)])
     listed = first_store.list()
-    assert len(listed["artifacts"]) == 1
-    artifact_id = str(listed["artifacts"][0]["artifact_id"])
+    tool_outputs = [
+        artifact
+        for artifact in listed["artifacts"]
+        if str(artifact["path"]).startswith("tool_outputs/")
+    ]
+    assert len(tool_outputs) == 1
+    artifact_id = str(tool_outputs[0]["artifact_id"])
     read = first_store.read(artifact_id, max_bytes=256)
     serialized = json.dumps(read)
     assert "alpha" in serialized
@@ -976,3 +1060,71 @@ def test_create_session_no_log_with_explicit_artifact_root_keeps_offload_enabled
         assert session.tool_output_offload_enabled is True
     finally:
         session.close()
+
+
+@pytest.mark.parametrize(
+    "tool_name",
+    [
+        "embedded_browser_snapshot",
+        "embedded_browser_click",
+        "embedded_browser_type",
+        "embedded_browser_select",
+        "embedded_browser_scroll",
+        "embedded_browser_key",
+    ],
+)
+def test_offloaded_browser_snapshot_keeps_observation_identity(tmp_path, tool_name):
+    offloader = ToolOutputOffloader(
+        artifact_layout=SessionArtifactLayout(filesystem_root=tmp_path / "session-store"),
+        workspace_root=tmp_path,
+        threshold_chars=6000,
+        preview_chars=200,
+    )
+    payload = {
+        "tab_id": "tab",
+        "snapshot_id": "observed",
+        "url": "https://example.com/",
+        "text": "x" * 6000,
+        "elements": [{"ref": "e1", "role": "textbox", "name": "Date", "input_type": "date"}],
+        "focused_ref": "e1",
+        "viewport": {"width": 800, "height": 600},
+    }
+    result = offloader.maybe_offload(
+        tool_name=tool_name,
+        tool_call_id="snapshot",
+        step=1,
+        result=payload,
+        content_json=json.dumps(payload),
+    )
+    stub = json.loads(result.content_for_message)
+    assert stub["snapshot_id"] == "observed"
+    assert stub["elements"] == payload["elements"]
+    assert stub["elements_truncated"] is False
+    assert stub["viewport"] == payload["viewport"]
+    assert stub["focused_ref"] == "e1"
+    saved = json.loads(Path(result.artifact_fs_path).read_text())
+    assert json.loads(saved["content_json"])["elements"] == payload["elements"]
+
+
+def test_browser_offloaded_controls_are_bounded_and_preserve_real_refs(tmp_path):
+    offloader = ToolOutputOffloader(
+        artifact_layout=SessionArtifactLayout(filesystem_root=tmp_path / "session-store"),
+        workspace_root=tmp_path,
+        threshold_chars=6000,
+        preview_chars=200,
+    )
+    elements = [{"ref": f"control-{i}", "role": "button", "name": "x" * 500} for i in range(80)]
+    payload = {"tab_id": "tab", "snapshot_id": "observed", "text": "x" * 6000, "elements": elements}
+    result = offloader.maybe_offload(
+        tool_name="embedded_browser_snapshot",
+        tool_call_id="bounded",
+        step=1,
+        result=payload,
+        content_json=json.dumps(payload),
+    )
+    stub = json.loads(result.content_for_message)
+    assert stub["elements_truncated"] is True
+    assert 0 < len(stub["elements"]) < 20
+    assert len(json.dumps(stub["elements"], ensure_ascii=False)) <= 3500
+    assert all(element in elements for element in stub["elements"])
+    assert "never guess" in stub["element_details"]

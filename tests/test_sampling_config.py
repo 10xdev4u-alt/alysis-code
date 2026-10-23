@@ -111,13 +111,13 @@ class SamplingParsingTests(unittest.TestCase):
         self.assertEqual(settings.temperature, 0.1)
         self.assertEqual(settings.sources["temperature"], f"env:{rp.SAMPLING_TEMPERATURE_ENV}")
 
-    def test_legacy_env_name_is_used(self) -> None:
+    def test_canonical_env_name_is_used(self) -> None:
         settings = rp.resolve_sampling_settings(
             config_values={},
-            environ={"SYLLIPTOR_SAMPLING_TEMPERATURE": "0.1"},
+            environ={"ALYSIS_SAMPLING_TEMPERATURE": "0.1"},
         )
         self.assertEqual(settings.temperature, 0.1)
-        self.assertEqual(settings.sources["temperature"], "env:SYLLIPTOR_SAMPLING_TEMPERATURE")
+        self.assertEqual(settings.sources["temperature"], "env:ALYSIS_SAMPLING_TEMPERATURE")
 
     def test_config_used_when_env_absent(self) -> None:
         settings = rp.resolve_sampling_settings(
@@ -664,6 +664,44 @@ class ConfigSnapshotTests(unittest.TestCase):
         self.assertEqual(payload["config"], {})
         self.assertEqual(payload["environment"], {})
         json.dumps(payload)
+
+    def test_snapshot_schema_is_version_2(self) -> None:
+        # Version 2 introduced the `effective` section. Consumers key on this
+        # number to know the section exists, so it is pinned rather than
+        # merely referenced through the constant.
+        self.assertEqual(rp.CONFIG_SNAPSHOT_SCHEMA_VERSION, 2)
+        self.assertEqual(rp.config_snapshot_payload(environ={})["schema_version"], 2)
+
+    def test_snapshot_records_effective_values_verbatim(self) -> None:
+        # The defect this section exists for: an 89-task campaign enforced an
+        # env-provided llm timeout of 240 while every snapshot's raw config
+        # dump reported the unset field default of 60.0, and the teardown
+        # read the wrong one. The effective section is the caller's statement
+        # of what will actually be enforced, with the source that won.
+        payload = rp.config_snapshot_payload(
+            config_values={"llm_timeout_s": 60.0},
+            environ={"ALYSIS_LLM_TIMEOUT_S": "240"},
+            effective_values={
+                "llm_timeout_s": 240.0,
+                "llm_timeout_source": "environment",
+            },
+        )
+        self.assertEqual(payload["effective"]["llm_timeout_s"], 240.0)
+        self.assertEqual(payload["effective"]["llm_timeout_source"], "environment")
+        # The raw dump is deliberately unchanged: it answers "what does the
+        # config file say", the effective section answers "what governs".
+        self.assertEqual(payload["config"]["llm_timeout_s"], 60.0)
+        json.dumps(payload)
+
+    def test_snapshot_effective_defaults_to_empty_and_is_scrubbed(self) -> None:
+        self.assertEqual(rp.config_snapshot_payload(environ={})["effective"], {})
+        payload = rp.config_snapshot_payload(
+            environ={},
+            effective_values={"api_key": "sk-live-bbbbbbbbbbbbbbbb"},
+        )
+        # Same structural scrubbing as the config dump: a resolver that leaks
+        # a credential into the effective section must not defeat PR1.
+        self.assertEqual(payload["effective"]["api_key"], rp.MASKED_VALUE)
 
 
 class IdempotenceTests(unittest.TestCase):

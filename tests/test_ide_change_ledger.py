@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sqlite3
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -16,6 +17,65 @@ from alysis_code.ide.change_ledger import (
 
 def _ledger(workspace: Path, storage: Path, **kwargs: object) -> ChangeLedger:
     return ChangeLedger(workspace, storage_root=storage, **kwargs)
+
+
+def test_checkpoint_presence_probe_is_read_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    data = tmp_path / "data"
+    monkeypatch.setenv("ALYSIS_DATA_DIR", str(data))
+    assert change_ledger_module.checkpoint_storage_exists(workspace) is False
+    assert not data.exists()
+    ChangeLedger(workspace)
+    assert change_ledger_module.checkpoint_storage_exists(workspace) is True
+
+
+def test_missing_git_has_a_safe_checkpoint_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    def missing_git(*args: object, **kwargs: object) -> None:
+        raise FileNotFoundError("private command path must not be displayed")
+
+    monkeypatch.setattr(change_ledger_module.subprocess, "run", missing_git)
+    with pytest.raises(ChangeLedgerError, match="Install Git") as error:
+        _ledger(workspace, tmp_path / "checkpoints")
+    assert "private command path" not in str(error.value)
+
+
+@pytest.mark.parametrize("object_format", ["sha1", "sha256"])
+def test_local_blob_hashes_match_git_without_per_file_processes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    object_format: str,
+) -> None:
+    monkeypatch.setenv("GIT_DEFAULT_HASH", object_format)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    ledger = _ledger(workspace, tmp_path / "external")
+    samples = [b"", b"hello\n", b"windows\r\nlines\r\n", bytes(range(256)), "γειά 🌍".encode()]
+    for data in samples:
+        expected = (
+            ledger._git(["hash-object", "--stdin"], input_bytes=data, check=True)
+            .stdout.decode()
+            .strip()
+        )
+        assert ledger._blob_oid(data) == expected
+        target = workspace / "sample.bin"
+        target.write_bytes(data)
+        original_git = ledger._git
+
+        def no_git(*args: object, **kwargs: object) -> None:
+            pytest.fail("File identity must not spawn Git")
+
+        with monkeypatch.context() as scoped:
+            scoped.setattr(ledger, "_git", no_git)
+            assert ledger._path_identity(target) == ("100644", expected)
+        assert ledger._git == original_git
 
 
 def test_capture_revert_redo_and_restart(tmp_path: Path) -> None:
@@ -512,6 +572,60 @@ def test_capture_fails_closed_when_scoped_path_changes_while_git_stages_it(
 
     assert ledger.head("session-1") == baseline
     assert target.read_text(encoding="utf-8") == "human\n"
+
+
+def test_reconcile_reads_every_session_ref_with_one_git_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "workspace"
+    storage = tmp_path / "external"
+    workspace.mkdir()
+    (workspace / "app.py").write_text("one\n", encoding="utf-8")
+    ledger = _ledger(workspace, storage)
+    sessions = [f"session-{index}" for index in range(6)]
+    for session in sessions:
+        ledger.ensure_baseline(session)
+    calls: list[str] = []
+
+    def count_git(target: ChangeLedger) -> None:
+        original = target._git
+
+        def counting_git(args: list[str], **kwargs: Any) -> Any:
+            calls.append(args[0])
+            return original(args, **kwargs)
+
+        monkeypatch.setattr(target, "_git", counting_git)
+
+    count_git(ledger)
+    for session in sessions:
+        assert ledger.head(session) is not None
+    # Each look reconciles all six sessions: one process each time, not one per session.
+    assert calls == ["for-each-ref"] * len(sessions)
+    calls.clear()
+    restarted = _ledger(workspace, storage)
+    count_git(restarted)
+    assert [checkpoint.kind for checkpoint in restarted.list("session-2")] == ["baseline"]
+    assert calls == ["for-each-ref"]
+
+
+def test_reconcile_restores_a_session_ref_deleted_after_its_checkpoint(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    storage = tmp_path / "external"
+    workspace.mkdir()
+    (workspace / "app.py").write_text("one\n", encoding="utf-8")
+    ledger = _ledger(workspace, storage)
+    kept = ledger.ensure_baseline("session-kept")
+    lost = ledger.ensure_baseline("session-lost")
+    ref = "refs/heads/sessions/" + change_ledger_module._session_key("session-lost")
+    ledger._git(["update-ref", "-d", ref], check=True)
+    assert ledger._ref_oid(ref) is None
+
+    restarted = _ledger(workspace, storage)
+    assert restarted._ref_oid(ref) == lost.commit_oid
+    assert restarted.head("session-lost") == lost
+    assert restarted.head("session-kept") == kept
 
 
 def test_restart_recovers_ref_published_before_sqlite_metadata(

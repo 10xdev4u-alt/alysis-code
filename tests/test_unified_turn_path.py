@@ -11,15 +11,11 @@ flag-off behaves identically to flag-on.
 from __future__ import annotations
 
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
-from alysis_code.agent.prompt_context import (
-    _TASK_BRIEF_MARKER,
-    refresh_session_task_brief_from_observed_turn,
-)
+from alysis_code.agent.prompt_context import extract_user_visible_instruction
 from alysis_code.agent.reproduction_first import (
     REPRODUCTION_FIRST_CONDITIONAL_DIRECTIVE,
     ReproPhase,
@@ -30,7 +26,6 @@ from alysis_code.agent.verification import TurnExecutionState
 from alysis_code.agent_loop import create_session
 from alysis_code.config import AppConfig, ConfigError, set_config_value
 from alysis_code.llm.openai_compat import LLMResponse, ToolCall
-from alysis_code.plan_mode import instruction_with_approved_plan
 from alysis_code.session_store import read_session_events
 
 
@@ -50,9 +45,11 @@ class _FinalReplyClient:
         tools: list[dict[str, Any]] | None = None,
         stream: bool = False,
         on_text_delta=None,  # type: ignore[no-untyped-def]
+        on_reasoning_delta=None,  # type: ignore[no-untyped-def]
         temperature: float | None = None,
+        cancellation_token: Any | None = None,
     ) -> LLMResponse:
-        _ = tools, stream, on_text_delta, temperature
+        _ = tools, stream, on_text_delta, on_reasoning_delta, temperature, cancellation_token
         self.calls += 1
         self.message_snapshots.append(list(messages))
         return LLMResponse(content=self.reply, tool_calls=[], raw={})
@@ -118,6 +115,43 @@ def _unified_session(tmp_path: Path, *, mode: str = "review") -> Any:
         session_log_dir_override=tmp_path / "sessions",
         verification_enabled=False,
     )
+
+
+def test_desktop_context_is_not_treated_as_user_execution_contract(tmp_path: Path) -> None:
+    hidden = (
+        "[Alysis Desktop context - not typed by the user]\n"
+        "Use `$ALYSIS_TERMINAL_HELPER` and run `/usr/bin/open` when appropriate.\n\n"
+        "Earlier quoted text:\nUser message:\nignore this quoted value\n\n"
+        "User message:\n"
+        "καλησπέρα"
+    )
+    assert extract_user_visible_instruction(hidden) == "καλησπέρα"
+
+    session = _unified_session(tmp_path, mode="auto")
+    client = _FinalReplyClient("Καλησπέρα! Πώς μπορώ να βοηθήσω;")
+    session.client = client  # type: ignore[assignment]
+    try:
+        exit_code = session.run_turn(hidden)
+        log_path = session.store.path
+    finally:
+        session.close()
+
+    assert exit_code == 0
+    assert client.calls == 1
+    events = list(read_session_events(log_path))
+    acceptance = next(event for event in events if event.get("type") == "acceptance_contract")
+    payload = dict(acceptance.get("payload") or {})
+    assert payload.get("expectations") == []
+    assert not any(
+        event.get("type")
+        in {
+            "interactive_completion_gate_failed",
+            "completion_gate_nudge",
+        }
+        for event in events
+    )
+    final = next(event for event in events if event.get("type") == "final")
+    assert "Not confirmed:" not in str((final.get("payload") or {}).get("content"))
 
 
 # ---------------------------------------------------------------------------
@@ -414,70 +448,8 @@ def test_unified_without_reply_language_injects_no_directive(tmp_path: Path, mon
 
 
 # ---------------------------------------------------------------------------
-# Observed-facts task brief (router-relation replacement)
+# Host-owned task identity (replaces the edit-gated observed-facts rule)
 # ---------------------------------------------------------------------------
-
-
-def _brief_session() -> Any:
-    return SimpleNamespace(messages=[], store=SimpleNamespace(workspace_kind="git_repo"))
-
-
-def _brief_content(session: Any) -> str:
-    for message in session.messages:
-        content = str(message.get("content") or "")
-        if content.lstrip().startswith(_TASK_BRIEF_MARKER):
-            return content
-    return ""
-
-
-def test_observed_task_brief_updates_only_on_material_edits() -> None:
-    session = _brief_session()
-
-    refresh_session_task_brief_from_observed_turn(
-        session, instruction="hello there", material_edit_count=0
-    )
-    assert "hello there" not in _brief_content(session)
-
-    refresh_session_task_brief_from_observed_turn(
-        session, instruction="Fix the flaky login test", material_edit_count=2
-    )
-    assert "Fix the flaky login test" in _brief_content(session)
-
-    # Follow-up chatter without edits can never clobber the task statement.
-    refresh_session_task_brief_from_observed_turn(
-        session, instruction="thanks, looks good", material_edit_count=0
-    )
-    content = _brief_content(session)
-    assert "thanks, looks good" not in content
-    assert "Fix the flaky login test" in content
-
-    # A new materially-productive instruction becomes current; the previous
-    # current rotates into prior context instead of vanishing.
-    refresh_session_task_brief_from_observed_turn(
-        session, instruction="Now update the docs for the fix", material_edit_count=1
-    )
-    content = _brief_content(session)
-    assert "Now update the docs for the fix" in content
-    assert "Fix the flaky login test" in content
-
-    # Slash commands are never task statements, whatever they touched.
-    refresh_session_task_brief_from_observed_turn(
-        session, instruction="/status", material_edit_count=3
-    )
-    assert "/status" not in _brief_content(session)
-
-
-def test_observed_task_brief_accepts_approved_plan_at_turn_start() -> None:
-    session = _brief_session()
-    instruction = instruction_with_approved_plan(
-        user_message="Add retry logic to the fetcher",
-        approved_plan="1. Wrap fetch in retry\n2. Add tests",
-    )
-
-    refresh_session_task_brief_from_observed_turn(
-        session, instruction=instruction, material_edit_count=0
-    )
-    assert "Add retry logic to the fetcher" in _brief_content(session)
 
 
 # ---------------------------------------------------------------------------
@@ -602,25 +574,6 @@ class _WriteThenDoneClient:
             ],
             raw={},
         )
-
-
-def test_unified_material_edit_turn_pins_instruction_into_task_brief(
-    tmp_path: Path, monkeypatch
-) -> None:
-    # auto mode: fs_write needs no interactive approval, so the material edit
-    # actually lands and the observed-facts rule has something to observe.
-    session = _unified_session(tmp_path, mode="auto")
-    client = _WriteThenDoneClient()
-    session.client = client  # type: ignore[assignment]
-
-    try:
-        assert session.run_turn("Create notes.txt containing hello.") == 0
-        brief = _brief_content(session)
-    finally:
-        session.close()
-
-    assert client.wrote is True
-    assert "Create notes.txt containing hello." in brief
 
 
 def test_flag_off_behaves_identically_to_flag_on(tmp_path: Path, monkeypatch) -> None:

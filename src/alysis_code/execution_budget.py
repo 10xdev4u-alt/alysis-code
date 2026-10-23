@@ -283,6 +283,7 @@ def compute_execution_prompt_budget_inputs(
             allow_write_globs=allow_write_globs,
             non_interactive=non_interactive,
             shell_runner=None,
+            shell_environment=prompt_context.shell_environment,
             verification_enabled=verification_enabled,
             authoritative_verification_commands=prompt_context.authoritative_verify_commands,
             subagents_enabled=prompt_context.resolved_subagents_enabled,
@@ -291,6 +292,9 @@ def compute_execution_prompt_budget_inputs(
             skills_enabled=prompt_context.resolved_skills_enabled,
             skill_registry=prompt_context.discovered_skills.skills,
             session_log_dir_override=None,
+            # Budget estimation assembles a scratch tool surface. It must not
+            # rewrite live sessions' process-global compatibility state.
+            tool_availability_sink=lambda _snapshot: None,
         )
     finally:
         store.close()

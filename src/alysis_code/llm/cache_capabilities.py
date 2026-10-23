@@ -363,11 +363,12 @@ def resolve_effective_cache_capability(
     model: str,
     base_url: str | None = None,
     transport_capabilities: ProviderProtocolCapabilities | None,
+    auth_cache_capability: CacheCapabilitySpec | Mapping[str, Any] | None = None,
     preset_cache_capability: CacheCapabilitySpec | Mapping[str, Any] | None = None,
     profile_cache_capability: CacheCapabilitySpec | Mapping[str, Any] | None = None,
     runtime_disabled_fields: tuple[str, ...] = (),
 ) -> EffectiveCacheCapability:
-    """Resolve cache behavior from transport, preset, and profile metadata.
+    """Resolve cache behavior from transport, auth adapter, preset, and profile metadata.
 
     The resolver deliberately separates "declared support" from "transport projection".
     User/profile overrides may opt into provider features, but emitted request fields are
@@ -379,8 +380,12 @@ def resolve_effective_cache_capability(
     normalized_model = _safe_text(model)
 
     state = _state_from_transport_capabilities(transport_capabilities)
+    auth_spec = _coerce_spec(auth_cache_capability, source="auth_adapter")
     preset_spec = _coerce_spec(preset_cache_capability, source="preset")
     profile_spec = _coerce_spec(profile_cache_capability, source="profile")
+    # A provider endpoint can serve both API-key and subscription traffic.
+    # Its generic preset is the default; the selected auth adapter defines the
+    # actual account route. Explicit profile preferences remain the final layer.
     if preset_spec is not None:
         state = _apply_spec(state, preset_spec, origin="preset")
         state = _apply_scoped_specs(
@@ -389,6 +394,15 @@ def resolve_effective_cache_capability(
             model=normalized_model,
             base_url=base_url,
             origin="preset",
+        )
+    if auth_spec is not None:
+        state = _apply_spec(state, auth_spec, origin="auth_adapter")
+        state = _apply_scoped_specs(
+            state,
+            auth_spec,
+            model=normalized_model,
+            base_url=base_url,
+            origin="auth_adapter",
         )
     if profile_spec is not None:
         state = _apply_spec(state, profile_spec, origin="profile")

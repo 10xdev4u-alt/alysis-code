@@ -16,6 +16,7 @@ import pytest
 from alysis_code.agent.acceptance_contract import (
     AcceptanceContract,
     build_acceptance_contract,
+    extract_explicit_acceptance_commands,
 )
 from alysis_code.agent.completion_certificate import (
     CompletionCertificateInput,
@@ -23,6 +24,7 @@ from alysis_code.agent.completion_certificate import (
     evaluate_completion_certificate,
 )
 from alysis_code.agent.turn_contract import (
+    DEFAULT_ADVISORY_COMPLETION_EXPLANATION,
     MAX_EXPECTATIONS,
     AdvisoryCompletion,
     AdvisoryCompletionReason,
@@ -90,6 +92,34 @@ def test_backtick_command_is_not_expected_output(tmp_path: Path) -> None:
     outputs = {e.text for e in contract.expectations if e.kind == ExpectationKind.EXPECTED_OUTPUT}
     assert "pytest -q" not in outputs
     assert "git status" not in outputs
+
+
+@pytest.mark.parametrize("separator", [" and ", ", ", ", and "])
+def test_explicit_quoted_command_list_preserves_each_command(separator):
+    instruction = f"Run `pytest -q`{separator}`git status` and `custom-check --strict`."
+    assert extract_explicit_acceptance_commands(instruction) == [
+        "pytest -q",
+        "git status",
+        "custom-check --strict",
+    ]
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        "inspect `result.txt`",
+        "write `out/result.txt`",
+        "inspect `request.path`",
+        "print `DONE OK`",
+        "inspect `request.path` and `git status`",
+    ],
+)
+def test_command_list_does_not_promote_intervening_prose_paths_or_symbols(tail):
+    assert extract_explicit_acceptance_commands(f"Run `pytest -q` and {tail}.") == ["pytest -q"]
+
+
+def test_negated_quoted_command_list_has_no_execution_authority():
+    assert extract_explicit_acceptance_commands("Do not run `pytest -q` and `git status`.") == []
 
 
 def test_bare_identifier_is_not_expected_output(tmp_path: Path) -> None:
@@ -420,9 +450,9 @@ def test_advisory_summary_surfaces_reason_and_explanation() -> None:
     summary = build_advisory_completion_summary(
         AdvisoryCompletionReason.CANNOT_REPRODUCE, "the bug does not reproduce locally"
     )
-    assert "No changes made:" in summary
-    assert "cannot_reproduce" in summary
-    assert "the bug does not reproduce locally" in summary
+    # The agent's own explanation, in plain words; the machine reason label is not shown.
+    assert summary == "\n\n---\nNo files were changed: the bug does not reproduce locally."
+    assert "cannot_reproduce" not in summary
 
 
 def test_coerce_advisory_reason_valid_and_invalid() -> None:
@@ -530,16 +560,42 @@ def test_prompt_norms_identical_across_runtime_kinds(monkeypatch) -> None:
 
 
 def test_unconfirmed_expectations_marker_visible_and_distinct() -> None:
-    marker = build_unconfirmed_expectations_marker(["exp001", "exp003"])
-    assert "UNCONFIRMED EXPECTATIONS" in marker
-    assert "exp001" in marker
-    assert "exp003" in marker
+    marker = build_unconfirmed_expectations_marker(
+        ["add AMOUNT CATEGORY [--note TEXT]", "summary --month YYYY-MM"]
+    )
+    # The request's own words, never the internal expectation ids.
+    assert marker == (
+        "\n\n---\n⚠️ Not confirmed: “add AMOUNT CATEGORY [--note TEXT]”; "
+        "“summary --month YYYY-MM”. The request asked for these, and this turn did not show "
+        "them working."
+    )
+    assert "exp0" not in marker
     assert marker != HONEST_UNVERIFIED_FINALIZATION_MARKER
     assert "REGRESSIONS" not in marker
+
+
+def test_unconfirmed_expectations_marker_singular_long_and_empty() -> None:
+    single = build_unconfirmed_expectations_marker(["x" * 100])
+    assert "this turn did not show it working" in single
+    assert "“" + "x" * 79 + "…”" in single
+    assert build_unconfirmed_expectations_marker([]) == (
+        "\n\n---\n⚠️ Not confirmed: some things the request named were not shown "
+        "working in this turn."
+    )
 
 
 def test_advisory_completion_summary_format() -> None:
     summary = build_advisory_completion_summary(
         AdvisoryCompletionReason.NO_CHANGE_NEEDED, "already right"
     )
-    assert summary.startswith("\n\n---\nNo changes made: no_change_needed — already right")
+    assert summary == "\n\n---\nNo files were changed: already right."
+
+
+def test_advisory_summary_without_a_recorded_reason_says_only_what_happened() -> None:
+    summary = build_advisory_completion_summary(
+        AdvisoryCompletionReason.OTHER, DEFAULT_ADVISORY_COMPLETION_EXPLANATION
+    )
+    assert summary == "\n\n---\nNo files were changed in this turn."
+    assert build_advisory_completion_summary(AdvisoryCompletionReason.NO_CHANGE_NEEDED, "") == (
+        "\n\n---\nNo files were changed: no change was needed."
+    )

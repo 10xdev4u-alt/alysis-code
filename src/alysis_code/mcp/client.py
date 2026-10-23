@@ -48,9 +48,11 @@ _SUPPORTED_PROTOCOL_VERSIONS_BY_TRANSPORT = {
     "stdio": (MCP_STDIO_PROTOCOL_VERSION,),
     "http": MCP_HTTP_SUPPORTED_PROTOCOL_VERSIONS,
 }
-# `notifications/initialized` needs a real follow-up window for immediate
-# server activity without turning every quiet startup into a full startup-timeout wait.
-_INITIALIZED_NOTIFICATION_COMPLETION_TIMEOUT_S = 0.5
+# Stdio observes immediate server activity after `notifications/initialized`
+# without making a quiet startup wait for the full configured timeout.
+_STDIO_INITIALIZED_NOTIFICATION_COMPLETION_TIMEOUT_S = 0.5
+# Bound encoded image retention before validation by the tool's visual channel.
+_MAX_IMAGE_BASE64_CHARS = ((8 * 1024 * 1024 + 2) // 3) * 4
 _ReadOnlyRequestResult = TypeVar("_ReadOnlyRequestResult")
 
 
@@ -430,13 +432,17 @@ class _BaseMcpClient:
         self._supports_resources = "resources" in capabilities
         self._supports_prompts = "prompts" in capabilities
         self._apply_negotiated_protocol_version(protocol_version)
+        notification_timeout_s = self.server.startup_timeout_s
+        if self.server.transport == "stdio":
+            notification_timeout_s = min(
+                notification_timeout_s, _STDIO_INITIALIZED_NOTIFICATION_COMPLETION_TIMEOUT_S
+            )
+        # HTTP must wait for the server's acknowledgement of the notification;
+        # a short stdio observation window is not a network request timeout.
         self.transport.send_notification(
             method="notifications/initialized",
             params={},
-            completion_timeout_s=min(
-                self.server.startup_timeout_s,
-                _INITIALIZED_NOTIFICATION_COMPLETION_TIMEOUT_S,
-            ),
+            completion_timeout_s=notification_timeout_s,
         )
         self._initialized = True
         self._drain_notifications()
@@ -1109,6 +1115,22 @@ def _normalize_content_items(
             summaries.append(f"text({len(text)} chars)")
             text_parts.append(text)
             continue
+
+        # Keep bounded image content in memory for the tool binding's visual
+        # channel. The binding removes these bytes before hooks or persistence.
+        if item_type == "image":
+            data = item.get("data")
+            if isinstance(data, str) and len(data) <= _MAX_IMAGE_BASE64_CHARS:
+                normalized.append(
+                    {
+                        "type": "image",
+                        "data": data,
+                        "mime_type": item.get("mimeType"),
+                        "summary": "image",
+                    }
+                )
+                summaries.append("image")
+                continue
 
         summary = f"{item_type} item omitted"
         payload: dict[str, Any] = {

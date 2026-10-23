@@ -5,14 +5,19 @@ import math
 import os
 import re
 import shlex
-from collections.abc import Callable, Sequence
+import sys
+import threading
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
+from io import BufferedRandom
 from pathlib import Path
 from typing import Any, Literal, Self
 from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
+from .atomic_io import atomic_write_json
 from .branding import (
     canonical_user_config_dir,
     canonical_user_data_dir,
@@ -24,6 +29,14 @@ from .llm.provider_limits import (
     DEFAULT_PROVIDER_RETRY_MAX_DELAY_SECONDS,
     DEFAULT_PROVIDER_RETRY_MAX_RETRIES,
 )
+from .llm.streaming import STREAM_ASSEMBLY_AUTO, STREAM_ASSEMBLY_SETTINGS
+from .prompt_guidance_catalog import (
+    GUIDANCE_PROFILES,
+    ParentPromptGuidanceProfile,
+    PromptGuidanceProfile,
+    get_model_prompt_catalog,
+    subagent_profile,
+)
 from .step_budget import (
     AUTONOMOUS_STEP_BUDGET_POLICY,
     DEFAULT_CHAT_MAX_STEPS,
@@ -31,8 +44,14 @@ from .step_budget import (
     DEFAULT_TASK_MAX_STEPS,
     normalize_step_budget_policy,
 )
+from .web_research import normalize_trusted_domain_entry
 from .web_search_adapters import normalize_web_search_adapter
 from .web_search_policy import normalize_web_search_policy
+
+if os.name == "nt":  # pragma: no cover - exercised on Windows
+    import msvcrt
+else:  # pragma: no cover - exercised on POSIX
+    import fcntl
 
 
 class ConfigError(RuntimeError):
@@ -57,10 +76,35 @@ _VALID_TOOLBAR_ITEMS: set[str] = {
     "tokens",
     "cost",
     "forge",
-    "plan",
 }
 _DEFAULT_TOOLBAR_ITEMS: tuple[str, ...] = ("mode", "model", "ctx", "subagents")
-DEFAULT_SUBAGENT_TIMEOUT_S = 900.0
+DEFAULT_SUBAGENT_TIMEOUT_S: float | None = None
+
+# Hosts (plus their subdomains) that web_fetch may fetch without prior session
+# provenance. Curated to major public package registries — read-only metadata
+# endpoints that search engines do not index, so the search-mediated provenance
+# recovery path can never authorize them. The safe-HTTP guard (scheme, DNS/IP,
+# redirect, and byte-cap validation) still applies to every fetch.
+DEFAULT_WEB_FETCH_TRUSTED_DOMAINS: tuple[str, ...] = (
+    "registry.npmjs.org",
+    "registry.yarnpkg.com",
+    "pypi.org",
+    "files.pythonhosted.org",
+    "crates.io",
+    "index.crates.io",
+    "static.crates.io",
+    "rubygems.org",
+    "repo.maven.apache.org",
+    "repo1.maven.org",
+    "proxy.golang.org",
+    "sum.golang.org",
+    "pkg.go.dev",
+    "hex.pm",
+    "repo.hex.pm",
+    "packagist.org",
+    "repo.packagist.org",
+    "api.nuget.org",
+)
 DEFAULT_VERIFY_COMMANDS: tuple[str, ...] = ("pytest -q",)
 VERIFY_RUNNER_PREFIXES: frozenset[tuple[str, str]] = frozenset(
     {
@@ -85,33 +129,12 @@ _REASONING_EFFORTS: set[str] = {
 }
 _PROMPT_CACHE_MODES: set[str] = {"off", "manual", "auto"}
 _ANTHROPIC_PROMPT_CACHE_TTLS: set[str] = {"5m", "1h"}
-DEFAULT_FEEDBACK_GITHUB_REPO = "AlysisAi/alysis-code"
+DEFAULT_FEEDBACK_GITHUB_REPO = "AlysisAi/AlysisCode"
 _GITHUB_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$")
+_CONFIG_STORE_LOCK = threading.RLock()
+_CONFIG_TRANSACTION_STATE = threading.local()
 
-# Profile name for the hosted Pro provider. Duplicated from ``alysis_cloud``
-# rather than imported, to keep config.py free of intra-package imports at
-# module scope. The legacy spelling is what pre-rebrand installs wrote into
-# config.json and credentials.json.
 CLOUD_PROFILE_KEY = "alysis"
-LEGACY_CLOUD_PROFILE_KEY = "sylliptor"
-
-# A config written before the rename pins the feedback repo to its old name.
-# GitHub redirects the rename, so feedback still lands, but the value is stale
-# and would outlive the redirect if the old name were ever reused. Anything
-# still pointing at the pre-rebrand repo is read as the current one.
-LEGACY_FEEDBACK_GITHUB_REPOS = frozenset(
-    {
-        "alysisai/sylliptor",
-        "apfivos/sylliptor",
-    }
-)
-
-
-def _redirect_legacy_feedback_repo(repo: str) -> str:
-    """Map a pre-rebrand feedback repo onto the current one."""
-    if repo.strip().lower() in LEGACY_FEEDBACK_GITHUB_REPOS:
-        return DEFAULT_FEEDBACK_GITHUB_REPO
-    return repo
 
 
 class AssetsComprehensionConfig(BaseModel):
@@ -352,8 +375,23 @@ class SubagentOrchestrationConfig(BaseModel):
     parallel_nonwriting_shared: bool = False
     helpers_enabled: bool = True
     helper_max_total_per_child: int = Field(default=2, ge=0)
-    helper_timeout_s: float = Field(default=120.0, gt=0, allow_inf_nan=False)
-    helper_max_steps: int = Field(default=20, ge=1)
+    helper_timeout_s: float | None = Field(
+        default=None,
+        gt=0,
+        allow_inf_nan=False,
+        description=(
+            "Optional wall-clock ceiling for a nested helper. Unset means the helper "
+            "only inherits an active parent deadline."
+        ),
+    )
+    helper_max_steps: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Optional step ceiling for nested helpers. Unset keeps autonomous helpers "
+            "unbounded unless an explicit limit or the limited step policy applies."
+        ),
+    )
     # Match the established exploration-stagnation threshold: three identical
     # outcomes are enough to identify repetition without treating one retry as a loop.
     repetition_signal_threshold: int = Field(default=3, ge=2)
@@ -406,9 +444,59 @@ class CacheConfig(BaseModel):
     keepalive_idle_threshold_s: float = Field(default=240.0, gt=0, allow_inf_nan=False)
 
 
+class PromptGuidanceConfig(BaseModel):
+    """Prompt templates only; model selection and runtime requirements are unchanged."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    default: ParentPromptGuidanceProfile = "expanded"
+    # Explicit, editable assignments, not model-family or capability inference.
+    # Supplying a mapping replaces this default mapping, including an empty map.
+    model_profiles: dict[str, ParentPromptGuidanceProfile] = Field(
+        default_factory=get_model_prompt_catalog
+    )
+
+    @model_validator(mode="after")
+    def validate_model_ids(self) -> Self:
+        if any(not model or model != model.strip() for model in self.model_profiles):
+            raise ValueError("prompt_guidance.model_profiles requires nonempty, trimmed model IDs")
+        return self
+
+
+def resolve_prompt_guidance_profile(
+    cfg: AppConfig | None,
+    *,
+    model: str | None = None,
+    subagent: bool = False,
+) -> PromptGuidanceProfile:
+    """Resolve the effective model, then select parent density or its child family.
+
+    Scope comes from the session, never from whether delegation tools are enabled.
+    Child roles remain separate from this family-level working guidance.
+    """
+
+    guidance = cfg.prompt_guidance if cfg is not None else PromptGuidanceConfig()
+    effective_model = str(model if model is not None else getattr(cfg, "model", "") or "").strip()
+    profile = guidance.model_profiles.get(effective_model, guidance.default)
+    return subagent_profile(profile) if subagent else profile
+
+
+class AnytimeCheckpointConfig(BaseModel):
+    enabled: bool = True
+    max_files: int = Field(default=2000, ge=1, le=20000)
+    max_total_bytes: int = Field(default=64 * 1024 * 1024, ge=1024, le=512 * 1024 * 1024)
+    max_candidates: int = Field(default=4, ge=1, le=20)
+    # This is host configuration, never inferred from a task name or supplied
+    # by the model. The command must also be an accepted required check.
+    objective_command: str = ""
+    objective_key: str = "score"
+    objective_direction: Literal["minimize", "maximize"] = "minimize"
+
+
 class AppConfig(BaseModel):
     execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
     cache: CacheConfig = Field(default_factory=CacheConfig)
+    prompt_guidance: PromptGuidanceConfig = Field(default_factory=PromptGuidanceConfig)
     read_ledger_enabled: bool = True
     agent_runtimes: dict[str, AgentRuntimeSettings] = Field(default_factory=dict)
     base_url: str = "https://api.openai.com/v1"
@@ -437,10 +525,10 @@ class AppConfig(BaseModel):
     # Default persona for interactive chat: code|architect|ask|debug. Personas
     # are conventions (prompt overlay, model role, default execution mode)
     # layered on the execution-mode gate; "code" is the no-op persona and
-    # preserves pre-persona behavior exactly. See docs/persona_modes_design.md.
+    # preserves pre-persona behavior exactly. See docs/personas.md.
     default_persona: str = "code"
     # Kill-switch for persona modes; env override ALYSIS_PERSONA_MODES=off
-    # wins over the config value. Off: /mode accepts only execution modes,
+    # wins over the config value. Off: /permissions accepts only execution modes,
     # the switch_mode tool is not registered, and personas stay at Code.
     persona_modes_enabled: bool = True
     max_steps: int = DEFAULT_CHAT_MAX_STEPS
@@ -462,6 +550,10 @@ class AppConfig(BaseModel):
     sampling_top_p: float | None = None
     sampling_seed: int | None = None
     stream: bool = True
+    # auto|concat|cumulative: how streamed chunks become content and tool-call
+    # arguments. "auto" is "concat" for every provider not known to re-send
+    # cumulative text (see llm.openai_compat.resolve_stream_assembly).
+    llm_stream_assembly: str = STREAM_ASSEMBLY_AUTO
     routing_mode: str = "auto"  # auto|code_only
     # Kill-switch for capability arbitration over router verdicts; env override
     # ALYSIS_ROUTE_ARBITRATION=off wins over the config value.
@@ -538,11 +630,14 @@ class AppConfig(BaseModel):
     step_budget_policy: str = AUTONOMOUS_STEP_BUDGET_POLICY
     task_max_steps: int = DEFAULT_TASK_MAX_STEPS
     subagent_max_steps: int = DEFAULT_SUBAGENT_MAX_STEPS
-    subagent_timeout_s: float = Field(
+    subagent_timeout_s: float | None = Field(
         default=DEFAULT_SUBAGENT_TIMEOUT_S,
         gt=0,
         allow_inf_nan=False,
-        description="Fallback wall-clock ceiling in seconds for each ordinary subagent run.",
+        description=(
+            "Optional wall-clock ceiling in seconds for each ordinary subagent run. "
+            "Unset means the child only inherits an active parent deadline."
+        ),
     )
     subagent_orchestration: SubagentOrchestrationConfig = Field(
         default_factory=SubagentOrchestrationConfig,
@@ -568,6 +663,19 @@ class AppConfig(BaseModel):
             "by benchmark/offline runs to guarantee no network-mediated contamination."
         ),
     )
+    web_fetch_trusted_domains: list[str] = Field(
+        default_factory=lambda: list(DEFAULT_WEB_FETCH_TRUSTED_DOMAINS),
+        description=(
+            "Hosts (matched exactly or as a subdomain suffix) that web_fetch may "
+            "fetch without prior session provenance such as a user-provided URL or "
+            "a web_search result. Defaults to major public package registries so "
+            "dependency lookups work in fresh sessions and subagents. The safe-HTTP "
+            "guard still validates scheme, credentials, DNS/IP ranges, redirects, "
+            "and response size on every fetch. Set to [] to require provenance for "
+            "every URL. Overridable via ALYSIS_WEB_FETCH_TRUSTED_DOMAINS "
+            "(comma-separated hosts; 'none' disables the allowlist)."
+        ),
+    )
     web_search_mode: str = "auto"
     web_search_policy: str = "auto"
     web_search_adapter: str = "auto"
@@ -584,6 +692,9 @@ class AppConfig(BaseModel):
     session_log_dir: str | None = None
     crash_diagnostic_log_path: str | None = None
     prompt_cache_mode: str = "manual"
+    # Hosted defaults are applied once when an Alysis profile is selected/loaded.
+    # Explicit cache choices also set this marker, including reselecting Manual.
+    hosted_prompt_cache_defaults_applied: bool = False
     prompt_cache_key: str | None = None
     prompt_cache_retention: str | None = None
     anthropic_prompt_cache_enabled: bool = False
@@ -593,6 +704,7 @@ class AppConfig(BaseModel):
     )
     integration_verify_mode: str = "warn"
     integration_verify_commands: list[str] = Field(default_factory=list)
+    anytime_checkpoint: AnytimeCheckpointConfig = Field(default_factory=AnytimeCheckpointConfig)
     replanning_mode: str = "off"
     toolbar_items: list[str] = Field(
         default_factory=lambda: list(_DEFAULT_TOOLBAR_ITEMS),
@@ -760,15 +872,26 @@ def _looks_like_env_assignment(token: str) -> bool:
     return all(ch == "_" or ch.isalnum() for ch in name)
 
 
-def _split_supported_launcher_path_command_parts(command: str) -> list[str] | None:
+def split_command_words(command: str) -> list[str] | None:
+    """The words of one command line, with backslashes kept literally.
+
+    Quotes group a word and are removed; nothing else is interpreted, so Windows paths
+    (``C:\\venv\\Scripts\\pytest.exe``) and quoted paths with spaces
+    (``"C:\\Program Files\\Python312\\python.exe"``) come out whole. ``None`` when the
+    quotes do not balance.
+    """
     try:
-        raw_parts = shlex.split(command, posix=False)
+        raw_parts = shlex.split(str(command or ""), posix=False)
     except ValueError:
         return None
-    if not raw_parts:
+    return [_strip_matching_shell_quotes(token) for token in raw_parts]
+
+
+def _split_supported_launcher_path_command_parts(command: str) -> list[str] | None:
+    parts = split_command_words(command)
+    if not parts:
         return None
 
-    parts = [_strip_matching_shell_quotes(token) for token in raw_parts]
     candidate = parts
     runner_stripped = strip_verify_runner_prefix(candidate)
     if runner_stripped is None:
@@ -812,6 +935,30 @@ def _data_dir() -> Path:
 
 def config_path() -> Path:
     return _config_dir() / "config.json"
+
+
+def _config_lock_path(path: Path) -> Path:
+    return path.with_name(f"{path.name}.lock")
+
+
+def _acquire_config_file_lock(handle: BufferedRandom) -> None:
+    if os.name == "nt":  # pragma: no cover - exercised on Windows
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"\0")
+            handle.flush()
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+        return
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+
+
+def _release_config_file_lock(handle: BufferedRandom) -> None:
+    if os.name == "nt":  # pragma: no cover - exercised on Windows
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        return
+    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def credentials_path() -> Path:
@@ -930,8 +1077,8 @@ def load_config() -> AppConfig:
     # reports the repo that feedback actually goes to. Redirecting only inside
     # resolve_feedback_github_repo() left the two disagreeing in the same
     # output: the migrated profile name beside the stale repo name.
-    cfg.feedback_github_repo = _redirect_legacy_feedback_repo(
-        str(getattr(cfg, "feedback_github_repo", DEFAULT_FEEDBACK_GITHUB_REPO))
+    cfg.feedback_github_repo = str(
+        getattr(cfg, "feedback_github_repo", DEFAULT_FEEDBACK_GITHUB_REPO)
     )
     _migrate_delegated_codex_subscription(
         cfg,
@@ -940,6 +1087,9 @@ def load_config() -> AppConfig:
             and any(str(name) != "default" for name in raw["profiles"])
         ),
     )
+    from .profiles import migrate_subscription_endpoints
+
+    migrate_subscription_endpoints(cfg)
     sync_active_profile_to_config(cfg)
     _canonicalize_active_profile_model(cfg)
     return cfg
@@ -977,13 +1127,17 @@ def _migrate_delegated_codex_subscription(
         add_profile,
         set_active_profile,
     )
+    from .provider_auth import provider_auth_connection
 
+    connection = provider_auth_connection("openai-codex")
+    if connection is None:
+        return False
     model = str(settings.model or "").strip()
     reasoning_effort = str(settings.reasoning_effort or "").strip() or None
     profile = ProfileSpec(
         name="chatgpt-codex",
-        protocol="openai_responses",
-        base_url="https://chatgpt.com/backend-api/codex",
+        protocol=connection.protocol,
+        base_url=connection.base_url,
         auth_provider="openai-codex",
         default_model=model,
         reasoning_effort=reasoning_effort,
@@ -1013,7 +1167,6 @@ def _migrate_delegated_codex_subscription(
 
 def save_config(cfg: AppConfig) -> None:
     path = config_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
 
     try:
         validated = AppConfig.model_validate(cfg.model_dump())
@@ -1026,7 +1179,53 @@ def save_config(cfg: AppConfig) -> None:
         extra_fields.pop("web_search_enabled", None)
         data.update(extra_fields)
 
-    path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    atomic_write_json(path, data, ensure_ascii=True)
+
+
+@contextmanager
+def config_transaction(
+    *,
+    loader: Callable[[], AppConfig] | None = None,
+    saver: Callable[[AppConfig], None] | None = None,
+) -> Iterator[AppConfig]:
+    """Serialize a fresh config read, in-memory mutation, and one durable save.
+
+    The sidecar lock is intentionally stable instead of locking ``config.json``
+    itself: atomic publication replaces that inode. Callers may inject their
+    existing patchable loader and saver; non-canonical stores receive in-process
+    serialization only. Nesting fails fast because acquiring the same sidecar a
+    second time in one thread is not portable across supported platforms.
+    """
+
+    load = load_config if loader is None else loader
+    save = save_config if saver is None else saver
+    canonical_store = (loader is None or loader is load_config) and (
+        saver is None or saver is save_config
+    )
+    with _CONFIG_STORE_LOCK:
+        if getattr(_CONFIG_TRANSACTION_STATE, "active", False):
+            raise ConfigError("Nested config transactions are not supported.")
+        _CONFIG_TRANSACTION_STATE.active = True
+        try:
+            if not canonical_store:
+                cfg = load()
+                yield cfg
+                save(cfg)
+                return
+
+            path = config_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            lock_path = _config_lock_path(path)
+            with lock_path.open("a+b") as handle:
+                _acquire_config_file_lock(handle)
+                try:
+                    cfg = load()
+                    yield cfg
+                    save(cfg)
+                finally:
+                    _release_config_file_lock(handle)
+        finally:
+            _CONFIG_TRANSACTION_STATE.active = False
 
 
 def _canonicalize_active_profile_model(cfg: AppConfig) -> None:
@@ -1197,7 +1396,13 @@ def _matching_model_presets(model: str) -> tuple[tuple[Any, str], ...]:
 
 
 def _provider_switch_is_unsafe(preset: Any) -> bool:
-    return str(getattr(preset, "key", "") or "").strip().lower() in {"openrouter", "custom"}
+    # Hosted account credentials cannot authenticate a direct provider. Keep an
+    # unsupported model on the selected gateway until the user changes it.
+    return str(getattr(preset, "key", "") or "").strip().lower() in {
+        "alysis",
+        "openrouter",
+        "custom",
+    }
 
 
 def _align_active_profile_to_preset(
@@ -1321,11 +1526,6 @@ def load_persisted_profile_keys() -> dict[str, str]:
         key = str(value or "").strip()
         if profile_name and key:
             keys[profile_name] = key
-    # The hosted Pro provider's profile was named "sylliptor" before the
-    # rename. Surface the stored gateway key under the current name so an
-    # existing Pro user is not asked to log in again.
-    if LEGACY_CLOUD_PROFILE_KEY in keys and CLOUD_PROFILE_KEY not in keys:
-        keys[CLOUD_PROFILE_KEY] = keys[LEGACY_CLOUD_PROFILE_KEY]
     return keys
 
 
@@ -1386,6 +1586,9 @@ def resolve_profile_api_key(
     profile = get_profile(cfg, profile_name)
     if profile is None:
         return ApiKeyResolution(key=None, source="missing")
+    ide_key = _resolve_ide_profile_api_key(cfg, profile_name)
+    if ide_key.key:
+        return ide_key
     stored_profile_key = _resolve_stored_profile_api_key(cfg, profile_name)
     if stored_profile_key.key:
         return stored_profile_key
@@ -1403,6 +1606,21 @@ def resolve_profile_api_key(
         openai_key = str(os.environ.get("OPENAI_API_KEY") or "").strip()
         if openai_key:
             return ApiKeyResolution(key=openai_key, source="env:OPENAI_API_KEY")
+    return ApiKeyResolution(key=None, source="missing")
+
+
+def _resolve_ide_profile_api_key(cfg: AppConfig, profile_name: str) -> ApiKeyResolution:
+    """Honor an IDE's explicitly supplied profile key without overwriting CLI credentials."""
+    from .profiles import get_profile
+
+    profile = get_profile(cfg, profile_name)
+    if profile is not None:
+        # Match the extension's encoding; plain env-var names can collide between two profiles.
+        encoded = profile.name.encode("utf-8").hex().upper()
+        env_name = f"ALYSIS_IDE_PROFILE_{encoded}_API_KEY"
+        key = str(os.environ.get(env_name) or "").strip()
+        if key:
+            return ApiKeyResolution(key=key, source=f"env:{env_name}")
     return ApiKeyResolution(key=None, source="missing")
 
 
@@ -1427,6 +1645,9 @@ def resolve_api_key(
     if profile_name is None:
         profile_name = str((effective_cfg.extra_fields or {}).get("active_profile") or "").strip()
     if profile_name:
+        ide_key = _resolve_ide_profile_api_key(effective_cfg, profile_name)
+        if ide_key.key:
+            return ide_key
         stored_profile_key = _resolve_stored_profile_api_key(effective_cfg, profile_name)
         if stored_profile_key.key:
             return stored_profile_key
@@ -1566,7 +1787,31 @@ def _missing_api_key_message(cfg: AppConfig) -> str:
             suggestions.append("set OPENAI_API_KEY")
     suggestions.append("run `alysis config set-api-key`")
     sentences = [suggestion[0].upper() + suggestion[1:] for suggestion in suggestions]
-    return "Missing API key. " + "; or ".join(sentences) + "."
+    # A missing key is almost always a "which store did this process read?" question, so
+    # the error names the exact file and profile this process consulted. Paths and
+    # booleans only — never key material.
+    try:
+        cred_path = credentials_path()
+        stored = load_persisted_profile_keys()
+        # `exists` alone proved ambiguous in the field (a file that exists for one process and
+        # not for another), so say *why*: a raw stat result is unambiguous where Path.exists()
+        # swallows the error, and the process identity explains which environment looked.
+        try:
+            os.stat(cred_path)
+            stat_note = "stat=ok"
+        except OSError as stat_error:
+            stat_note = f"stat={type(stat_error).__name__}:{stat_error.errno}"
+        diag = (
+            f" [looked in: {cred_path} (exists={cred_path.exists()}, {stat_note}); "
+            f"config_dir_override={'set' if env_get('ALYSIS_CONFIG_DIR') else 'unset'}; "
+            f"active_profile={profile.name if profile is not None else '<unresolved>'}; "
+            f"stored_profiles={sorted(stored.keys()) or 'none'}; "
+            f"legacy_key={'yes' if load_persisted_api_key() else 'no'}; "
+            f"pid={os.getpid()}; python={sys.executable}; cwd={os.getcwd()}]"
+        )
+    except Exception:  # noqa: BLE001 - diagnostics must never mask the real error
+        diag = ""
+    return "Missing API key. " + "; or ".join(sentences) + "." + diag
 
 
 _SETTABLE_KEYS: set[str] = {
@@ -1574,8 +1819,11 @@ _SETTABLE_KEYS: set[str] = {
     "execution.runtime",
     "base_url",
     "model",
+    "prompt_guidance.default",
+    "prompt_guidance.model_profiles",
     "llm_timeout_s",
     "llm_stream_no_progress_timeout_s",
+    "llm_stream_assembly",
     "run_deadline_seconds",
     "llm_enable_thinking",
     "llm_reasoning_effort",
@@ -1643,6 +1891,8 @@ _SETTABLE_KEYS: set[str] = {
     "cache.keepalive_enabled",
     "cache.keepalive_idle_threshold_s",
     "read_ledger_enabled",
+    "web_fetch_trusted_domains",
+    "web_tools_enabled",
     "web_search_mode",
     "web_search_policy",
     "web_search_enabled",
@@ -1714,6 +1964,7 @@ _ROLE_MODEL_NAMES: set[str] = {
     "conflict_resolve",
     "comprehension",
     "router",
+    "approval_review",
 }
 _ROLE_MODEL_CONFIG_PREFIXES: set[str] = {"role_models", "forge_role_models"}
 # Persona vocabulary for persona_models.<persona> keys and default_persona
@@ -1805,6 +2056,21 @@ def _coerce_optional_positive_float(value: Any, *, key: str) -> float | None:
         raise ConfigError(f"{key} must be a finite number > 0") from e
     if parsed <= 0 or not math.isfinite(parsed):
         raise ConfigError(f"{key} must be a finite number > 0")
+    return parsed
+
+
+def _coerce_optional_positive_int(value: Any, *, key: str) -> int | None:
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    if normalized.lower() in {"", "none", "null", "default", "off", "unlimited", "never"}:
+        return None
+    try:
+        parsed = int(normalized, 10)
+    except (TypeError, ValueError) as e:
+        raise ConfigError(f"{key} must be an integer > 0 or unlimited") from e
+    if parsed <= 0:
+        raise ConfigError(f"{key} must be an integer > 0 or unlimited")
     return parsed
 
 
@@ -1916,6 +2182,16 @@ def _coerce_non_negative_int(value: str, *, key: str) -> int:
     return parsed
 
 
+def _coerce_min_int(value: str, *, key: str, minimum: int) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as e:
+        raise ConfigError(f"{key} must be an integer") from e
+    if parsed < minimum:
+        raise ConfigError(f"{key} must be >= {minimum}")
+    return parsed
+
+
 def _resolve_positive_timeout(raw: Any) -> float | None:
     try:
         parsed = float(raw)
@@ -2000,14 +2276,41 @@ def _apply_legacy_temperature_override(cfg: AppConfig, temperature: float) -> No
     cfg.chat_temperature = temperature
 
 
-def resolve_llm_timeout_s(cfg: AppConfig | None) -> float:
+@dataclass(frozen=True)
+class ResolvedLlmTimeout:
+    """The per-request LLM timeout that will actually be enforced, and why.
+
+    Exists because the config snapshot used to record only the raw
+    ``AppConfig.llm_timeout_s`` field. A campaign that set
+    ``ALYSIS_LLM_TIMEOUT_S=240`` then produced 89 session logs all reporting
+    ``llm_timeout_s: 60.0`` -- the unset field default -- and the teardown
+    concluded the operator's value had been dropped. It had not; the artifact
+    was answering a different question than the one every reader asked of it.
+    A resolved value must carry its source so the snapshot can state what was
+    enforced rather than requiring readers to re-derive the precedence chain.
+    """
+
+    seconds: float
+    source: str
+
+
+def resolve_llm_timeout(cfg: AppConfig | None) -> ResolvedLlmTimeout:
+    """Resolve the enforced LLM timeout: environment, config, then default.
+
+    Source vocabulary matches ``resolve_run_deadline``: ``environment``,
+    ``config``, ``runtime_default``.
+    """
     env_timeout = _resolve_positive_timeout(env_get("ALYSIS_LLM_TIMEOUT_S"))
     if env_timeout is not None:
-        return env_timeout
+        return ResolvedLlmTimeout(seconds=env_timeout, source="environment")
     cfg_timeout = _resolve_positive_timeout(getattr(cfg, "llm_timeout_s", None))
     if cfg_timeout is not None:
-        return cfg_timeout
-    return 60.0
+        return ResolvedLlmTimeout(seconds=cfg_timeout, source="config")
+    return ResolvedLlmTimeout(seconds=60.0, source="runtime_default")
+
+
+def resolve_llm_timeout_s(cfg: AppConfig | None) -> float:
+    return resolve_llm_timeout(cfg).seconds
 
 
 @dataclass(frozen=True)
@@ -2115,6 +2418,13 @@ def resolve_crash_diagnostic_log_path(
 
 
 def resolve_llm_enable_thinking(cfg: AppConfig | None) -> bool | None:
+    invocation = env_get("ALYSIS_RUN_REASONING_EFFORT")
+    if invocation is not None:
+        from .model_reasoning import invocation_reasoning_settings
+
+        if cfg is None:
+            raise ConfigError("Reasoning effort requires a selected provider/model.")
+        return invocation_reasoning_settings(cfg, invocation)[1]
     active_subscription, subscription_effort = _active_subscription_reasoning_effort(cfg)
     if active_subscription:
         return None if subscription_effort is None else subscription_effort != "none"
@@ -2151,6 +2461,13 @@ def _legacy_reasoning_effort_hint(cfg: AppConfig | None) -> str | None:
 
 
 def resolve_llm_reasoning_effort(cfg: AppConfig | None) -> str | None:
+    invocation = env_get("ALYSIS_RUN_REASONING_EFFORT")
+    if invocation is not None:
+        from .model_reasoning import invocation_reasoning_settings
+
+        if cfg is None:
+            raise ConfigError("Reasoning effort requires a selected provider/model.")
+        return invocation_reasoning_settings(cfg, invocation)[0]
     active_subscription, subscription_effort = _active_subscription_reasoning_effort(cfg)
     if active_subscription:
         return subscription_effort
@@ -2224,6 +2541,60 @@ def resolve_web_tools_enabled(cfg: AppConfig | None) -> bool:
     if cfg is None:
         return True
     return bool(getattr(cfg, "web_tools_enabled", True))
+
+
+_WEB_FETCH_TRUSTED_DOMAINS_DISABLED_ENV_VALUES = frozenset(
+    {"none", "off", "0", "false", "disabled"}
+)
+
+
+def _parse_trusted_domain_list(value: str) -> list[str]:
+    """Parse a ``config set web_fetch_trusted_domains`` value.
+
+    Comma-separated hosts. ``none``/``off``/``[]``/empty clears the allowlist;
+    ``default`` restores the curated registry defaults. Every entry must carry
+    a usable host (validated with the same normalizer the session tracker uses).
+    """
+    text = str(value or "").strip()
+    if not text or text.lower() in {"none", "off", "[]"}:
+        return []
+    if text.lower() in {"default", "defaults"}:
+        return list(DEFAULT_WEB_FETCH_TRUSTED_DOMAINS)
+    entries: list[str] = []
+    for raw_entry in text.split(","):
+        entry = raw_entry.strip()
+        if not entry:
+            continue
+        if normalize_trusted_domain_entry(entry) is None:
+            raise ConfigError(
+                f"web_fetch_trusted_domains entry {entry!r} has no usable host; "
+                "use bare hosts like registry.npmjs.org (comma-separated)"
+            )
+        entries.append(entry)
+    if not entries:
+        return []
+    return entries
+
+
+def resolve_web_fetch_trusted_domains(cfg: AppConfig | None) -> tuple[str, ...]:
+    """Trusted-domain allowlist for the web_fetch provenance gate.
+
+    Precedence: ALYSIS_WEB_FETCH_TRUSTED_DOMAINS env var (comma-separated hosts;
+    any of none/off/0/false/disabled empties the allowlist) over the
+    ``web_fetch_trusted_domains`` config field, over the curated defaults.
+    Entries are host-normalized downstream by the session tracker.
+    """
+    env_value = str(env_get("ALYSIS_WEB_FETCH_TRUSTED_DOMAINS") or "").strip()
+    if env_value:
+        if env_value.lower() in _WEB_FETCH_TRUSTED_DOMAINS_DISABLED_ENV_VALUES:
+            return ()
+        return tuple(entry.strip() for entry in env_value.split(",") if entry.strip())
+    if cfg is None:
+        return tuple(DEFAULT_WEB_FETCH_TRUSTED_DOMAINS)
+    entries = getattr(cfg, "web_fetch_trusted_domains", None)
+    if entries is None:
+        return tuple(DEFAULT_WEB_FETCH_TRUSTED_DOMAINS)
+    return tuple(str(entry) for entry in entries)
 
 
 def resolve_web_search_enabled(cfg: AppConfig | None) -> bool:
@@ -2368,11 +2739,9 @@ def resolve_feedback_github_enabled(cfg: AppConfig | None) -> bool:
 def resolve_feedback_github_repo(cfg: AppConfig | None) -> str:
     env_value = env_get("ALYSIS_FEEDBACK_GITHUB_REPO")
     if env_value is not None:
-        return _redirect_legacy_feedback_repo(
-            _coerce_github_repo(str(env_value), key="ALYSIS_FEEDBACK_GITHUB_REPO")
-        )
+        return _coerce_github_repo(str(env_value), key="ALYSIS_FEEDBACK_GITHUB_REPO")
     raw = getattr(cfg, "feedback_github_repo", DEFAULT_FEEDBACK_GITHUB_REPO)
-    return _redirect_legacy_feedback_repo(_coerce_github_repo(str(raw), key="feedback_github_repo"))
+    return _coerce_github_repo(str(raw), key="feedback_github_repo")
 
 
 def resolve_feedback_open_browser(cfg: AppConfig | None) -> bool:
@@ -2633,6 +3002,42 @@ def _ensure_selected_runtime_settings(cfg: AppConfig, runtime_id: str) -> None:
         )
 
 
+def _set_prompt_guidance_config_value(cfg: AppConfig, *, key: str, value: str) -> AppConfig:
+    values = cfg.prompt_guidance.model_dump()
+    if key == "prompt_guidance.default":
+        values["default"] = value.strip().lower()
+    elif key == "prompt_guidance.model_profiles":
+        try:
+            values["model_profiles"] = json.loads(value)
+        except (TypeError, ValueError) as exc:
+            raise ConfigError("prompt_guidance.model_profiles must be a JSON object") from exc
+    elif key.startswith("prompt_guidance.model_profiles."):
+        model = key.removeprefix("prompt_guidance.model_profiles.")
+        if not model or model != model.strip():
+            raise ConfigError(
+                "prompt_guidance.model_profiles requires a nonempty, trimmed model ID"
+            )
+        profile = value.strip().lower()
+        if profile:
+            values["model_profiles"][model] = profile
+        else:
+            values["model_profiles"].pop(model, None)
+    else:
+        raise ConfigError(
+            "Supported prompt guidance keys: prompt_guidance.default, "
+            "prompt_guidance.model_profiles, prompt_guidance.model_profiles.<model-id>"
+        )
+    try:
+        guidance = PromptGuidanceConfig.model_validate(values)
+    except ValidationError as exc:
+        raise ConfigError(
+            f"Prompt guidance profiles must be one of {', '.join(GUIDANCE_PROFILES)}; "
+            "model_profiles must map exact model IDs to profiles."
+        ) from exc
+    cfg.prompt_guidance = guidance
+    return cfg
+
+
 def set_config_value(
     cfg: AppConfig,
     key: str,
@@ -2642,6 +3047,8 @@ def set_config_value(
 ) -> AppConfig:
     if not allow_subscription_selection or str(key or "").strip().lower() == "base_url":
         ensure_subscription_menu_managed_key(cfg, key)
+    if key.startswith("prompt_guidance."):
+        return _set_prompt_guidance_config_value(cfg, key=key, value=value)
     role_model_parts = _role_model_key_parts(key)
     if role_model_parts is not None:
         namespace, role = role_model_parts
@@ -2675,7 +3082,7 @@ def set_config_value(
             f"Unknown/unsupported key: {key}. Supported keys: "
             f"{', '.join(sorted(_SETTABLE_KEYS))}, role_models.<role>, "
             "forge_role_models.<role>, persona_models.<persona>, "
-            "agent_runtimes.<runtime-id>.<field>"
+            "agent_runtimes.<runtime-id>.<field>, prompt_guidance.model_profiles.<model-id>"
         )
 
     if key == "execution.backend":
@@ -2843,7 +3250,7 @@ def set_config_value(
         return cfg
 
     if key == "subagent_timeout_s":
-        cfg.subagent_timeout_s = _coerce_positive_float(value, key=key)
+        cfg.subagent_timeout_s = _coerce_optional_positive_float(value, key=key)
         return cfg
 
     if key == "subagent_orchestration.max_background_children":
@@ -2880,11 +3287,17 @@ def set_config_value(
         return cfg
 
     if key == "subagent_orchestration.helper_timeout_s":
-        cfg.subagent_orchestration.helper_timeout_s = _coerce_positive_float(value, key=key)
+        cfg.subagent_orchestration.helper_timeout_s = _coerce_optional_positive_float(
+            value,
+            key=key,
+        )
         return cfg
 
     if key == "subagent_orchestration.helper_max_steps":
-        cfg.subagent_orchestration.helper_max_steps = _coerce_positive_int(value, key=key)
+        cfg.subagent_orchestration.helper_max_steps = _coerce_optional_positive_int(
+            value,
+            key=key,
+        )
         return cfg
 
     if key == "subagent_orchestration.repetition_signal_threshold":
@@ -2996,6 +3409,15 @@ def set_config_value(
             cfg.stream = False
             return cfg
         raise ConfigError("stream must be true/false")
+
+    if key == "llm_stream_assembly":
+        normalized = value.strip().lower()
+        if normalized not in STREAM_ASSEMBLY_SETTINGS:
+            raise ConfigError(
+                "llm_stream_assembly must be one of: " + ", ".join(STREAM_ASSEMBLY_SETTINGS)
+            )
+        cfg.llm_stream_assembly = normalized
+        return cfg
 
     if key == "routing_mode":
         v = value.strip().lower()
@@ -3194,6 +3616,20 @@ def set_config_value(
             return cfg
         raise ConfigError("custom_tools_enabled must be true/false")
 
+    if key == "web_tools_enabled":
+        v = value.strip().lower()
+        if v in {"1", "true", "yes", "on"}:
+            cfg.web_tools_enabled = True
+            return cfg
+        if v in {"0", "false", "no", "off"}:
+            cfg.web_tools_enabled = False
+            return cfg
+        raise ConfigError("web_tools_enabled must be true/false")
+
+    if key == "web_fetch_trusted_domains":
+        cfg.web_fetch_trusted_domains = _parse_trusted_domain_list(value)
+        return cfg
+
     if key == "web_search_mode":
         cfg.web_search_mode = _normalize_web_search_mode(value)
         return cfg
@@ -3321,22 +3757,27 @@ def set_config_value(
 
     if key == "prompt_cache_mode":
         cfg.prompt_cache_mode = _normalize_prompt_cache_mode(value, key=key)
+        cfg.hosted_prompt_cache_defaults_applied = True
         return cfg
 
     if key == "prompt_cache_key":
         cfg.prompt_cache_key = value.strip() or None
+        cfg.hosted_prompt_cache_defaults_applied = True
         return cfg
 
     if key == "prompt_cache_retention":
         cfg.prompt_cache_retention = value.strip() or None
+        cfg.hosted_prompt_cache_defaults_applied = True
         return cfg
 
     if key == "anthropic_prompt_cache_enabled":
         cfg.anthropic_prompt_cache_enabled = _coerce_bool(value, key=key)
+        cfg.hosted_prompt_cache_defaults_applied = True
         return cfg
 
     if key == "anthropic_prompt_cache_ttl":
         cfg.anthropic_prompt_cache_ttl = _normalize_anthropic_prompt_cache_ttl(value, key=key)
+        cfg.hosted_prompt_cache_defaults_applied = True
         return cfg
 
     if key == "verify_commands":

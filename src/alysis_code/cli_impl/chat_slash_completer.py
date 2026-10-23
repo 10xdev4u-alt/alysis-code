@@ -6,12 +6,32 @@ from typing import Any
 
 from prompt_toolkit.completion import Completer, Completion
 
+from .chat.forge_visibility import command_visible
+from .tui.actions import MODEL_DESCRIPTION
+
 
 @dataclass(frozen=True)
 class ChatSlashCommandSpec:
     name: str
     usage: str
     description: str
+
+
+NAVIGATION_COMMAND_SPECS = (
+    ChatSlashCommandSpec("mcp", "/mcp", "Inspect MCP state, tools and connection controls"),
+    ChatSlashCommandSpec(
+        "extensions", "/extensions", "Inspect installed extensions and configuration"
+    ),
+    ChatSlashCommandSpec("plan", "/plan", "Choose Architect or Forge planning"),
+    ChatSlashCommandSpec("planning", "/planning", "Planning choices and return to previous mode"),
+    ChatSlashCommandSpec("find", "/find [text]", "Find text in this transcript"),
+    ChatSlashCommandSpec("copy-last", "/copy-last", "Copy last assistant response"),
+)
+
+DIFF_COMMAND_SPEC = ChatSlashCommandSpec("diff", "/diff", "Browse working-tree changes locally")
+REVIEW_COMMAND_SPEC = ChatSlashCommandSpec(
+    "review", "/review", "Choose a scope for structured review"
+)
 
 
 @dataclass(frozen=True)
@@ -32,7 +52,14 @@ def _ellipsize(text: str, limit: int) -> str:
         return clean
     if limit <= 3:
         return "." * limit
-    return clean[: limit - 3].rstrip() + "..."
+    clipped = clean[: limit - 3]
+    # Don't cut mid-word - when the cut lands inside a word and at least
+    # one whole word fits, retreat to the last word boundary before eliding.
+    if clean[limit - 3 : limit - 2] not in ("", " ") and " " in clipped:
+        head, _, _tail = clipped.rpartition(" ")
+        if head:
+            clipped = head
+    return clipped.rstrip().rstrip(",;:") + "..."
 
 
 def _completion_display(
@@ -55,7 +82,7 @@ def _completion_display(
 
 SPECS: tuple[ChatSlashCommandSpec, ...] = (
     ChatSlashCommandSpec("help", "/help", "Show available commands"),
-    ChatSlashCommandSpec("mode", "/mode", "Change execution mode"),
+    ChatSlashCommandSpec("permissions", "/permissions", "Change execution mode"),
     ChatSlashCommandSpec("persona", "/persona", "Switch persona: code, architect, ask, debug"),
     ChatSlashCommandSpec("ask", "/ask <question>", "One read-only turn; mode restored after"),
     ChatSlashCommandSpec("status", "/status", "Show session status"),
@@ -69,16 +96,15 @@ SPECS: tuple[ChatSlashCommandSpec, ...] = (
     ChatSlashCommandSpec("resume", "/resume [id]", "Resume a previous session"),
     ChatSlashCommandSpec("stream", "/stream", "Toggle live answer and reasoning output"),
     ChatSlashCommandSpec("trace", "/trace", "Set reasoning trace detail"),
+    ChatSlashCommandSpec("model", "/model [name]", MODEL_DESCRIPTION),
     ChatSlashCommandSpec("config", "/config", "Open or show configuration"),
     ChatSlashCommandSpec("login", "/login", "Connect your Alysis Code account or a subscription"),
     ChatSlashCommandSpec("logout", "/logout", "Disconnect your Alysis Code account"),
     ChatSlashCommandSpec("toolbar", "/toolbar", "Configure status toolbar"),
-    ChatSlashCommandSpec("assets", "/assets", "Open Forge assets"),
-    ChatSlashCommandSpec("image", "/image [path]", "Queue an image for the next message"),
+    ChatSlashCommandSpec("image", "/image [path]", "Attach an image or file to the next message"),
     ChatSlashCommandSpec("forge", "/forge [resume]", "Enter or resume Forge"),
     ChatSlashCommandSpec("report", "/report [text]", "Create feedback bundle and issue draft"),
     ChatSlashCommandSpec("feedback", "/feedback [text]", "Alias for /report"),
-    ChatSlashCommandSpec("plan", "/plan <task>", "Draft, review, approve, then execute"),
     ChatSlashCommandSpec(
         "skill",
         "/skill",
@@ -89,10 +115,12 @@ SPECS: tuple[ChatSlashCommandSpec, ...] = (
 
 FORGE_SPECS: tuple[ChatSlashCommandSpec, ...] = (
     ChatSlashCommandSpec("assistant", "/assistant on|off|status", "Toggle planner assistant"),
+    ChatSlashCommandSpec("assets", "/assets", "Open Forge assets"),
     ChatSlashCommandSpec("execute", "/execute plan", "Run scoped planned tasks"),
     ChatSlashCommandSpec("goal", "/goal <text>", "Set project goal"),
     ChatSlashCommandSpec("task", "/task <title>", "Add a task to the plan"),
     ChatSlashCommandSpec("show", "/show", "Show the current plan summary"),
+    ChatSlashCommandSpec("plan", "/plan tasks|markdown|edit", "View or edit the plan"),
     ChatSlashCommandSpec("done", "/done", "Save and validate the plan"),
     ChatSlashCommandSpec("back", "/back", "Return to chat without finalizing"),
 )
@@ -123,12 +151,11 @@ _SHARED_NESTED_SPECS: tuple[_ChatSlashCompletionSpec, ...] = (
 
 _CHAT_NESTED_SPECS: tuple[_ChatSlashCompletionSpec, ...] = (
     _ChatSlashCompletionSpec("/forge resume", "/forge resume", "Resume the current run pointer"),
-    _ChatSlashCompletionSpec("/plan mode", "/plan mode", "Enter persistent readonly planning"),
-    _ChatSlashCompletionSpec("/plan approve", "/plan approve", "Execute the stored plan draft"),
 )
 
 _FORGE_NESTED_SPECS: tuple[_ChatSlashCompletionSpec, ...] = (
     _ChatSlashCompletionSpec("/execute plan", "/execute plan", "Run scoped planned tasks"),
+    _ChatSlashCompletionSpec("/plan tasks", "/plan tasks", "Show the plan task table"),
     _ChatSlashCompletionSpec(
         "/plan markdown", "/plan markdown", "Preview PLAN.md for the current run"
     ),
@@ -150,7 +177,9 @@ def max_completions_for_mode(mode: str) -> int:
 
     normalized = str(mode or "chat").strip().lower()
     if normalized == "forge":
-        top_level_count = len([spec for spec in SPECS if spec.name not in {"clear", "forge"}])
+        top_level_count = len(
+            [spec for spec in SPECS if spec.name not in {"clear", "forge", "plan"}]
+        )
         top_level_count += len(FORGE_SPECS)
         nested_count = len(_SHARED_NESTED_SPECS) + len(_FORGE_NESTED_SPECS)
         return max(top_level_count, nested_count)
@@ -166,9 +195,11 @@ class ChatSlashCompleter(Completer):
         *,
         mode_provider: Callable[[], str],
         skill_names_provider: Callable[[], Sequence[str]] | None = None,
+        extra_specs: Sequence[ChatSlashCommandSpec] = (),
     ) -> None:
         self._mode_provider = mode_provider
         self._skill_names_provider = skill_names_provider
+        self._extra_specs = tuple(extra_specs)
 
     def get_completions(self, document: Any, complete_event: Any) -> Iterable[Completion]:
         del complete_event
@@ -217,9 +248,18 @@ class ChatSlashCompleter(Completer):
 
     def _top_level_entries(self) -> list[_ChatSlashCompletionSpec]:
         specs = list(get_chat_specs())
-        if self._mode() == "forge":
-            specs = [spec for spec in specs if spec.name not in {"clear", "forge"}]
+        specs.extend(self._extra_specs)
+        mode = self._mode()
+        if mode == "forge":
+            specs = [spec for spec in specs if spec.name not in {"clear", "forge", "plan"}]
             specs.extend(get_forge_specs())
+        planning_entry = any(spec.name == "plan" for spec in self._extra_specs)
+        specs = [
+            spec
+            for spec in specs
+            if command_visible(f"/{spec.name}", ui_mode=mode)
+            or (planning_entry and spec.name == "plan")
+        ]
         return [
             _ChatSlashCompletionSpec(
                 completion=f"/{spec.name}",

@@ -2,22 +2,32 @@ from __future__ import annotations
 
 import ipaddress
 import logging
+import ntpath
 import os
 import platform
+import re
+import shlex
 import shutil
 import site
 import subprocess
 import sys
+import tempfile
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, fields, is_dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import Protocol
 
 from .branding import default_sandbox_docker_image
 from .bwrap_etc import ensure_minimal_etc_dir
+from .command_text import command_text
 from .config import AppConfig, ConfigError
-from .process_reaping import ProcessGroupRegistry, run_in_tracked_process_group
+from .process_reaping import (
+    CommandCancelledError,
+    ProcessGroupRegistry,
+    communicate_until_cancelled,
+    run_in_tracked_process_group,
+)
 from .sandbox_settings import ShellSandboxSettings, resolve_shell_sandbox_settings
 from .service_persistence import apply_non_interactive_defaults
 
@@ -26,6 +36,84 @@ _LOGGER = logging.getLogger("alysis_code.sandbox_runner")
 _DEFAULT_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 _BWRAP_UNSHARE_CGROUP_SUPPORTED: bool | None = None
 _PROTECTED_REPO_META = (".git", ".alysis", ".alysis_images", "alysis-feedback")
+
+# `protect_repo_meta` mounts `.git` read-only, which blocked `git commit` —
+# the safest, most reversible git operation — with the same mechanism as
+# history rewrites. A vetted allowlist of plain staging/commit commands runs
+# with repo metadata writable for that single invocation; everything else
+# (amend, rebase, force updates, config edits, reflog) keeps the read-only
+# mount. The command must be a single simple `git` invocation: any shell
+# metacharacter disqualifies it.
+_SAFE_GIT_SHELL_METACHAR_RE = re.compile(r"[;&|<>`\n\r]|\$\(")
+_SAFE_GIT_COMMIT_VALUE_FLAGS = {"-m", "--message", "--date"}
+_SAFE_GIT_COMMIT_BARE_FLAGS = {
+    "-a",
+    "--all",
+    "-am",
+    "-q",
+    "--quiet",
+    "--no-verify",
+    "--allow-empty",
+    "--",
+}
+_SAFE_GIT_ADD_BARE_FLAGS = {"-A", "--all", "-u", "--update", "--"}
+_SAFE_GIT_CONFIG_KEYS = {"user.name", "user.email"}
+
+
+def is_safe_repo_meta_git_command(cmd: str) -> bool:
+    """True for a single plain ``git add``/``git commit`` invocation.
+
+    Deliberately conservative: unknown flags, chained commands, substitutions,
+    and every other git subcommand return False and keep the read-only mount.
+    """
+    raw = str(cmd or "").strip()
+    if not raw or _SAFE_GIT_SHELL_METACHAR_RE.search(raw):
+        return False
+    try:
+        tokens = shlex.split(raw)
+    except ValueError:
+        return False
+    if not tokens or tokens[0] != "git":
+        return False
+    index = 1
+    # Optional identity config: `-c user.name=...` / `-c user.email=...` only.
+    while index + 1 < len(tokens) and tokens[index] == "-c":
+        key_value = tokens[index + 1]
+        key = key_value.split("=", 1)[0].strip().lower()
+        if key not in _SAFE_GIT_CONFIG_KEYS:
+            return False
+        index += 2
+    if index >= len(tokens):
+        return False
+    subcommand = tokens[index]
+    rest = tokens[index + 1 :]
+    if subcommand == "add":
+        for token in rest:
+            if token.startswith("-") and token not in _SAFE_GIT_ADD_BARE_FLAGS:
+                return False
+        return True
+    if subcommand == "commit":
+        position = 0
+        while position < len(rest):
+            token = rest[position]
+            if token in _SAFE_GIT_COMMIT_VALUE_FLAGS:
+                if position + 1 >= len(rest):
+                    return False
+                position += 2
+                continue
+            if any(token.startswith(f"{flag}=") for flag in _SAFE_GIT_COMMIT_VALUE_FLAGS):
+                position += 1
+                continue
+            if token in _SAFE_GIT_COMMIT_BARE_FLAGS:
+                position += 1
+                continue
+            if token.startswith("-"):
+                return False
+            position += 1
+        return True
+    return False
+
+
 _BWRAP_SYSTEM_BIND_ROOTS = (Path("/usr"), Path("/bin"), Path("/lib"), Path("/lib64"))
 _BWRAP_COMMON_TOOLCHAIN_COMMANDS = (
     "python",
@@ -61,6 +149,9 @@ _BWRAP_COMMON_TOOLCHAIN_COMMANDS = (
 
 
 class ShellRunner(Protocol):
+    # ``cancel_check`` is read while the command runs; once it returns true the
+    # command and what it started are stopped and ``CommandCancelledError`` is
+    # raised (a Stop, or the run's budget, ends a command that is still running).
     def run(
         self,
         *,
@@ -68,6 +159,7 @@ class ShellRunner(Protocol):
         cwd: Path,
         cmd: str,
         timeout_s: int,
+        cancel_check: Callable[[], bool] | None = None,
     ) -> subprocess.CompletedProcess[str]: ...
 
 
@@ -451,6 +543,9 @@ def _bwrap_path_value(path_value: str | None) -> str:
 class HostShellRunner:
     process_group_registry: ProcessGroupRegistry | None = None
     close_stdin: bool = False
+    # True when this runner stands in for a sandbox that is not available here: the shell
+    # guards then ask the user to approve each command (see select_shell_sandbox_backend).
+    requires_command_approval: bool = False
 
     def run(
         self,
@@ -459,6 +554,7 @@ class HostShellRunner:
         cwd: Path,
         cmd: str,
         timeout_s: int,
+        cancel_check: Callable[[], bool] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         return run_in_tracked_process_group(
             cmd,
@@ -469,6 +565,7 @@ class HostShellRunner:
             origin="shell_run:host",
             command_label=cmd,
             stdin=subprocess.DEVNULL if self.close_stdin else None,
+            cancel_check=cancel_check,
         )
 
 
@@ -483,6 +580,7 @@ class DisabledShellRunner:
         cwd: Path,
         cmd: str,
         timeout_s: int,
+        cancel_check: Callable[[], bool] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         raise RuntimeError(self.reason)
 
@@ -506,6 +604,14 @@ class LazyShellRunner:
         self._runner = runner
         return runner
 
+    @property
+    def requires_command_approval(self) -> bool:
+        try:
+            runner = self._resolve_runner()
+        except Exception:  # noqa: BLE001 - the same error is raised when a command runs
+            return False
+        return bool(getattr(runner, "requires_command_approval", False))
+
     def run(
         self,
         *,
@@ -513,8 +619,14 @@ class LazyShellRunner:
         cwd: Path,
         cmd: str,
         timeout_s: int,
+        cancel_check: Callable[[], bool] | None = None,
     ) -> subprocess.CompletedProcess[str]:
-        return self._resolve_runner().run(root=root, cwd=cwd, cmd=cmd, timeout_s=timeout_s)
+        runner = self._resolve_runner()
+        if cancel_check is None:
+            return runner.run(root=root, cwd=cwd, cmd=cmd, timeout_s=timeout_s)
+        return runner.run(
+            root=root, cwd=cwd, cmd=cmd, timeout_s=timeout_s, cancel_check=cancel_check
+        )
 
 
 def _build_bwrap_argv(
@@ -526,6 +638,8 @@ def _build_bwrap_argv(
     clear_env: bool,
     profile: str,
     unshare_cgroup: bool,
+    protect_repo_meta: bool = True,
+    allow_repo_meta_writes: bool = False,
 ) -> tuple[list[str], dict[str, str]]:
     """Build bwrap argv + parent-process env. Pure function; no subprocess calls."""
 
@@ -545,7 +659,11 @@ def _build_bwrap_argv(
         args.append("--unshare-pid")
 
     args.extend(["--bind", os.fspath(root_abs), "/workspace"])
-    if profile == "hardened":
+    # Repo-meta protection now honors the protect_repo_meta setting (it was
+    # previously welded to the hardened profile, making the config knob dead on
+    # the bwrap backend), and a vetted safe git write skips the read-only
+    # mounts for its single invocation.
+    if profile == "hardened" and protect_repo_meta and not allow_repo_meta_writes:
         for host_path, rel_posix_path in _protected_repo_paths(root_abs):
             args.extend(
                 [
@@ -636,6 +754,8 @@ class BwrapShellRunner:
     network: str = "off"
     clear_env: bool = True
     profile: str = "hardened"
+    protect_repo_meta: bool = True
+    safe_git_writes: bool = True
     process_group_registry: ProcessGroupRegistry | None = None
     close_stdin: bool = False
 
@@ -646,7 +766,11 @@ class BwrapShellRunner:
         cwd: Path,
         cmd: str,
         timeout_s: int,
+        cancel_check: Callable[[], bool] | None = None,
     ) -> subprocess.CompletedProcess[str]:
+        allow_repo_meta_writes = bool(
+            self.protect_repo_meta and self.safe_git_writes and is_safe_repo_meta_git_command(cmd)
+        )
         args, run_env = _build_bwrap_argv(
             root=root,
             cwd=cwd,
@@ -655,6 +779,8 @@ class BwrapShellRunner:
             clear_env=self.clear_env,
             profile=self.profile,
             unshare_cgroup=_supports_bwrap_unshare_cgroup(),
+            protect_repo_meta=self.protect_repo_meta,
+            allow_repo_meta_writes=allow_repo_meta_writes,
         )
         return run_in_tracked_process_group(
             args,
@@ -665,6 +791,7 @@ class BwrapShellRunner:
             origin="shell_run:bwrap",
             command_label=cmd,
             stdin=subprocess.DEVNULL if self.close_stdin else None,
+            cancel_check=cancel_check,
         )
 
 
@@ -677,7 +804,7 @@ def _supports_bwrap_unshare_cgroup() -> bool:
             ["bwrap", "--help"],
             check=False,
             capture_output=True,
-            text=True,
+            **command_text(),
         )
     except OSError:
         _BWRAP_UNSHARE_CGROUP_SUPPORTED = False
@@ -717,6 +844,7 @@ def _build_docker_argv(
     protect_repo_meta: bool,
     env_allowlist: tuple[str, ...],
     published_ports: tuple[tuple[str, int, int], ...] = (),
+    allow_repo_meta_writes: bool = False,
 ) -> tuple[list[str], dict[str, str]]:
     """Build docker run argv + parent-process env. Pure function."""
 
@@ -737,7 +865,7 @@ def _build_docker_argv(
         "-w",
         workdir,
     ]
-    if protect_repo_meta or read_only_rootfs:
+    if (protect_repo_meta and not allow_repo_meta_writes) or read_only_rootfs:
         for host_path, rel_posix_path in _protected_repo_paths(root_abs):
             args.extend(
                 [
@@ -800,7 +928,7 @@ def _docker_cleanup_container(
                 cleanup_args,
                 check=False,
                 capture_output=True,
-                text=True,
+                **command_text(),
                 timeout=5,
                 cwd=cwd,
                 env=env,
@@ -820,6 +948,7 @@ class DockerShellRunner:
     cpus: str | None = None
     read_only_rootfs: bool = False
     protect_repo_meta: bool = True
+    safe_git_writes: bool = True
     env_allowlist: tuple[str, ...] = ()
     warning_callback: Callable[[str], None] | None = None
     close_stdin: bool = False
@@ -831,13 +960,21 @@ class DockerShellRunner:
         cwd: Path,
         cmd: str,
         timeout_s: int,
+        cancel_check: Callable[[], bool] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         root_abs = root.resolve()
         container_name = f"alysis-sbx-{uuid.uuid4().hex[:12]}"
+        allow_repo_meta_writes = bool(
+            self.protect_repo_meta
+            and self.safe_git_writes
+            and not self.read_only_rootfs
+            and is_safe_repo_meta_git_command(cmd)
+        )
         args, run_env = _build_docker_argv(
             root=root_abs,
             cwd=cwd,
             cmd=cmd,
+            allow_repo_meta_writes=allow_repo_meta_writes,
             container_name=container_name,
             network=self.network,
             docker_image=self.docker_image,
@@ -882,12 +1019,17 @@ class DockerShellRunner:
                 args,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True,
+                **command_text(),
                 cwd=os.fspath(root_abs),
                 env=run_env,
                 **({"stdin": subprocess.DEVNULL} if self.close_stdin else {}),
             )
-            stdout, stderr = proc.communicate(timeout=timeout_s)
+            if cancel_check is None:
+                stdout, stderr = proc.communicate(timeout=timeout_s)
+            else:
+                stdout, stderr = communicate_until_cancelled(
+                    proc, timeout=timeout_s, cancel_check=cancel_check
+                )
             return subprocess.CompletedProcess(
                 args=args,
                 returncode=proc.returncode if proc.returncode is not None else 1,
@@ -896,6 +1038,10 @@ class DockerShellRunner:
             )
         except subprocess.TimeoutExpired:
             cleanup_container("timeout")
+            kill_docker_cli()
+            raise
+        except CommandCancelledError:
+            cleanup_container("cancel")
             kill_docker_cli()
             raise
         except BaseException:
@@ -907,6 +1053,195 @@ class DockerShellRunner:
             if proc is not None and proc.poll() is None:
                 cleanup_container("unfinished process")
                 kill_docker_cli()
+
+
+SEATBELT_EXECUTABLE = "/usr/bin/sandbox-exec"
+
+
+@dataclass(frozen=True)
+class SandboxBackendChoice:
+    """Where shell commands run under some sandbox settings, decided in one place.
+
+    ``backend`` is "host", "bwrap", "docker" or "seatbelt", or None when the settings ask
+    for a sandbox that this machine cannot provide (``unavailable_reason`` says why).
+    """
+
+    backend: str | None
+    unavailable_reason: str = ""
+    requires_command_approval: bool = False
+
+
+def select_shell_sandbox_backend(
+    settings: ShellSandboxSettings,
+    *,
+    system: str | None = None,
+    which: Callable[[str], str | None] | None = None,
+    path_exists: Callable[[str], bool] | None = None,
+) -> SandboxBackendChoice:
+    """Pick the backend for ``settings``; the shell and background builders and the shell
+    guards all use this, so they cannot disagree.
+
+    ``auto`` prefers bubblewrap on Linux, then Docker, then Seatbelt on macOS. When no
+    backend is usable and ``unavailable_fallback`` is "ask", commands run on the host and
+    each one needs the user's approval; with "refuse" nothing runs.
+    """
+    if settings.mode == "off":
+        return SandboxBackendChoice("host")
+    # Looked up at call time, so a patched shutil.which or os.path.exists applies.
+    which = which or shutil.which
+    path_exists = path_exists or os.path.exists
+    current = (system if system is not None else platform.system()).lower()
+    available = {
+        "bwrap": current == "linux" and which("bwrap") is not None,
+        "docker": which("docker") is not None,
+        "seatbelt": current == "darwin" and path_exists(SEATBELT_EXECUTABLE),
+    }
+    if settings.backend == "auto":
+        backend = next((b for b in ("bwrap", "docker", "seatbelt") if available[b]), None)
+        reason = "auto backend could not find bwrap or docker" if backend is None else ""
+    else:
+        backend = settings.backend if available.get(settings.backend) else None
+        reason = {
+            "bwrap": "bwrap backend selected, but bubblewrap is not available",
+            "docker": "docker backend selected, but docker is not available",
+            "seatbelt": "seatbelt backend selected, but sandbox-exec is not available (macOS only)",
+        }.get(settings.backend, f"unsupported shell sandbox backend: {settings.backend}")
+    if backend is not None:
+        return SandboxBackendChoice(backend)
+    if settings.unavailable_fallback == "ask":
+        return SandboxBackendChoice("host", reason, requires_command_approval=True)
+    return SandboxBackendChoice(None, reason)
+
+
+def describe_shell_backend(
+    choice: SandboxBackendChoice,
+    *,
+    system: str | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> str:
+    """Name the shell that runs a command under ``choice``, for the model's prompt.
+
+    It follows the runners built from the same choice: HostShellRunner passes the command
+    with ``shell=True`` (%COMSPEC% on Windows, /bin/sh elsewhere), BwrapShellRunner and
+    DockerShellRunner run ``sh -lc``, and SeatbeltShellRunner runs ``/bin/sh -c`` inside
+    sandbox-exec.
+    """
+    if choice.backend == "host":
+        current = (system if system is not None else platform.system()).lower()
+        if current == "windows":
+            env = os.environ if environ is None else environ
+            shell = ntpath.basename(str(env.get("COMSPEC") or "")).lower() or "cmd.exe"
+        else:
+            shell = "sh"
+        if choice.requires_command_approval:
+            return f"{shell} (host, each command needs approval)"
+        return f"{shell} (host)"
+    if choice.backend == "bwrap":
+        return "sh (bwrap sandbox)"
+    if choice.backend == "docker":
+        return "sh (Docker sandbox)"
+    if choice.backend == "seatbelt":
+        return "sh (Seatbelt sandbox)"
+    return "none (no usable sandbox, so shell commands are disabled)"
+
+
+def seatbelt_profile(*, network: str, protected_path_count: int) -> str:
+    """A macOS Seatbelt (sandbox-exec) profile: everything allowed except writes outside the
+    workspace and the temporary folders, writes to protected repository metadata, and, with
+    the network off, connections to anything but this machine.
+
+    Paths come in as ``-D`` parameters so no path is ever quoted into the profile text. In
+    Seatbelt the last matching rule wins, so the narrower rules follow the broad ones.
+    """
+    lines = [
+        "(version 1)",
+        "(allow default)",
+        "(deny file-write*)",
+        "(allow file-write*",
+        '    (subpath (param "WORKSPACE"))',
+        '    (subpath (param "TMPDIR"))',
+        '    (subpath "/private/tmp")',
+        '    (subpath "/private/var/folders")',
+        '    (literal "/dev/null")',
+        '    (literal "/dev/zero")',
+        '    (literal "/dev/stdout")',
+        '    (literal "/dev/stderr")',
+        '    (literal "/dev/tty")',
+        '    (literal "/dev/dtracehelper")',
+        '    (regex #"^/dev/fd/[0-9]+$"))',
+    ]
+    lines += [
+        f'(deny file-write* (subpath (param "PROTECTED_{index}")))'
+        for index in range(protected_path_count)
+    ]
+    if network != "on":
+        lines += [
+            '(deny network-outbound (remote ip "*:*"))',
+            '(allow network-outbound (remote ip "localhost:*"))',
+        ]
+    return "\n".join(lines)
+
+
+def seatbelt_command(
+    cmd: str,
+    *,
+    root: Path,
+    network: str,
+    protect_repo_meta: bool,
+    safe_git_writes: bool,
+) -> str:
+    """``cmd`` wrapped in sandbox-exec, as one string for ``/bin/sh``."""
+    root_abs = os.path.realpath(root)
+    protected: list[str] = []
+    if protect_repo_meta and not (safe_git_writes and is_safe_repo_meta_git_command(cmd)):
+        protected = [os.path.realpath(path) for path, _rel in _protected_repo_paths(Path(root_abs))]
+    parameters = [
+        "-D",
+        f"WORKSPACE={root_abs}",
+        "-D",
+        f"TMPDIR={os.path.realpath(tempfile.gettempdir())}",
+    ]
+    for index, path in enumerate(protected):
+        parameters += ["-D", f"PROTECTED_{index}={path}"]
+    profile = seatbelt_profile(network=network, protected_path_count=len(protected))
+    return shlex.join([SEATBELT_EXECUTABLE, *parameters, "-p", profile, "/bin/sh", "-c", cmd])
+
+
+@dataclass(frozen=True)
+class SeatbeltShellRunner:
+    network: str = "off"
+    protect_repo_meta: bool = True
+    safe_git_writes: bool = True
+    process_group_registry: ProcessGroupRegistry | None = None
+    close_stdin: bool = False
+
+    def run(
+        self,
+        *,
+        root: Path,
+        cwd: Path,
+        cmd: str,
+        timeout_s: int,
+        cancel_check: Callable[[], bool] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        wrapped = seatbelt_command(
+            cmd,
+            root=root,
+            network=self.network,
+            protect_repo_meta=self.protect_repo_meta,
+            safe_git_writes=self.safe_git_writes,
+        )
+        return run_in_tracked_process_group(
+            wrapped,
+            shell=True,
+            cwd=str(cwd),
+            timeout=timeout_s,
+            registry=self.process_group_registry,
+            origin="shell_run:seatbelt",
+            command_label=cmd,
+            stdin=subprocess.DEVNULL if self.close_stdin else None,
+            cancel_check=cancel_check,
+        )
 
 
 def _emit_warning(message: str, *, warning_callback: Callable[[str], None] | None) -> None:
@@ -944,76 +1279,56 @@ def build_shell_runner_from_settings(
     # `_docker_cleanup_container` (which this runner already does on timeout and
     # on exception). This mirrors DockerBackgroundRunner's "direct" termination
     # mode.
-    if settings.mode == "off":
-        return HostShellRunner(process_group_registry=process_group_registry)
-
-    is_linux = platform.system().lower() == "linux"
-    has_bwrap = is_linux and shutil.which("bwrap") is not None
-    has_docker = shutil.which("docker") is not None
-
-    def fallback_or_error(*, reason: str) -> ShellRunner:
-        if settings.mode == "warn":
-            disabled_reason = f"Shell sandbox unavailable ({reason}); host fallback is disabled."
-            _emit_warning(disabled_reason, warning_callback=warning_callback)
-            return DisabledShellRunner(reason=disabled_reason)
-        raise ConfigError(
-            "Shell sandbox strict mode is enabled, but no usable backend is available: "
-            f"{reason}. Install bubblewrap (Linux) or Docker, or set "
-            "ALYSIS_SHELL_SANDBOX_MODE=off for explicit unsafe host execution. "
-            "Run `alysis doctor sandbox` for a guided diagnosis or "
-            "`alysis setup sandbox` after installing/starting Docker."
+    choice = select_shell_sandbox_backend(settings)
+    if choice.backend == "host":
+        return HostShellRunner(
+            process_group_registry=process_group_registry,
+            requires_command_approval=choice.requires_command_approval,
         )
-
-    if settings.backend == "auto":
-        if has_bwrap:
-            return BwrapShellRunner(
-                network=settings.network,
-                clear_env=settings.clear_env,
-                profile=settings.bwrap_profile,
-                process_group_registry=process_group_registry,
-            )
-        if has_docker:
-            return DockerShellRunner(
-                network=settings.network,
-                docker_image=settings.docker_image,
-                clear_env=settings.clear_env,
-                pids_limit=settings.docker_pids_limit,
-                memory_limit=settings.docker_memory,
-                cpus=settings.docker_cpus,
-                read_only_rootfs=settings.docker_read_only,
-                protect_repo_meta=settings.protect_repo_meta,
-                env_allowlist=settings.docker_env_allowlist,
-                warning_callback=warning_callback,
-            )
-        return fallback_or_error(reason="auto backend could not find bwrap or docker")
-
-    if settings.backend == "bwrap":
-        if has_bwrap:
-            return BwrapShellRunner(
-                network=settings.network,
-                clear_env=settings.clear_env,
-                profile=settings.bwrap_profile,
-                process_group_registry=process_group_registry,
-            )
-        return fallback_or_error(reason="bwrap backend selected, but bubblewrap is not available")
-
-    if settings.backend == "docker":
-        if has_docker:
-            return DockerShellRunner(
-                network=settings.network,
-                docker_image=settings.docker_image,
-                clear_env=settings.clear_env,
-                pids_limit=settings.docker_pids_limit,
-                memory_limit=settings.docker_memory,
-                cpus=settings.docker_cpus,
-                read_only_rootfs=settings.docker_read_only,
-                protect_repo_meta=settings.protect_repo_meta,
-                env_allowlist=settings.docker_env_allowlist,
-                warning_callback=warning_callback,
-            )
-        return fallback_or_error(reason="docker backend selected, but docker is not available")
-
-    raise ConfigError(f"Unhandled shell sandbox backend: {settings.backend}")
+    if choice.backend == "bwrap":
+        return BwrapShellRunner(
+            network=settings.network,
+            clear_env=settings.clear_env,
+            profile=settings.bwrap_profile,
+            protect_repo_meta=settings.protect_repo_meta,
+            safe_git_writes=settings.safe_git_writes,
+            process_group_registry=process_group_registry,
+        )
+    if choice.backend == "docker":
+        return DockerShellRunner(
+            network=settings.network,
+            docker_image=settings.docker_image,
+            clear_env=settings.clear_env,
+            pids_limit=settings.docker_pids_limit,
+            memory_limit=settings.docker_memory,
+            cpus=settings.docker_cpus,
+            read_only_rootfs=settings.docker_read_only,
+            protect_repo_meta=settings.protect_repo_meta,
+            safe_git_writes=settings.safe_git_writes,
+            env_allowlist=settings.docker_env_allowlist,
+            warning_callback=warning_callback,
+        )
+    if choice.backend == "seatbelt":
+        return SeatbeltShellRunner(
+            network=settings.network,
+            protect_repo_meta=settings.protect_repo_meta,
+            safe_git_writes=settings.safe_git_writes,
+            process_group_registry=process_group_registry,
+        )
+    if settings.mode == "warn":
+        disabled_reason = (
+            f"Shell sandbox unavailable ({choice.unavailable_reason}); host fallback is disabled."
+        )
+        _emit_warning(disabled_reason, warning_callback=warning_callback)
+        return DisabledShellRunner(reason=disabled_reason)
+    raise ConfigError(
+        "Shell sandbox strict mode is enabled, but no usable backend is available: "
+        f"{choice.unavailable_reason}. Install bubblewrap (Linux) or Docker, or set "
+        "ALYSIS_SHELL_SANDBOX_MODE=off for explicit unsafe host execution, or "
+        "ALYSIS_SHELL_SANDBOX_FALLBACK=ask to approve each command. "
+        "Run `alysis doctor sandbox` for a guided diagnosis or "
+        "`alysis setup sandbox` after installing/starting Docker."
+    )
 
 
 def build_shell_runner(

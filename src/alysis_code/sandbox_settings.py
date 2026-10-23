@@ -9,7 +9,11 @@ from .branding import default_sandbox_docker_image, env_get
 from .config import AppConfig, ConfigError
 
 _VALID_MODES = {"off", "warn", "strict"}
-_VALID_BACKENDS = {"auto", "bwrap", "docker"}
+_VALID_BACKENDS = {"auto", "bwrap", "docker", "seatbelt"}
+# What happens when the mode asks for a sandbox and no backend is usable on this machine:
+# "refuse" (no command runs), or "ask" (each command runs on the host only after the user
+# approves that exact command). A host sets "ask" only when it can show those approvals.
+_VALID_UNAVAILABLE_FALLBACKS = {"refuse", "ask"}
 _VALID_NETWORK = {"off", "on"}
 _VALID_BWRAP_PROFILES = {"compat", "hardened"}
 _VALID_PREVIEW_ACCESS = {"auto", "local", "lan"}
@@ -30,11 +34,13 @@ class ShellSandboxSettings:
     docker_cpus: str | None = None
     docker_read_only: bool = False
     protect_repo_meta: bool = True
+    safe_git_writes: bool = True
     docker_env_allowlist: tuple[str, ...] = ()
     background_max_concurrent: int = 4
     background_output_max_lines: int = 2000
     background_output_max_bytes: int = 256 * 1024
     background_kill_timeout_s: float = 10.0
+    unavailable_fallback: str = "refuse"
 
 
 _ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -168,11 +174,13 @@ def resolve_shell_sandbox_settings(cfg: AppConfig) -> ShellSandboxSettings:
     docker_cpus: str | None = None
     docker_read_only = False
     protect_repo_meta = True
+    safe_git_writes = True
     docker_env_allowlist: tuple[str, ...] = ()
     background_max_concurrent = 4
     background_output_max_lines = 2000
     background_output_max_bytes = 256 * 1024
     background_kill_timeout_s = 10.0
+    unavailable_fallback = "refuse"
 
     raw_cfg = cfg.extra_fields.get("shell_sandbox")
     if raw_cfg is not None and not isinstance(raw_cfg, dict):
@@ -244,6 +252,11 @@ def resolve_shell_sandbox_settings(cfg: AppConfig) -> ShellSandboxSettings:
         field_name="shell_sandbox.protect_repo_meta",
         default=protect_repo_meta,
     )
+    safe_git_writes = _parse_bool(
+        cfg_map.get("safe_git_writes"),
+        field_name="shell_sandbox.safe_git_writes",
+        default=safe_git_writes,
+    )
     docker_env_allowlist = _parse_env_allowlist(
         cfg_map.get("docker_env_allowlist"),
         field_name="shell_sandbox.docker_env_allowlist",
@@ -268,6 +281,13 @@ def resolve_shell_sandbox_settings(cfg: AppConfig) -> ShellSandboxSettings:
         cfg_map.get("background_kill_timeout_s"),
         field_name="shell_sandbox.background_kill_timeout_s",
         default=background_kill_timeout_s,
+    )
+
+    unavailable_fallback = _parse_choice(
+        cfg_map.get("unavailable_fallback"),
+        field_name="shell_sandbox.unavailable_fallback",
+        allowed=_VALID_UNAVAILABLE_FALLBACKS,
+        default=unavailable_fallback,
     )
 
     mode = _parse_choice(
@@ -335,6 +355,11 @@ def resolve_shell_sandbox_settings(cfg: AppConfig) -> ShellSandboxSettings:
         field_name="ALYSIS_SHELL_SANDBOX_PROTECT_REPO_META",
         default=protect_repo_meta,
     )
+    safe_git_writes = _parse_bool(
+        env_get("ALYSIS_SHELL_SANDBOX_SAFE_GIT_WRITES"),
+        field_name="ALYSIS_SHELL_SANDBOX_SAFE_GIT_WRITES",
+        default=safe_git_writes,
+    )
     docker_env_allowlist = _parse_env_allowlist(
         env_get("ALYSIS_SHELL_SANDBOX_DOCKER_ENV_ALLOWLIST"),
         field_name="ALYSIS_SHELL_SANDBOX_DOCKER_ENV_ALLOWLIST",
@@ -361,6 +386,13 @@ def resolve_shell_sandbox_settings(cfg: AppConfig) -> ShellSandboxSettings:
         default=background_kill_timeout_s,
     )
 
+    unavailable_fallback = _parse_choice(
+        env_get("ALYSIS_SHELL_SANDBOX_FALLBACK"),
+        field_name="ALYSIS_SHELL_SANDBOX_FALLBACK",
+        allowed=_VALID_UNAVAILABLE_FALLBACKS,
+        default=unavailable_fallback,
+    )
+
     return ShellSandboxSettings(
         mode=mode,
         backend=backend,
@@ -374,11 +406,13 @@ def resolve_shell_sandbox_settings(cfg: AppConfig) -> ShellSandboxSettings:
         docker_cpus=docker_cpus,
         docker_read_only=docker_read_only,
         protect_repo_meta=protect_repo_meta,
+        safe_git_writes=safe_git_writes,
         docker_env_allowlist=docker_env_allowlist,
         background_max_concurrent=background_max_concurrent,
         background_output_max_lines=background_output_max_lines,
         background_output_max_bytes=background_output_max_bytes,
         background_kill_timeout_s=background_kill_timeout_s,
+        unavailable_fallback=unavailable_fallback,
     )
 
 

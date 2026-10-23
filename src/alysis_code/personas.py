@@ -5,7 +5,7 @@ execution mode — never an enforcement layer. Execution modes, approval guards,
 write scope, and the sandbox remain the sole authority over what a turn may do.
 A persona switch may freely lower the effective execution mode but may never
 raise it above the user's session mode (the clamp rule, mirroring subagent
-mode clamping). See ``docs/persona_modes_design.md``.
+mode clamping). See ``docs/personas.md``.
 
 This module is deliberately dependency-light: the registry, the name
 vocabulary, the kill switch, and the model-role lookup. Applying a persona to
@@ -47,8 +47,8 @@ class PersonaDefinition:
     default_exec_mode: str
     model_role: str
     overlay_prompt: str = ""
-    # Optional write scope narrowing (Kilo-fileRegex-style, but enforced by
-    # the host gate's allow_write_globs machinery, not by prompt convention).
+    # Optional write scope narrowing, enforced by the host gate's
+    # allow_write_globs machinery, not by prompt convention.
     # Persona and user scopes are independent constraints: a write must match
     # both whenever both are present. Empty means "no persona scoping".
     allow_write_globs: tuple[str, ...] = ()
@@ -84,7 +84,11 @@ BUILTIN_PERSONAS: dict[str, PersonaDefinition] = {
             "outlines. You may create and edit MARKDOWN documents only "
             "(plans, specs, ADRs); the host's write scope blocks every other "
             "file type, and the host owns all persona and mode state and "
-            "execution gating. Do not attempt code edits or repository "
+            "execution gating. Inspect the existing context first. For an "
+            "ambiguous brief, clarify consequential goals, constraints, and "
+            "success criteria in small rounds; reuse prior answers and stop "
+            "asking once the plan is actionable. Use the question tool only "
+            "when it is available and a reasonable fallback exists. Do not attempt code edits or repository "
             "mutations beyond markdown plans. When the user wants the plan "
             "implemented, propose switching to the code persona (the "
             "switch_mode tool asks; the user decides)."
@@ -376,7 +380,7 @@ def persona_modes_enabled(cfg: Any | None) -> bool:
     """``ALYSIS_PERSONA_MODES`` (on/off) wins over the config value.
 
     Mirrors the kill-switch idiom used by ``unified_turn_path_enabled``; the
-    default is on. Off means: ``/mode`` accepts only execution modes, the
+    default is on. Off means: ``/permissions`` accepts only execution modes, the
     ``switch_mode`` tool is not registered, and personas stay at Code.
     """
     env_value = env_get("ALYSIS_PERSONA_MODES")
