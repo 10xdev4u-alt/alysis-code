@@ -16,8 +16,10 @@ from ..repo_scan import RepoScanResult
 from ..runtime_artifacts import is_runtime_artifact_path
 from ..verification_command_analysis import (
     CheckerEntrypointFingerprint,
+    VerificationCommandEvidentiaryCapability,
     analyze_verification_command,
 )
+from ..verify_gate import assess_verification_command_execution
 from .turn_contract import (
     MAX_EXPECTATIONS,
     MIN_EXPECTED_OUTPUT_LITERAL_LEN,
@@ -39,6 +41,7 @@ class AcceptanceCriterionKind(StrEnum):
     EXPLICIT_HOST_USER_VERIFICATION_COMMAND = "explicit_host_user_verification_command"
     PREEXISTING_REPO_CHECK_SURFACE = "preexisting_repo_check_surface"
     REFERENCE_PATH = "reference_path"
+    PUBLIC_SYMBOL_INTERFACE = "public_symbol_interface"
 
 
 class AcceptanceCriterionStatus(StrEnum):
@@ -51,10 +54,10 @@ class AcceptanceCriterionStatus(StrEnum):
 
 class AcceptanceCriterionSource(StrEnum):
     USER_INSTRUCTION = "user_instruction"
-    TASK_BRIEF = "task_brief"
     PLANNING_CONSTRAINT = "planning_constraint"
     HOST_VERIFICATION = "host_verification"
     REPO_SCAN = "repo_scan"
+    DELEGATED_TASK = "delegated_task"
 
 
 class EvidenceOrigin(StrEnum):
@@ -142,6 +145,15 @@ class AcceptanceEvidence:
     paths: tuple[str, ...] = tuple()
     criterion_ids: tuple[str, ...] = tuple()
     category: str = ""
+    task_id: str = ""
+    generation: int = 0
+    tool_name: str = ""
+    cwd: str = ""
+    exit_code: int | None = None
+    discovered_test_count: int | None = None
+    executed_test_count: int | None = None
+    result_id: str = ""
+    evidence_allowed: bool | None = None
 
     def as_payload(self) -> dict[str, Any]:
         return {
@@ -153,6 +165,15 @@ class AcceptanceEvidence:
             "paths": list(self.paths),
             "criterion_ids": list(self.criterion_ids),
             "category": self.category,
+            "task_id": self.task_id,
+            "generation": self.generation,
+            "tool_name": self.tool_name,
+            "cwd": self.cwd,
+            "exit_code": self.exit_code,
+            "discovered_test_count": self.discovered_test_count,
+            "executed_test_count": self.executed_test_count,
+            "result_id": self.result_id,
+            "evidence_allowed": self.evidence_allowed,
         }
 
 
@@ -243,6 +264,10 @@ class AcceptanceContract:
     # task text (expected-output literals, named loci, named behaviors). Empty is
     # valid; the completion gate demands a disposition per expectation.
     expectations: list[Expectation] = field(default_factory=list)
+    task_id: str = ""
+    generation: int = 0
+    acceptance_revision: str = ""
+    baseline_available: bool = True
 
     def next_evidence_id(self) -> str:
         return f"ev{len(self.evidence) + 1:03d}"
@@ -257,6 +282,15 @@ class AcceptanceContract:
         paths: tuple[str, ...] = tuple(),
         criterion_ids: tuple[str, ...] = tuple(),
         category: str = "",
+        task_id: str | None = None,
+        generation: int | None = None,
+        tool_name: str = "",
+        cwd: str = "",
+        exit_code: int | None = None,
+        discovered_test_count: int | None = None,
+        executed_test_count: int | None = None,
+        result_id: str = "",
+        evidence_allowed: bool | None = None,
     ) -> AcceptanceEvidence:
         evidence = AcceptanceEvidence(
             evidence_id=self.next_evidence_id(),
@@ -267,6 +301,15 @@ class AcceptanceContract:
             paths=tuple(paths),
             criterion_ids=tuple(criterion_ids),
             category=category,
+            task_id=self.task_id if task_id is None else task_id,
+            generation=self.generation if generation is None else generation,
+            tool_name=tool_name,
+            cwd=cwd,
+            exit_code=exit_code,
+            discovered_test_count=discovered_test_count,
+            executed_test_count=executed_test_count,
+            result_id=result_id,
+            evidence_allowed=evidence_allowed,
         )
         self.evidence.append(evidence)
         return evidence
@@ -285,7 +328,7 @@ class AcceptanceContract:
         return counts
 
     def problem_names(self) -> list[str]:
-        problems: list[str] = []
+        problems: list[str] = [] if self.baseline_available else ["acceptance_baseline_unavailable"]
         required = self.required_criteria()
         if any(item.status == AcceptanceCriterionStatus.FAILED for item in required):
             problems.append("acceptance_criteria_failed")
@@ -319,6 +362,10 @@ class AcceptanceContract:
 
     def as_payload(self) -> dict[str, Any]:
         return {
+            "task_id": self.task_id,
+            "generation": self.generation,
+            "acceptance_revision": self.acceptance_revision,
+            "baseline_available": self.baseline_available,
             "criteria": [criterion.as_payload() for criterion in self.criteria],
             "evidence": [evidence.as_payload() for evidence in self.evidence[-20:]],
             "snapshot": self.snapshot.as_payload(),
@@ -332,13 +379,26 @@ class AcceptanceContract:
 
 
 _BACKTICK_COMMAND_RE = re.compile(r"`([^`\n]+)`")
+_PATH_EXTENSIONS = (
+    r"py|js|ts|tsx|jsx|json|toml|yaml|yml|txt|md|html|css|csv|xml|sql|sh|go|rs|java|rb|php|"
+    r"out|expected|actual|bin|docx|xlsx|pptx|pdf|png|jpg|jpeg|webp"
+)
+_QUOTED_PATH = "|".join(
+    rf"(?<={re.escape(quote)})(?:[A-Za-z]:)?"
+    rf"[^\x00-\x1f{re.escape(quote)}<>|?:]+?\.(?:{_PATH_EXTENSIONS})(?={re.escape(quote)})"
+    for quote in ('"', "'", "`")
+)
 _PATH_RE = re.compile(
     r"(?<![\w.-])("
+    # Native file names commonly contain spaces. A quoted document path must be
+    # captured whole, not as an invented relative path beginning after the space.
+    rf"{_QUOTED_PATH}|"
     r"(?:[A-Za-z]:[\\/]|[\\/]{1,2}|\.{1,2}[\\/])?"
     r"(?:[A-Za-z0-9_.-]+[\\/])+[A-Za-z0-9_.-]+(?:\.[A-Za-z0-9_.-]+)?|"
     r"(?:\.{1,2}[\\/])?[A-Za-z0-9_.-]+\."
-    r"(?:py|js|ts|tsx|jsx|json|toml|yaml|yml|txt|md|html|css|csv|xml|sql|sh|go|rs|java|rb|php|out|expected|actual|bin)"
-    r")(?=$|[\s,;:!?\]\)}]|[.](?:\s|$))"
+    rf"(?:{_PATH_EXTENSIONS})"
+    r")(?=$|[`\"'\s,;:!?\]\)}]|[.](?:\s|$))",
+    re.I,
 )
 _PORT_RE = re.compile(r"\bport\s+([1-9][0-9]{1,4})\b", re.I)
 _THRESHOLD_RE = re.compile(
@@ -376,10 +436,14 @@ _INPUT_ROLE_RE = re.compile(
     r"\b(?:read\s+from|input|initial|reference|source|given\s+at|provided\s+at|load\s+from|using)\b",
     re.I,
 )
+# A source connector can switch from an output to its inputs inside one clause.
+# Bare nouns such as "source" must not override "create source code at ...".
+_INPUT_CONNECTOR_RE = re.compile(r"\b(?:using|from|given\s+at|provided\s+at)\b", re.I)
 _PRESERVATION_ROLE_RE = re.compile(
     r"\b(?:do\s+not|don't|dont|without|never|leave|keep|preserve)\b"
     r"[^;\n]{0,80}?"
-    r"\b(?:modify|change|touch|overwrite|alter|remove|delete|unchanged|intact)\b|"
+    r"\b(?:modif(?:y|ying)|chang(?:e|ing)|touch(?:ing)?|overwrit(?:e|ing)|alter(?:ing)?|"
+    r"remov(?:e|ing)|delet(?:e|ing)|unchanged|intact)\b|"
     r"\b(?:preserve|keep)\b[^;\n]{0,80}?\b(?:unchanged|intact)\b",
     re.I,
 )
@@ -425,18 +489,30 @@ def build_acceptance_contract(
     instruction: str,
     authoritative_verification_commands: list[str] | None = None,
     effective_verification_commands: list[str] | None = None,
-    task_brief: str = "",
     repo_scan: RepoScanResult | None = None,
     planning_constraints: Any | None = None,
+    delegated: bool = False,
+    generation: int = 0,
+    workspace_snapshot: AcceptanceWorkspaceSnapshot | None = None,
+    baseline_available: bool = True,
 ) -> AcceptanceContract:
-    snapshot = capture_acceptance_workspace_snapshot(
-        root=root,
-        repo_scan=repo_scan,
-        authoritative_verification_commands=authoritative_verification_commands,
-        effective_verification_commands=effective_verification_commands,
+    snapshot = (
+        workspace_snapshot
+        if workspace_snapshot is not None
+        else capture_acceptance_workspace_snapshot(
+            root=root,
+            repo_scan=repo_scan,
+            authoritative_verification_commands=authoritative_verification_commands,
+            effective_verification_commands=effective_verification_commands,
+        )
     )
-    texts = [str(instruction or "").strip(), str(task_brief or "").strip()]
-    texts = [item for item in texts if item]
+    # Only the current host-supplied request creates explicit obligations.
+    instruction_source = (
+        AcceptanceCriterionSource.DELEGATED_TASK
+        if delegated
+        else AcceptanceCriterionSource.USER_INSTRUCTION
+    )
+    texts = [instruction] if instruction else []
     criteria: list[AcceptanceCriterion] = []
     allowed_output_paths: set[str] = set()
     path_refs = _extract_path_refs(root=root, texts=texts)
@@ -449,7 +525,7 @@ def build_acceptance_contract(
                 _criterion(
                     criteria,
                     kind=AcceptanceCriterionKind.REQUIRED_ARTIFACT_PATH,
-                    source=AcceptanceCriterionSource.USER_INSTRUCTION,
+                    source=instruction_source,
                     description=f"Required output path: {path_ref.display_path}",
                     paths=_legacy_paths_from_refs((path_ref,)),
                     path_refs=(path_ref,),
@@ -462,7 +538,7 @@ def build_acceptance_contract(
                 _criterion(
                     criteria,
                     kind=AcceptanceCriterionKind.PRESERVATION_UNCHANGED_PATH,
-                    source=AcceptanceCriterionSource.USER_INSTRUCTION,
+                    source=instruction_source,
                     description=f"Preserve unchanged: {path_ref.display_path}",
                     paths=_legacy_paths_from_refs((path_ref,)),
                     path_refs=(path_ref,),
@@ -479,7 +555,7 @@ def build_acceptance_contract(
                 _criterion(
                     criteria,
                     kind=AcceptanceCriterionKind.REFERENCE_PATH,
-                    source=AcceptanceCriterionSource.USER_INSTRUCTION,
+                    source=instruction_source,
                     description=f"Path reference: {path_ref.display_path}",
                     paths=_legacy_paths_from_refs((path_ref,)),
                     path_refs=(path_ref,),
@@ -503,7 +579,7 @@ def build_acceptance_contract(
             _criterion(
                 criteria,
                 kind=AcceptanceCriterionKind.CONTENT_FORMAT_SCHEMA,
-                source=AcceptanceCriterionSource.USER_INSTRUCTION,
+                source=instruction_source,
                 description=f"{fmt.upper()} format requirement for {path_ref.display_path}",
                 paths=_legacy_paths_from_refs((path_ref,)),
                 path_refs=(path_ref,),
@@ -517,11 +593,23 @@ def build_acceptance_contract(
             _criterion(
                 criteria,
                 kind=AcceptanceCriterionKind.EXPLICIT_COMMAND_IO,
-                source=AcceptanceCriterionSource.USER_INSTRUCTION,
+                source=instruction_source,
                 description=f"Explicit command must pass: {command}",
                 commands=(command,),
                 confidence=AcceptanceCriterionConfidence.EXPLICIT,
                 enforcement=AcceptanceCriterionEnforcement.HARD,
+            )
+        )
+
+    for symbol in _extract_public_symbols(texts):
+        criteria.append(
+            _criterion(
+                criteria,
+                kind=AcceptanceCriterionKind.PUBLIC_SYMBOL_INTERFACE,
+                source=instruction_source,
+                description=f"Public symbol/interface reference: {symbol}",
+                confidence=AcceptanceCriterionConfidence.HEURISTIC,
+                enforcement=AcceptanceCriterionEnforcement.ADVISORY,
             )
         )
 
@@ -530,7 +618,7 @@ def build_acceptance_contract(
             _criterion(
                 criteria,
                 kind=AcceptanceCriterionKind.THRESHOLD,
-                source=AcceptanceCriterionSource.USER_INSTRUCTION,
+                source=instruction_source,
                 description=(
                     f"Threshold: {threshold.metric} {threshold.operator} "
                     f"{threshold.value:g}{threshold.unit}"
@@ -546,7 +634,7 @@ def build_acceptance_contract(
             _criterion(
                 criteria,
                 kind=AcceptanceCriterionKind.FUNCTIONAL_API_PROTOCOL,
-                source=AcceptanceCriterionSource.USER_INSTRUCTION,
+                source=instruction_source,
                 description=f"Protocol/API behavior on port {port}",
                 ports=(port,),
                 confidence=AcceptanceCriterionConfidence.EXPLICIT,
@@ -559,7 +647,7 @@ def build_acceptance_contract(
             _criterion(
                 criteria,
                 kind=AcceptanceCriterionKind.PERSISTENT_SERVICE,
-                source=AcceptanceCriterionSource.USER_INSTRUCTION,
+                source=instruction_source,
                 description="Persistent service must survive finalization",
                 ports=tuple(_extract_ports(texts)),
                 confidence=AcceptanceCriterionConfidence.EXPLICIT,
@@ -572,7 +660,7 @@ def build_acceptance_contract(
             _criterion(
                 criteria,
                 kind=AcceptanceCriterionKind.PRESERVATION_UNCHANGED_PATH,
-                source=AcceptanceCriterionSource.USER_INSTRUCTION,
+                source=instruction_source,
                 description="No unexpected material paths outside requested outputs",
                 paths=tuple(sorted(allowed_output_paths)),
                 path_refs=tuple(
@@ -628,7 +716,7 @@ def build_acceptance_contract(
             _criterion(
                 criteria,
                 kind=AcceptanceCriterionKind.FUNCTIONAL_API_PROTOCOL,
-                source=AcceptanceCriterionSource.USER_INSTRUCTION,
+                source=instruction_source,
                 description=f"Functional requirement context: {residual}",
                 confidence=AcceptanceCriterionConfidence.HEURISTIC,
                 enforcement=AcceptanceCriterionEnforcement.ADVISORY,
@@ -636,8 +724,11 @@ def build_acceptance_contract(
         )
 
     return AcceptanceContract(
+        task_id="",
+        generation=generation,
         criteria=_dedupe_criteria(criteria),
         snapshot=snapshot,
+        baseline_available=baseline_available,
         allowed_output_paths=allowed_output_paths,
         path_refs=path_refs,
         expectations=extract_task_expectations(texts=texts, path_refs=path_refs),
@@ -719,12 +810,118 @@ def record_acceptance_tool_effect(
     verification_authoritative: bool = False,
     evidence_category: str = "",
     evidence_allowed: bool | None = None,
+    generation: int | None = None,
+    task_id: str | None = None,
 ) -> None:
     if contract is None:
         return
     normalized_tool = str(tool_name or "").strip().lower()
+    command_results = result.get("command_results")
+    if normalized_tool == "verify_run" and isinstance(command_results, list) and command_results:
+        for item in command_results:
+            if not isinstance(item, dict):
+                continue
+            command = str(item.get("effective_command") or item.get("command") or "").strip()
+            if not command:
+                continue
+            single_result = {
+                "cwd": result.get("cwd", arguments.get("cwd", str(root))),
+                **item,
+                "commands": [command],
+            }
+            record_acceptance_tool_effect(
+                contract=contract,
+                root=root,
+                tool_name=normalized_tool,
+                arguments=arguments,
+                status="failed" if item.get("ok") is False else "ok",
+                result=single_result,
+                touched_paths=touched_paths,
+                known_verification_commands=known_verification_commands,
+                verification_authoritative=verification_authoritative,
+                evidence_category=str(
+                    item.get("verification_evidence_category") or evidence_category
+                ),
+                evidence_allowed=item.get("verification_evidence_allowed", evidence_allowed),
+                generation=generation,
+                task_id=task_id,
+            )
+        return
+    observed_generation = contract.generation if generation is None else generation
+    observed_task = contract.task_id if task_id is None else task_id
+    if observed_task == contract.task_id and observed_generation > contract.generation:
+        invalidate_acceptance_evidence(contract, generation=observed_generation)
     command = _observed_command(tool_name=normalized_tool, arguments=arguments, result=result)
     command_passed = _command_passed(status=status, result=result)
+    output = _tool_output(result)
+    cwd = str(result.get("cwd") or arguments.get("cwd") or root)
+    try:
+        cwd_path = Path(cwd)
+        same_workspace = (
+            cwd_path if cwd_path.is_absolute() else root / cwd_path
+        ).resolve() == root.resolve()
+    except (OSError, ValueError):
+        same_workspace = False
+    current = observed_generation == contract.generation and observed_task == contract.task_id
+    exit_code = result.get("exit_code")
+    exit_code = exit_code if type(exit_code) is int else None
+    discovered, executed = _observed_test_counts(command=command, result=result, output=output)
+    allowed = evidence_allowed
+    # Two different questions meet here. "Did the command really run, here and
+    # now, without side effects?" is about execution. "Can this command prove
+    # anything beyond its own exit status?" is about evidentiary capability.
+    # Verification evidence needs both. A command the user named is its own
+    # acceptance check, so that criterion needs only the first.
+    capability_verdicts = _evidentiary_capability_verdicts(command) if command else frozenset()
+    execution_observed = bool(command)
+    if command:
+        if (
+            not same_workspace
+            or not current
+            or exit_code is None
+            or executed == 0
+            or discovered == 0
+            or touched_paths
+        ):
+            allowed = False
+            execution_observed = False
+        if result.get("real_execution") is False:
+            allowed = False
+            if str(result.get("non_execution_reason") or "") not in capability_verdicts:
+                execution_observed = False
+        if exit_code is not None:
+            assessment = assess_verification_command_execution(
+                command=command, exit_code=exit_code, output=output
+            )
+            if assessment.real_execution is False:
+                allowed = False
+                if str(assessment.non_execution_reason or "") not in capability_verdicts:
+                    execution_observed = False
+    explicit_command_allowed = allowed
+    if (
+        allowed is False
+        and execution_observed
+        and (
+            evidence_allowed is not False
+            or str(result.get("verification_evidence_reason") or "") in capability_verdicts
+        )
+    ):
+        # Every refusal was about capability, none about the run itself. The
+        # evidence record below still carries ``allowed`` (not verification).
+        explicit_command_allowed = True
+    host_covered_commands: tuple[str, ...] = ()
+    covered_payload = result.get("verification_evidence_covered_commands")
+    if normalized_tool == "verify_run" and allowed is True and isinstance(covered_payload, list):
+        known = set(normalize_verify_command_list(known_verification_commands or []))
+        known.update(
+            command
+            for criterion in contract.criteria
+            if criterion.kind == AcceptanceCriterionKind.EXPLICIT_COMMAND_IO
+            for command in criterion.commands
+        )
+        host_covered_commands = tuple(
+            item for item in covered_payload if isinstance(item, str) and item in known
+        )
     origin = classify_evidence_origin(
         contract=contract,
         root=root,
@@ -733,26 +930,42 @@ def record_acceptance_tool_effect(
         known_verification_commands=known_verification_commands,
         verification_authoritative=verification_authoritative,
     )
+    if host_covered_commands and origin != EvidenceOrigin.SELF_AUTHORED:
+        # The host may expand a glob before executing a required command. Its
+        # classified coverage preserves the obligation's identity; the evidence
+        # command below still records the invocation that actually executed.
+        origin = classify_evidence_origin(
+            contract=contract,
+            root=root,
+            command=host_covered_commands[0],
+            touched_paths=touched_paths,
+            known_verification_commands=known_verification_commands,
+            verification_authoritative=verification_authoritative,
+        )
     criterion_ids: list[str] = []
-    if command:
+    if command and current:
         criterion_ids.extend(
             _update_command_and_threshold_criteria(
                 contract=contract,
                 command=command,
-                output=_tool_output(result),
+                output=output,
                 passed=command_passed,
                 origin=origin,
+                evidence_allowed=allowed,
+                explicit_command_allowed=explicit_command_allowed,
+                host_covered_commands=host_covered_commands,
             )
         )
-    criterion_ids.extend(
-        _update_path_criteria(
-            contract=contract,
-            root=root,
-            touched_paths=touched_paths,
-            status=status,
+    if current:
+        criterion_ids.extend(
+            _update_path_criteria(
+                contract=contract,
+                root=root,
+                touched_paths=touched_paths,
+                status=status,
+            )
         )
-    )
-    if normalized_tool in {
+    if current and normalized_tool in {
         "shell_service_start",
         "shell_service_status",
         "workspace_preview_start",
@@ -763,7 +976,7 @@ def record_acceptance_tool_effect(
                 result=result,
             )
         )
-    elif normalized_tool == "shell_background":
+    elif current and normalized_tool == "shell_background":
         # persist=true routes shell_background through the durable-service
         # manager, so its result carries durable ownership and is durable
         # evidence. A plain background start produces no such payload and is
@@ -777,15 +990,16 @@ def record_acceptance_tool_effect(
             if durable_criterion_ids
             else _block_session_owned_service_criteria(contract=contract)
         )
-    if normalized_tool in {"verify_run", "shell_run"}:
+    if current and normalized_tool in {"verify_run", "shell_run"}:
         criterion_ids.extend(
             _update_repo_surface_criteria(
                 contract=contract,
                 command=command,
                 passed=command_passed,
-                evidence_allowed=evidence_allowed,
+                evidence_allowed=allowed,
                 known_verification_commands=known_verification_commands,
                 origin=origin,
+                host_covered_commands=host_covered_commands,
             )
         )
     if command or touched_paths or criterion_ids:
@@ -797,12 +1011,77 @@ def record_acceptance_tool_effect(
             paths=tuple(sorted(touched_paths)),
             criterion_ids=tuple(sorted(set(criterion_ids))),
             category=evidence_category,
+            task_id=observed_task,
+            generation=observed_generation,
+            tool_name=normalized_tool,
+            cwd=cwd,
+            exit_code=exit_code,
+            discovered_test_count=discovered,
+            executed_test_count=executed,
+            result_id=str(
+                result.get("result_id")
+                or result.get("artifact_id")
+                or (
+                    "sha256:"
+                    + hashlib.sha256(
+                        json.dumps(result, sort_keys=True, default=str).encode("utf-8")
+                    ).hexdigest()
+                )
+            ),
+            evidence_allowed=allowed,
         )
         for criterion in contract.criteria:
             if criterion.criterion_id in criterion_ids and evidence.evidence_id not in (
                 criterion.evidence_ids
             ):
                 criterion.evidence_ids.append(evidence.evidence_id)
+
+
+def invalidate_acceptance_evidence(contract: AcceptanceContract | None, *, generation: int) -> None:
+    """Expire execution-dependent passes using the runtime's existing edit clock."""
+    if contract is None or generation <= contract.generation:
+        return
+    contract.generation = generation
+    for criterion in contract.criteria:
+        if criterion.status == AcceptanceCriterionStatus.PASSED and criterion.kind not in {
+            AcceptanceCriterionKind.REFERENCE_PATH,
+            AcceptanceCriterionKind.PRESERVATION_UNCHANGED_PATH,
+        }:
+            criterion.status = AcceptanceCriterionStatus.UNVERIFIED
+            criterion.failure_summary = "Evidence predates a relevant edit"
+
+
+def _observed_test_counts(
+    *, command: str, result: dict[str, Any], output: str
+) -> tuple[int | None, int | None]:
+    from .regression_baseline import command_is_test_runner, parse_test_report
+
+    def count(key: str) -> int | None:
+        value = result.get(key)
+        return value if type(value) is int and value >= 0 else None
+
+    discovered = count("discovered_test_count")
+    executed = count("executed_test_count")
+    if not command_is_test_runner(command):
+        return discovered, executed
+    if discovered is None:
+        collected = re.search(r"\bcollected\s+(\d+)\s+items?\b", output, re.I)
+        if collected:
+            discovered = int(collected.group(1))
+    if executed is None:
+        report = parse_test_report(output)
+        ran = re.search(r"\bRan\s+(\d+)\s+tests?\s+in\b", output)
+        if ran:
+            executed = max(0, int(ran.group(1)) - (report.skipped or 0))
+        elif (
+            report.counts_known
+            and report.passed is not None
+            and not re.search(r"\b\d+\s+x(?:failed|passed)\b", output)
+        ):
+            executed = sum(value or 0 for value in (report.passed, report.failed, report.errors))
+        elif re.search(r"\b(?:no tests ran|no tests collected|ran 0 tests)\b", output, re.I):
+            executed = 0
+    return discovered, executed
 
 
 def finalize_acceptance_contract(
@@ -823,6 +1102,10 @@ def finalize_acceptance_contract(
             elif criterion.status == AcceptanceCriterionStatus.UNVERIFIED:
                 criterion.status = AcceptanceCriterionStatus.PASSED
         elif criterion.kind == AcceptanceCriterionKind.PRESERVATION_UNCHANGED_PATH:
+            if not contract.baseline_available:
+                criterion.status = AcceptanceCriterionStatus.BLOCKED
+                criterion.failure_summary = "The original task preservation baseline is unavailable"
+                continue
             if "outside requested outputs" in criterion.description.casefold():
                 unexpected = [
                     path
@@ -881,6 +1164,8 @@ def classify_evidence_origin(
     verification_authoritative: bool = False,
 ) -> EvidenceOrigin:
     command = _normalize_command(command)
+    if not contract.baseline_available:
+        return EvidenceOrigin.AD_HOC_OBSERVATION
     if command and _command_references_mutable_preexisting_checker(
         command,
         contract=contract,
@@ -999,6 +1284,18 @@ def _dedupe_criteria(criteria: list[AcceptanceCriterion]) -> list[AcceptanceCrit
     return out
 
 
+def _mask_path_tokens(text: str) -> str:
+    # Preserve offsets while ensuring a filename such as input/write.csv cannot
+    # introduce a new action or split a coordinated list of source files.
+    # Use non-whitespace so an "and <path>" list cannot become "and <verb>".
+    def masked(match: re.Match[str]) -> str:
+        token = match.group(0)
+        length = len(token.rstrip(".,;:!?)]}"))
+        return "\x00" * length + token[length:]
+
+    return _PATH_RE.sub(masked, text)
+
+
 def _iter_clauses(texts: list[str]) -> list[str]:
     clauses: list[str] = []
     boundary = re.compile(
@@ -1012,21 +1309,32 @@ def _iter_clauses(texts: list[str]) -> list[str]:
         re.I,
     )
     for text in texts:
-        for clause in boundary.split(str(text or "")):
-            normalized = " ".join(clause.split())
+        text = str(text or "")
+        start = 0
+        spans = []
+        for match in boundary.finditer(_mask_path_tokens(text)):
+            spans.append((start, match.start()))
+            start = match.end()
+        spans.append((start, len(text)))
+        for start, end in spans:
+            clause = text[start:end]
+            # Whitespace inside a quoted native filename is significant.
+            normalized = clause.strip()
             if normalized:
                 clauses.append(normalized)
     return clauses
 
 
-def _clause_path_role(clause: str) -> AcceptancePathRole:
-    if _PRESERVATION_ROLE_RE.search(clause):
-        return AcceptancePathRole.PRESERVATION_TARGET
-    if _OUTPUT_ROLE_RE.search(clause):
+def _prefix_path_role(prefix: str) -> AcceptancePathRole:
+    output = list(_OUTPUT_ROLE_RE.finditer(prefix))
+    source = list(_INPUT_CONNECTOR_RE.finditer(prefix))
+    if output:
+        if source and source[-1].start() > output[-1].start():
+            return AcceptancePathRole.EXISTING_INPUT
         return AcceptancePathRole.REQUIRED_OUTPUT
-    if _INPUT_ROLE_RE.search(clause):
+    if source or _INPUT_ROLE_RE.search(prefix):
         return AcceptancePathRole.EXISTING_INPUT
-    if _CHECKER_ROLE_RE.search(clause):
+    if _CHECKER_ROLE_RE.search(prefix):
         return AcceptancePathRole.VERIFICATION_CHECKER
     return AcceptancePathRole.UNKNOWN_REFERENCE
 
@@ -1036,13 +1344,14 @@ def _path_role(
     path_match: re.Match[str],
 ) -> AcceptancePathRole:
     path_start = path_match.start(1)
+    masked = _mask_path_tokens(clause)
     preservation = None
-    for candidate in _PRESERVATION_ROLE_RE.finditer(clause):
+    for candidate in _PRESERVATION_ROLE_RE.finditer(masked):
         if candidate.start() >= path_start:
             break
         preservation = candidate
     if preservation is None:
-        return _clause_path_role(clause)
+        return _prefix_path_role(masked[:path_start])
     if path_start < preservation.end():
         return AcceptancePathRole.PRESERVATION_TARGET
 
@@ -1055,7 +1364,7 @@ def _path_role(
     # carries across it only after binding a path, which preserves path lists.
     if not scope_is_complete and prior_path is not None:
         return AcceptancePathRole.PRESERVATION_TARGET
-    return _clause_path_role(clause[boundary + 1 :])
+    return _prefix_path_role(masked[boundary + 1 : path_start])
 
 
 def _clean_path_token(path: str) -> str:
@@ -1072,6 +1381,8 @@ def _extract_path_refs(*, root: Path, texts: list[str]) -> list[AcceptancePathRe
     for clause in _iter_clauses(texts):
         for match in _PATH_RE.finditer(clause):
             role = _path_role(clause, match)
+            if _context_is_suggestion(clause):
+                role = AcceptancePathRole.UNKNOWN_REFERENCE
             path_ref = _resolve_acceptance_path(
                 root=root,
                 raw_text=match.group(1),
@@ -1288,17 +1599,50 @@ def _extract_explicit_commands(texts: list[str]) -> list[str]:
         for match in _BACKTICK_COMMAND_RE.finditer(text):
             candidate = _normalize_command(match.group(1))
             context = str(text or "")[max(0, match.start() - 80) : match.start()]
+            if _context_is_suggestion(context) or _context_negates_command(context):
+                continue
+            suffix_requires_pass = bool(
+                re.match(
+                    r"\s*(?:must|shall|needs to)\s+(?:pass|succeed|exit\s+with\s+(?:code\s+)?0)\b",
+                    text[match.end() : match.end() + 80],
+                    re.I,
+                )
+            )
             python_snippet = _python_interpreter_snippet_command(candidate, context=context)
             if python_snippet:
+                if not re.search(r"\b(?:validate|verify|check|run|execute|test)\b", context, re.I):
+                    continue
                 candidate = python_snippet
-            elif not candidate or not _looks_like_command(candidate, context=context):
+            elif (
+                not candidate
+                or not _looks_like_command(
+                    candidate, context="run " if suffix_requires_pass else context
+                )
+                or not (_has_direct_command_intro(context) or suffix_requires_pass)
+            ):
                 continue
-            key = candidate.casefold()
+            key = candidate
             if key in seen:
                 continue
             seen.add(key)
             commands.append(candidate)
     return commands[:8]
+
+
+def _extract_public_symbols(texts: list[str]) -> list[str]:
+    symbols: list[str] = []
+    for text in texts:
+        for match in _BACKTICK_COMMAND_RE.finditer(text):
+            candidate = match.group(1).strip()
+            context = text[max(0, match.start() - 80) : match.start()]
+            if (
+                _expectation_span_is_symbol_like(candidate)
+                and not _PATH_RE.fullmatch(candidate)
+                and not _looks_like_command(candidate, context=context)
+                and candidate not in symbols
+            ):
+                symbols.append(candidate)
+    return symbols[:40]
 
 
 def extract_explicit_acceptance_commands(*texts: str) -> list[str]:
@@ -1419,6 +1763,8 @@ def _extract_thresholds(texts: list[str]) -> list[AcceptanceThreshold]:
     thresholds: list[AcceptanceThreshold] = []
     for text in texts:
         for match in _THRESHOLD_RE.finditer(text):
+            if _context_is_suggestion(text[: match.start()]):
+                continue
             operator = match.group("op").casefold()
             operator = {
                 "at least": ">=",
@@ -1446,6 +1792,8 @@ def _extract_ports(texts: list[str]) -> list[int]:
     seen: set[int] = set()
     for text in texts:
         for match in _PORT_RE.finditer(text):
+            if _context_is_suggestion(text[: match.start()]):
+                continue
             port = int(match.group(1))
             if 0 < port <= 65535 and port not in seen:
                 seen.add(port)
@@ -1565,7 +1913,8 @@ def _looks_like_explicit_artifact_path(path: str) -> bool:
 
 
 def _normalize_command(command: str) -> str:
-    return " ".join(str(command or "").strip().split())
+    # Whitespace inside quoted arguments or inline code is significant.
+    return str(command or "").strip()
 
 
 def _python_interpreter_snippet_command(command: str, *, context: str) -> str:
@@ -1594,16 +1943,64 @@ def _looks_like_command(command: str, *, context: str = "") -> bool:
         return False
     if not parts:
         return False
-    if _COMMAND_INTRO_RE.search(context or ""):
-        return True
+    direct_intro = _has_direct_command_intro(context)
+    # A path or API name in a sentence is data, regardless of an earlier 'run'.
+    if len(parts) == 1:
+        if command.endswith("()"):
+            return False
+        return direct_intro
     head = Path(parts[0]).name.casefold()
     if head in _COMMAND_HEADS:
         return True
-    if "/" in parts[0] and not parts[0].startswith("-"):
-        return True
-    if parts[0].startswith("./") and len(parts) >= 1:
-        return True
-    return False
+    return direct_intro
+
+
+def _has_direct_command_intro(context: str) -> bool:
+    clause = re.split(r"[.!?](?=\s|$)|[;\n]", context or "")[-1]
+    coordinated = re.fullmatch(
+        r"(?P<prefix>.*)`[^`\r\n]+`\s*(?:,\s*(?:and\s+)?|and\s+)\s*",
+        clause,
+        re.I,
+    )
+    if coordinated:
+        # Only a bare quoted list inherits its introduction. Intervening prose
+        # such as 'inspect' or 'write' ends the command relationship.
+        return _has_direct_command_intro(coordinated.group("prefix"))
+    if _context_negates_command(clause):
+        return False
+    if re.search(r"\b(?:old|previous|formerly|historical|document|describe)\b", clause, re.I):
+        return False
+    return bool(
+        re.search(
+            r"\b(?:run|execute|(?:test|verify|validate|check) (?:with|using)|"
+            r"install with|using command|acceptance check|verification command|command)"
+            r"\s*(?:(?:the|this)\s+)?(?:command\s*)?[:=]?\s*$",
+            clause,
+            re.I,
+        )
+    )
+
+
+def _context_negates_command(context: str) -> bool:
+    # Inspect only the immediate introduction, never the quoted command body
+    # or a previous clause's prohibition of a different command.
+    return bool(
+        re.search(
+            r"\b(?:do\s+not|don['’]t|never|without)\s+(?:ever\s+)?"
+            r"(?:run(?:ning)?|execut(?:e|ing)|(?:test|verify|validate|check)(?:ing)?"
+            r"(?:\s+(?:with|using))?)\s*"
+            r"(?:(?:the|this)\s+)?(?:command\s*)?[:=]?\s*$",
+            context,
+            re.I,
+        )
+    )
+
+
+def _context_is_suggestion(context: str) -> bool:
+    clause = re.split(r"[.!?](?=\s|$)|[;\n]", context or "")[-1]
+    return bool(
+        re.search(r"\b(?:could|might|optionally|consider|suggest|for example)\b", clause, re.I)
+    )
 
 
 def _is_test_or_checker_path(path: str) -> bool:
@@ -1757,9 +2154,34 @@ def _observed_command(
     return ""
 
 
+def _evidentiary_capability_verdicts(command: str) -> frozenset[str]:
+    """Reasons that only say what ``command`` can prove, never how it ran.
+
+    These are the verdicts the command analysis gives for this exact command
+    when it is not an assertive check (unknown, non-assertive, or a shape that
+    cannot assert by itself). An assertive command has none, so every refusal
+    of it is about the run. Reasons such as a mutation, another working
+    directory, zero tests, an execution-layer failure, a missing pipeline
+    status or an unmatched command are never capability verdicts.
+    """
+    analysis = analyze_verification_command(command, trusted=True)
+    if (
+        analysis.evidentiary_capability == VerificationCommandEvidentiaryCapability.ASSERTIVE
+        and not analysis.rejection_reason
+    ):
+        return frozenset()
+    return frozenset(
+        {analysis.rejection_reason, analysis.inconclusive_reason, analysis.capability_reason} - {""}
+    )
+
+
 def _command_passed(*, status: str, result: dict[str, Any]) -> bool | None:
     if status == "failed":
         return False
+    if str(result.get("status") or "") == "not_run":
+        # Tri-state: a verify run where nothing executed proves nothing —
+        # neither pass nor fail.
+        return None
     if "all_passed" in result:
         return bool(result.get("all_passed"))
     exit_code = result.get("exit_code")
@@ -1790,24 +2212,38 @@ def _update_command_and_threshold_criteria(
     output: str,
     passed: bool | None,
     origin: EvidenceOrigin,
+    evidence_allowed: bool | None = None,
+    explicit_command_allowed: bool | None = None,
+    host_covered_commands: tuple[str, ...] = (),
 ) -> list[str]:
     matched: list[str] = []
+    if explicit_command_allowed is None:
+        explicit_command_allowed = evidence_allowed
     for criterion in contract.criteria:
         if criterion.kind == AcceptanceCriterionKind.EXPLICIT_COMMAND_IO and any(
-            _commands_equivalent(command, candidate) for candidate in criterion.commands
+            _commands_equivalent(observed, candidate)
+            for observed in (command, *host_covered_commands)
+            for candidate in criterion.commands
         ):
             status = (
-                AcceptanceCriterionStatus.PASSED
+                AcceptanceCriterionStatus.BLOCKED
+                if passed is True and explicit_command_allowed is False
+                else AcceptanceCriterionStatus.PASSED
                 if passed is True
                 else AcceptanceCriterionStatus.FAILED
                 if passed is False
                 else AcceptanceCriterionStatus.UNVERIFIED
             )
             criterion.status = status
+            criterion.failure_summary = ""
             if status == AcceptanceCriterionStatus.FAILED:
                 criterion.failure_summary = f"Explicit command failed: {command}"
+            elif status == AcceptanceCriterionStatus.BLOCKED:
+                criterion.failure_summary = "Verification evidence was supplemental or unsafe"
             matched.append(criterion.criterion_id)
         elif criterion.kind == AcceptanceCriterionKind.THRESHOLD:
+            if passed is True and evidence_allowed is False:
+                continue
             status, summary = _evaluate_thresholds(
                 thresholds=criterion.thresholds,
                 output=output,
@@ -1831,6 +2267,7 @@ def _update_command_and_threshold_criteria(
         elif (
             criterion.kind == AcceptanceCriterionKind.REQUIRED_ARTIFACT_PATH
             and passed is True
+            and evidence_allowed is not False
             and origin
             in {
                 EvidenceOrigin.HOST_AUTHORITATIVE,
@@ -1900,6 +2337,7 @@ def _update_repo_surface_criteria(
     evidence_allowed: bool | None,
     known_verification_commands: list[str] | None,
     origin: EvidenceOrigin,
+    host_covered_commands: tuple[str, ...] = (),
 ) -> list[str]:
     matched: list[str] = []
     if not command:
@@ -1911,7 +2349,11 @@ def _update_repo_surface_criteria(
         }:
             continue
         commands = criterion.commands or tuple(known_verification_commands or ())
-        if not any(_commands_equivalent(command, candidate) for candidate in commands):
+        if not any(
+            _commands_equivalent(observed, candidate)
+            for observed in (command, *host_covered_commands)
+            for candidate in commands
+        ):
             continue
         if origin == EvidenceOrigin.SELF_AUTHORED:
             criterion.status = AcceptanceCriterionStatus.BLOCKED
@@ -2022,6 +2464,29 @@ def _finalize_persistent_service_criterion(
     )
 
 
+def record_consumer_profile_observation(
+    *,
+    contract: AcceptanceContract | None,
+    report: dict[str, Any],
+    generation: int,
+) -> None:
+    """Retain proposed consumer observations without promoting their assertions."""
+    if contract is None:
+        return
+    contract.add_evidence(
+        origin=EvidenceOrigin.SELF_AUTHORED,
+        summary=f"Fresh {report.get('profile', 'consumer')} profile: {report.get('status', 'unknown')}; supplemental requirements review needed",
+        passed=report.get("passed") is True,
+        paths=tuple(sorted(str(path) for path in report.get("artifact_hashes", {}))),
+        category="consumer_profile",
+        task_id=contract.task_id,
+        generation=generation,
+        tool_name="verify_run",
+        result_id=str(report.get("result_id") or ""),
+        evidence_allowed=False,
+    )
+
+
 def _durable_service_satisfies_criterion(
     *,
     criterion: AcceptanceCriterion,
@@ -2033,8 +2498,14 @@ def _durable_service_satisfies_criterion(
         return False
     if payload.get("alive") is not True:
         return False
+    if payload.get("identity_valid") is not True:
+        return False
     readiness = payload.get("readiness") if isinstance(payload.get("readiness"), dict) else {}
     if str(readiness.get("status") or "").casefold() != "ready":
+        return False
+    if readiness.get("endpoint_owned") is not True:
+        return False
+    if readiness.get("strength") != "owned_endpoint":
         return False
     if criterion.ports:
         if str(readiness.get("type") or "").casefold() != "tcp":
@@ -2209,8 +2680,8 @@ def _finalize_content_format_criterion(
 
 
 def _commands_equivalent(left: str, right: str) -> bool:
-    left_norm = _normalize_command(left).casefold()
-    right_norm = _normalize_command(right).casefold()
+    left_norm = _normalize_command(left)
+    right_norm = _normalize_command(right)
     if not left_norm or not right_norm:
         return False
     if left_norm == right_norm:

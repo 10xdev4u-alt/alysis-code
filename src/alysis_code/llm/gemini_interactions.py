@@ -10,6 +10,8 @@ import httpx
 from ..branding import env_get
 from ..error_text import sanitize_error_text_for_output
 from ..provider_telemetry import ProviderCallTelemetryRecorder
+from .cancellable_http import provider_httpx_client
+from .http_cancellation import cancellable_httpx_send, raise_if_cancelled
 from .metadata import (
     GEMINI_INTERACTIONS_PROVIDER_METADATA_KEY,
     ProviderRouteIdentity,
@@ -20,6 +22,7 @@ from .metadata import (
     merge_canonical_headers,
     stamp_response_for_route,
 )
+from .protocols import reasoning_trace_callback
 from .provider_limits import (
     DEFAULT_PROVIDER_CONCURRENCY_CAPS,
     ProviderRetrySettings,
@@ -200,7 +203,9 @@ class GeminiInteractionsClient:
 
         def _send_request() -> InputTokenCount | None:
             try:
-                with httpx.Client(timeout=self.timeout_s, transport=self._transport) as client:
+                with provider_httpx_client(
+                    timeout=self.timeout_s, transport=self._transport
+                ) as client:
                     response = client.post(url, headers=self._headers(), json=payload)
             except httpx.HTTPError as exc:
                 raise LLMError(
@@ -249,8 +254,14 @@ class GeminiInteractionsClient:
         on_reasoning_delta: Callable[[str], None] | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
+        cancellation_token: Any | None = None,
     ) -> LLMResponse:
         del on_text_delta
+        on_reasoning_delta = reasoning_trace_callback(
+            on_reasoning_delta,
+            capability=getattr(self, "reasoning_trace_capability", None),
+            stream=stream,
+        )
         messages = gate_messages_for_provider_route(messages, self.route_identity)
         if stream:
             raise LLMError("Gemini Interactions prototype does not support streaming yet")
@@ -355,10 +366,15 @@ class GeminiInteractionsClient:
             nonlocal request_plan_metadata
             thinking_summaries_fallback_used = False
             try:
-                with httpx.Client(timeout=self.timeout_s, transport=self._transport) as client:
+                with provider_httpx_client(
+                    timeout=self.timeout_s, transport=self._transport
+                ) as client:
                     while True:
-                        response = client.post(
-                            f"{self.base_url}/interactions",
+                        response = cancellable_httpx_send(
+                            client=client,
+                            cancellation_token=cancellation_token,
+                            method="POST",
+                            url=f"{self.base_url}/interactions",
                             headers=self._headers(),
                             json=payload,
                         )
@@ -388,6 +404,7 @@ class GeminiInteractionsClient:
                             continue
                         raise self._llm_error_from_response(response)
             except Exception as exc:  # noqa: BLE001
+                raise_if_cancelled(cancellation_token)
                 if isinstance(exc, LLMError):
                     raise
                 raise LLMError(
@@ -416,6 +433,7 @@ class GeminiInteractionsClient:
                         None,
                     ),
                     retry_deadline_allows=getattr(self, "_provider_retry_deadline_allows", None),
+                    cancellation_token=cancellation_token,
                 )
             ),
             self.route_identity,

@@ -118,8 +118,6 @@ def _run_chat_command(session: object, command: str) -> tuple[object, str]:
         pending_images=[],
         console=console,
         forge_state=cli_mod._ForgeChatState(),
-        plan_mode_state=cli_mod._ChatPlanModeState(),
-        plan_mode_escape_supported=False,
     )
     return result, buffer.getvalue()
 
@@ -710,12 +708,11 @@ def test_natural_language_navigation_logs_active_workdir_changes(
         session.close()
 
 
-def test_session_provisions_reasoning_off_skill_selector_and_keeps_coding_reasoning(
+def test_session_keeps_coding_reasoning_without_a_skill_selector(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Skill selection gets an independent reasoning-off client while the coding
-    # client keeps the configured deep-reasoning settings.
+    # Automatic skill choice uses the coding client's configured reasoning.
     repo = tmp_path / "repo"
     repo.mkdir(parents=True, exist_ok=True)
     _fake_git_repo(repo)
@@ -741,16 +738,10 @@ def test_session_provisions_reasoning_off_skill_selector_and_keeps_coding_reason
         workspace_binding=workspace_binding,
     )
     try:
-        # Coding client honors the configured reasoning settings...
         assert session.client.enable_thinking is True
         assert session.client.reasoning_effort == "high"
-        # ...while automatic skill selection remains deterministic at the
-        # sampling layer without inheriting those reasoning settings.
-        assert session.router_client is not None
-        assert session.router_client.temperature == 0.0
-        assert session.router_client.enable_thinking is False
-        assert session.router_client.reasoning_effort == ""
-        assert session._semantic_router_bound_client is session.client
-        assert session._provisioned_router_client is session.router_client
+        assert session.router_client is None
+        assert session.skills_auto_invoke is True
+        assert "skill_read" in session.tools
     finally:
         session.close()

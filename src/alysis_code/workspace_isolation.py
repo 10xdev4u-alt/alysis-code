@@ -7,6 +7,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+from .command_text import command_text
 from .git_ops import (
     GitOpsError,
     clean_untracked,
@@ -14,7 +15,7 @@ from .git_ops import (
     reset_hard,
     status_porcelain,
 )
-from .git_safe import build_git_cmd
+from .git_safe import build_git_cmd, build_git_process_env
 
 
 def _run_git_checked(
@@ -23,16 +24,18 @@ def _run_git_checked(
     *,
     error_message: str,
     extra_config: dict[str, str] | None = None,
+    disable_filters: bool = False,
 ) -> subprocess.CompletedProcess[str]:
-    cmd = build_git_cmd(root, args, extra_config=extra_config)
     try:
+        cmd = build_git_cmd(root, args, extra_config=extra_config, disable_filters=disable_filters)
         cp = subprocess.run(
             cmd,
+            env=build_git_process_env() if disable_filters else None,
             check=False,
             capture_output=True,
-            text=True,
+            **command_text(),
         )
-    except OSError as e:
+    except (OSError, subprocess.TimeoutExpired) as e:
         raise GitOpsError("failed to run git") from e
     if cp.returncode != 0:
         detail = (cp.stderr or cp.stdout).strip()
@@ -50,7 +53,7 @@ def _inspect_existing_git_workspace(
             build_git_cmd(worktree_path, ["rev-parse", "--is-inside-work-tree"]),
             check=False,
             capture_output=True,
-            text=True,
+            **command_text(),
         )
     except OSError as e:
         raise GitOpsError("failed to run git") from e
@@ -62,7 +65,7 @@ def _inspect_existing_git_workspace(
             build_git_cmd(worktree_path, ["rev-parse", "--abbrev-ref", "HEAD"]),
             check=False,
             capture_output=True,
-            text=True,
+            **command_text(),
         )
     except OSError as e:
         raise GitOpsError("failed to run git") from e

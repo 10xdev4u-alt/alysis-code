@@ -12,6 +12,7 @@ from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
+from ..command_text import command_text
 from ..config import AgentRuntimeSettings
 from .base import (
     AuthMethod,
@@ -111,7 +112,7 @@ class CodexCliRuntimeAdapter:
                 [executable, "--version"],
                 check=False,
                 capture_output=True,
-                text=True,
+                **command_text(),
                 timeout=_VERSION_TIMEOUT_SECONDS,
                 env=_runtime_environment(),
             )
@@ -145,7 +146,7 @@ class CodexCliRuntimeAdapter:
                 [probe.executable, "login", "status"],
                 check=False,
                 capture_output=True,
-                text=True,
+                **command_text(),
                 timeout=_STATUS_TIMEOUT_SECONDS,
                 env=_runtime_environment(),
             )
@@ -245,6 +246,10 @@ class CodexCliRuntimeAdapter:
         if not settings.provider_managed_auth:
             raise ValueError("The Codex account runtime requires provider-managed authentication.")
         sandbox = _codex_sandbox(request.mode)
+        # Reject malformed resume ids before probing an optional executable.
+        # An unavailable CLI must not turn an invalid request into a benign
+        # missing-executable result.
+        _validated_session_id(request.session_id)
         cwd = Path(request.cwd).expanduser().resolve()
         if not cwd.is_dir():
             return RuntimeTurnResult(
@@ -253,9 +258,6 @@ class CodexCliRuntimeAdapter:
                 exit_code=_INVALID_REQUEST_EXIT_CODE,
                 error=f"Delegated runtime cwd is not a directory: {cwd}",
             )
-        # Validate resume identifiers before probing the host executable. Invalid
-        # option-shaped input is a request error even on hosts without Codex.
-        _validated_session_id(request.session_id)
         executable = _resolve_executable(settings.executable)
         if executable is None:
             return RuntimeTurnResult(
@@ -404,9 +406,7 @@ def _run_process(
         "stdin": subprocess.PIPE,
         "stdout": subprocess.PIPE,
         "stderr": subprocess.PIPE,
-        "text": True,
-        "encoding": "utf-8",
-        "errors": "replace",
+        **command_text(),
     }
     if os.name == "nt":
         popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)

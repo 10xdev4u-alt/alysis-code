@@ -1,10 +1,18 @@
 from __future__ import annotations
 
+import inspect
+import os
+from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from .config import ConfigError, resolve_run_deadline
 from .execution_deadline import ExecutionDeadline
+from .managed_host_deadline import (
+    MANAGED_HOST_DEADLINE_UNIX_ENV,
+    ManagedHostDeadlineError,
+    clamp_to_managed_host_deadline,
+)
 
 if TYPE_CHECKING:
     from .config import AppConfig
@@ -39,11 +47,6 @@ from .agent.prompt_context import (  # noqa: F401
     _SYSTEM_PROMPT_SKILL_LIFECYCLE_SECTION,
     _SYSTEM_PROMPT_SUBAGENT_SECTION,
     _SYSTEM_PROMPT_WRITE_SECTION,
-    _TASK_BRIEF_EMPTY_STATUS,
-    _TASK_BRIEF_MARKER,
-    _TASK_BRIEF_MAX_CURRENT_LINES,
-    _TASK_BRIEF_MAX_LINE_CHARS,
-    _TASK_BRIEF_MAX_PRIOR_LINES,
     ALWAYS_PROTECTED_WRITE_PREFIXES,
     CONVENTIONS_FILENAME,
     MAX_CONVENTIONS_CHARS,
@@ -54,13 +57,11 @@ from .agent.prompt_context import (  # noqa: F401
     SYSTEM_PROMPT,
     PreparedSessionPromptContext,
     _build_plugin_activation_index,
-    _build_repo_task_brief_message,
     _build_user_message,
     _build_workspace_grounding_descriptor,
     _clean_workspace_hint,
     _component_plugin_allowed,
     _compose_session_system_prompt,
-    _empty_task_brief_message,
     _environment_context_message,
     _extract_repo_relative_paths_from_text,
     _extract_workspace_relation_paths_from_text,
@@ -72,8 +73,6 @@ from .agent.prompt_context import (  # noqa: F401
     _normalize_rel_match_path,
     _normalize_repo_relative_hint_path,
     _normalize_scope_list,
-    _normalize_task_brief_key,
-    _normalize_task_brief_line,
     _normalize_workspace_relpath,
     _normalized_authoritative_verify_commands,
     _normalized_verify_commands,
@@ -81,7 +80,6 @@ from .agent.prompt_context import (  # noqa: F401
     _PluginActivationIndex,
     _read_workspace_hint_text,
     _recent_visible_non_repo_history,
-    _render_task_brief_message,
     _repo_conventions_context,
     _repo_summary_data,
     _RepoSummaryData,
@@ -91,9 +89,7 @@ from .agent.prompt_context import (  # noqa: F401
     _resolve_session_pinned_prefix_len,
     _session_focus_dir_path,
     _session_focus_relpath,
-    _session_has_active_workspace_task,
     _session_repo_scan,
-    _session_task_brief_content,
     _session_verify_command_selection,
     _session_workspace_binding_context_message,
     _session_workspace_grounding,
@@ -101,8 +97,6 @@ from .agent.prompt_context import (  # noqa: F401
     _should_prepare_repo_scan,
     _skill_plugin_id,
     _subagent_context_message,
-    _task_brief_content_is_placeholder,
-    _task_brief_lines_from_text,
     _truncate_non_repo_history_content,
     _untrusted_prompt_prelude_message,
     _workspace_binding_context_message,
@@ -112,12 +106,10 @@ from .agent.prompt_context import (  # noqa: F401
     _workspace_hint_from_top_level_metadata,
     _workspace_kind_is_plain_dir,
     _workspace_kind_is_repo_backed,
-    _workspace_kind_supports_task_brief,
     _workspace_relpath_for_path,
     _WorkspaceGroundingDescriptor,
     prepare_session_prompt_context,
     refresh_session_environment_context_message,
-    refresh_session_task_brief_message,
     refresh_session_workspace_binding_context_message,
     resolve_session_active_workdir_path,
     resolve_session_active_workdir_relpath,
@@ -241,7 +233,7 @@ from .budget_policy import (  # noqa: F401
     resolve_budget_grace_seconds,
     resolve_run_budget_seconds,
 )
-from .cancellation import CooperativeCancellationError
+from .cancellation import CombinedCancellationToken, CooperativeCancellationError
 
 # execution deadline re-exports
 from .execution_deadline import (  # noqa: F401
@@ -288,7 +280,7 @@ from .agent.turn import (  # noqa: F401
     _PHASE_BUDGET_VERIFICATION_SYSTEM_PROMPT_TEMPLATE,
     _SUBAGENT_REQUIRED_NUDGE_TEMPLATE,
     _SAME_BATCH_FS_READ_DEFAULT_MAX_BYTES,
-    _SAME_BATCH_FS_READ_LINES_DEFAULT_MAX_LINES,
+    _SAME_BATCH_READ_WINDOW_DEFAULT_MAX_LINES,
     _SAME_BATCH_READ_CACHE_SAFE_TOOL_NAMES,
     _UNEXECUTED_TOOL_CALL_MARKUP_MARKERS,
     MAX_EDIT_NUDGES_PER_TURN,
@@ -303,10 +295,10 @@ from .agent.turn import (  # noqa: F401
     MAX_RECENT_EXPLORATION_PATHS,
     MAX_SUBAGENT_REQUIRED_NUDGES_PER_TURN,
     _append_recent_exploration_path,
-    _build_fs_read_lines_result_from_cached_range,
-    _build_fs_read_lines_result_from_full_fs_read,
+    _build_read_window_result_from_cached_range,
+    _build_read_window_result_from_full_read,
     _build_post_explore_bootstrap_nudge,
-    _coerce_fs_read_lines_request,
+    _coerce_read_window_request,
     _coerce_fs_read_request,
     _edit_similarity_key,
     _emit_surface_error,
@@ -324,7 +316,7 @@ from .agent.turn import (  # noqa: F401
     _remember_same_batch_read_result,
     _same_batch_read_cache_should_invalidate,
     _same_batch_read_path_key,
-    _SameBatchFsReadLinesRecord,
+    _SameBatchReadWindowRecord,
     _SameBatchFsReadRecord,
     _SameBatchReadReuseCache,
     _SubagentTurnPolicy,
@@ -426,7 +418,7 @@ from .tools.availability import (  # noqa: F401
 )
 
 # tools.fs re-exports
-from .tools.fs import fs_list, fs_read, fs_read_lines  # noqa: F401
+from .tools.fs import fs_list, fs_read  # noqa: F401
 
 # tools.search re-exports
 from .tools.search import search_rg  # noqa: F401
@@ -441,6 +433,27 @@ from .tools.symbols import symbol_search  # noqa: F401
 from .tools.web import web_fetch  # noqa: F401
 
 # isort: on
+
+
+def _run_turn_accepts_keyword(run_turn: Callable[..., Any], keyword: str) -> bool:
+    """Whether a session's ``run_turn`` takes ``keyword`` (legacy embedders may not)."""
+
+    try:
+        signature = inspect.signature(run_turn)
+    except (TypeError, ValueError):
+        # Opaque callables (C wrappers, mocks without signatures) get the
+        # capable path, matching the runtime session they normally wrap.
+        return True
+    for parameter in signature.parameters.values():
+        if parameter.kind is inspect.Parameter.VAR_KEYWORD:
+            return True
+        if (
+            parameter.kind
+            in {inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY}
+            and parameter.name == keyword
+        ):
+            return True
+    return False
 
 
 def _emit_required_run_deadline_missing(
@@ -477,6 +490,7 @@ def run_agent(
     cfg: AppConfig,
     root: Path,
     instruction: str,
+    acceptance_instruction: str | None = None,
     image_paths: list[str] | None = None,
     mode: str,
     yes: bool,
@@ -495,6 +509,8 @@ def run_agent(
     chat_turn_fixed_override: int | None = None,
     session_log_dir_override: Path | None = None,
     session_id_override: str | None = None,
+    seed_messages: list[dict[str, Any]] | None = None,
+    managed_session_persistence: Any | None = None,
     surface: Surface | None = None,
     usage_role: str = "main",
     trusted_system_prompt_override: str | None = None,
@@ -591,6 +607,17 @@ def run_agent(
             "or configure run_deadline_seconds."
         )
 
+    managed_host_anchor_record: dict[str, Any] | None = None
+    if require_run_deadline and execution_deadline is not None:
+        host_anchor = os.environ.get(MANAGED_HOST_DEADLINE_UNIX_ENV)
+        if host_anchor is not None:
+            try:
+                managed_host_anchor_record = clamp_to_managed_host_deadline(
+                    execution_deadline, host_anchor
+                )
+            except ManagedHostDeadlineError as exc:
+                raise ConfigError(str(exc)) from exc
+
     session = create_session(
         cfg=cfg,
         root=root,
@@ -610,6 +637,7 @@ def run_agent(
         chat_turn_fixed_override=chat_turn_fixed_override,
         session_log_dir_override=session_log_dir_override,
         session_id_override=session_id_override,
+        managed_session_persistence=managed_session_persistence,
         surface=surface,
         usage_role=usage_role,
         trusted_system_prompt_override=trusted_system_prompt_override,
@@ -633,22 +661,31 @@ def run_agent(
         session_source_metadata=session_source_metadata,
         tool_dispatch_guard=tool_dispatch_guard,
     )
+    if managed_host_anchor_record is not None:
+        session.store.append("managed_host_deadline_anchor", managed_host_anchor_record)
+        if session.crash_diagnostics is not None:
+            session.crash_diagnostics.event(
+                "managed_host_deadline_anchor", managed_host_anchor_record, durable=True
+            )
+    if acceptance_instruction is not None:
+        session.acceptance_instruction = acceptance_instruction
     # Arm the run-budget stop gate. Every deadline check inside the engine is a
     # *start* gate evaluated between operations; nothing re-reads the clock
     # while an operation is in flight, so a blocking call that does not bound
     # itself by the deadline can outlive the budget indefinitely -- which is
     # how runs that had already recorded exhausted:true kept going for hours.
-    # This daemon timer trips a cancellation event at deadline + grace, which
+    # This daemon timer trips a cancellation event at the hard deadline, which
     # unblocks the cooperative checkpoints (step loop, mid-stream LLM read,
-    # subagent joins) no matter where the run is parked. Skipped when a caller
-    # already supplied a token, because that surface owns its own cancellation.
+    # subagent joins) no matter where the run is parked. Caller cancellation is
+    # composed with the deadline: supplying a UI token must not disable it.
     watchdog: BudgetWatchdog | None = None
-    if cancellation_token is None and execution_deadline is not None and execution_deadline.enabled:
+    if execution_deadline is not None and execution_deadline.enabled:
 
         def _record_budget_watchdog_fired() -> None:
             payload = {
                 "reason": STOP_REASON_RUN_BUDGET_EXHAUSTED,
-                "grace_seconds": resolve_budget_grace_seconds(),
+                "grace_seconds": 0.0,
+                "requested_grace_seconds": resolve_budget_grace_seconds(),
                 "deadline": execution_deadline.telemetry_snapshot(),
             }
             session.store.append("run_budget_watchdog_fired", payload)
@@ -661,20 +698,27 @@ def run_agent(
 
         watchdog = BudgetWatchdog(
             # Remaining, not configured: session construction happens after the
-            # clock starts, so this fires at the real deadline plus the grace.
+            # clock starts. Grace must not extend the effective host deadline.
             budget_seconds=float(execution_deadline.remaining_seconds() or 0.0),
-            grace_seconds=resolve_budget_grace_seconds(),
+            grace_seconds=0.0,
             on_fire=_record_budget_watchdog_fired,
         )
-        cancellation_token = BudgetCancellationToken(
+        budget_token = BudgetCancellationToken(
             watchdog.event,
             # The engine's existing handlers catch CooperativeCancellationError;
             # the token attributes the stop to the budget via its reason, which
             # is what makes it finalize as a clean exit instead of an abort.
             error_class=CooperativeCancellationError,
         )
+        cancellation_token = (
+            budget_token
+            if cancellation_token is None
+            else CombinedCancellationToken(cancellation_token, budget_token)
+        )
         watchdog.arm()
     try:
+        if seed_messages:
+            session.messages.extend(seed_messages)
         turn_kwargs: dict[str, Any] = {
             "image_paths": image_paths,
             "cancellation_token": cancellation_token,

@@ -35,9 +35,9 @@ def test_tui_enabled_by_default(monkeypatch):
     assert is_tui_enabled() is True
 
 
-def test_legacy_tui_flag_still_disables_tui(monkeypatch):
+def test_canonical_tui_flag_disables_tui(monkeypatch):
     monkeypatch.delenv("ALYSIS_TUI", raising=False)
-    monkeypatch.setenv("SYLLIPTOR_TUI", "0")
+    monkeypatch.setenv("ALYSIS_TUI", "0")
     assert is_tui_enabled() is False
 
 
@@ -58,9 +58,9 @@ def test_static_text_matches_target():
     # The heading is the Alysis Code wordmark (the prompt question lives in the box).
     assert HEADING_TEXT == "Alysis Code"
     assert CREDIT_TEXT == "crafted by AlysisAI"
-    # Hint leads with Alysis Code's signature command; @ file-mentions aren't wired.
+    # Signature command and workspace path-reference discovery remain visible.
     assert "/forge" in HINT_TEXT
-    assert "@" not in HINT_TEXT
+    assert "@ for file paths" in HINT_TEXT
 
 
 def test_input_placeholder_is_alysis_greeting():
@@ -83,6 +83,7 @@ def test_disconnected_landing_uses_one_neutral_model_access_instruction():
         # DeepSeek hyphenates the whole name ("DeepSeek-V4-Flash"); dated beta
         # ids drop their expiry suffix.
         ("deepseek-chat", "DeepSeek-Chat"),
+        ("deepseek-flash", "DeepSeek-V4.1-Flash"),
         ("deepseek-v4-pro", "DeepSeek-V4-Pro"),
         ("deepseek-v4-flash-vision-exp", "DeepSeek-V4-Flash-Vision-Exp"),
         ("deepseek-v4.1-flash-expires-on-0910", "DeepSeek-V4.1-Flash"),
@@ -120,7 +121,7 @@ def test_footer_core_fields():
     assert "0 processed" in text and "$0.0000" in text
     assert "perdikis" in text
     assert "shift+tab" not in text
-    # Distinct from Cline: no "(0)", no "▶▶", no Plan/Act toggle.
+    # Omit "(0)", "▶▶", and the Plan/Act toggle from the footer.
     assert "(0)" not in text
     assert "▶▶" not in text
     assert "Plan" not in text and "Act" not in text and "(Tab)" not in text
@@ -150,6 +151,18 @@ def test_footer_mode_badge_is_the_approval_indicator():
     )
     assert "fast" in text
     assert "sensitive:" not in text
+
+
+def test_footer_distinguishes_active_and_next_message_permissions():
+    state = TuiState(
+        model_name="deepseek-chat",
+        exec_mode="review",
+        pending_exec_mode="auto",
+    )
+
+    text = _plain(footer_fragments(state, width=100))
+
+    assert "safe→fast next" in text
 
 
 def test_footer_shows_workspace_and_branch():
@@ -188,7 +201,7 @@ def test_footer_context_never_rounds_up_to_full_or_down_to_empty():
     assert "context: 1% left" in near_empty
 
 
-def test_footer_context_metric_uses_effective_provider_capacity():
+def test_footer_context_metric_uses_conversation_budget():
     from alysis_code.cli_impl.commands.startup import (
         _chat_context_percent_value,
     )
@@ -200,6 +213,14 @@ def test_footer_context_metric_uses_effective_provider_capacity():
             effective_percent_left=99.2,
         )
     )
+    assert _chat_context_percent_value(measured) == 100.0
+
+    # Exhausted conversation space must stay at zero, not fall back to the
+    # remaining capacity that includes the reserved startup baseline.
+    measured._hud_context_cache.dynamic_context_percent_left = 0.0
+    assert _chat_context_percent_value(measured) == 0.0
+
+    measured._hud_context_cache.dynamic_context_percent_left = None
     assert _chat_context_percent_value(measured) == 99.2
 
     window_fallback = SimpleNamespace(
@@ -383,6 +404,80 @@ def test_app_records_submission_then_exits():
     assert result == "/exit"
 
 
+def test_app_runs_next_message_boundary_before_session_turn():
+    state = TuiState(model_name="deepseek-chat", username="t", exec_mode="review")
+    observed: list[tuple[str, str, str | None]] = []
+
+    class Session:
+        mode = "review"
+        pending_permissions_mode = "auto"
+
+        def run_turn(self, text: str, *, cancellation_token=None) -> int:
+            _ = cancellation_token
+            observed.append((text, self.mode, self.pending_permissions_mode))
+            return 0
+
+    session = Session()
+
+    def before_turn(live_session, _run_kwargs):
+        live_session.mode = str(live_session.pending_permissions_mode)
+        live_session.pending_permissions_mode = None
+
+    result, _transcript = _run_headless(
+        state,
+        "hello\r/exit\r",
+        session_builder=lambda _surface: session,
+        before_turn=before_turn,
+        background_turns=False,
+    )
+
+    assert result == "/exit"
+    assert observed == [("hello", "auto", None)]
+
+
+def test_app_restores_temporary_turn_permissions_after_failure():
+    state = TuiState(model_name="deepseek-chat", username="t", exec_mode="review")
+    observed: list[tuple[str, str]] = []
+    cleanup_calls: list[str] = []
+
+    class Session:
+        mode = "review"
+
+        def run_turn(self, text: str, *, cancellation_token=None) -> int:
+            _ = cancellation_token
+            observed.append((text, self.mode))
+            raise RuntimeError("turn failed")
+
+    session = Session()
+
+    def before_turn(live_session, _run_kwargs):
+        # Pending Permissions have already selected the new base by this point;
+        # the one-turn scope narrows only the turn itself.
+        live_session.mode = "fullaccess"
+        restore_mode = live_session.mode
+        live_session.mode = "readonly"
+
+        def cleanup() -> None:
+            cleanup_calls.append(restore_mode)
+            live_session.mode = restore_mode
+
+        return cleanup
+
+    result, transcript = _run_headless(
+        state,
+        "inspect safely\r/exit\r",
+        session_builder=lambda _surface: session,
+        before_turn=before_turn,
+        background_turns=False,
+    )
+
+    assert result == "/exit"
+    assert observed == [("inspect safely", "readonly")]
+    assert cleanup_calls == ["fullaccess"]
+    assert session.mode == "fullaccess"
+    assert any("turn failed" in text for role, text in transcript if role == "error")
+
+
 def test_app_without_session_surfaces_model_blocker():
     from prompt_toolkit.input import create_pipe_input
     from prompt_toolkit.output import DummyOutput
@@ -462,12 +557,13 @@ def test_app_shift_tab_invokes_mode_cycle_then_exits():
 
     def _cycle() -> list[tuple[str, str]] | None:
         calls.append(1)
-        state.exec_mode = "auto"
-        return [("system", "Mode → fast (auto)")]
+        state.pending_exec_mode = "auto"
+        return [("system", "Permissions for the next message: fast (auto)")]
 
     _run_headless(state, "\x1b[Z/exit\r", mode_cycle=_cycle)
     assert calls == [1]
-    assert state.exec_mode == "auto"
+    assert state.exec_mode == "review"
+    assert state.pending_exec_mode == "auto"
 
 
 def test_app_shift_tab_is_inert_without_a_mode_cycle_callback():

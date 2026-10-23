@@ -74,8 +74,10 @@ except ModuleNotFoundError as exc:
 
 from alysis_code.managed_host_deadline import (  # noqa: E402
     DEFAULT_MANAGED_HOST_SHUTDOWN_RESERVE_SECONDS,
+    MANAGED_HOST_DEADLINE_UNIX_ENV,
     ManagedHostDeadline,
     ManagedHostDeadlineError,
+    managed_host_deadline_anchor_unix_seconds,
     resolve_managed_host_deadline,
 )
 from alysis_code.verification_contract import (  # noqa: E402
@@ -184,6 +186,11 @@ class AlysisSimpleAgent(AbstractInstalledAgent):
             "ALYSIS_TBENCH_WEB_SEARCH_MODE": str(self._web_search_mode),
             "ALYSIS_VERIFY_SANDBOX_MODE": "off",
         }
+        # --strict-provenance refuses a run whose thinking setting is not
+        # explicit; the host's setting is forwarded unchanged.
+        thinking = self._clean(os.environ.get("ALYSIS_LLM_ENABLE_THINKING"))
+        if thinking:
+            env["ALYSIS_LLM_ENABLE_THINKING"] = thinking
         if len(self._verify_cmds) == 1:
             env[VERIFY_CMD_ENV] = self._verify_cmds[0]
         return env
@@ -238,7 +245,11 @@ class AlysisSimpleAgent(AbstractInstalledAgent):
             "fullaccess",
             "--yes",
             "--no-log",
-            "--no-stream",
+            # Streaming chosen on the command line, which --strict-provenance
+            # requires: the token-plan endpoint closes a non-streaming request
+            # at 900 s, and a stream survives long thinking.
+            "--stream",
+            "--strict-provenance",
             "--no-subagents",
             "--max-steps",
             self._max_steps,
@@ -262,9 +273,17 @@ class AlysisSimpleAgent(AbstractInstalledAgent):
                 instruction,
             ]
         )
+        anchor = managed_host_deadline_anchor_unix_seconds(
+            deadline.alysis_invocation_deadline_seconds,
+            existing_anchor=os.environ.get(MANAGED_HOST_DEADLINE_UNIX_ENV),
+            now_unix_seconds=time.time(),
+        )
+        # A command-local assignment crosses the terminal transport without
+        # exporting a launch deadline into later commands or saved settings.
+        launch_env = f"{MANAGED_HOST_DEADLINE_UNIX_ENV}={anchor:.6f} "
         return [
             TerminalCommand(
-                command=" ".join(shlex.quote(part) for part in command_parts),
+                command=launch_env + " ".join(shlex.quote(part) for part in command_parts),
                 min_timeout_sec=0.0,
                 max_timeout_sec=(
                     deadline.host_remaining_timeout_seconds

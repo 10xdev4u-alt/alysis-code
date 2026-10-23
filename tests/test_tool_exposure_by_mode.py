@@ -10,11 +10,16 @@ import pytest
 from rich.console import Console
 
 import alysis_code.agent_loop as agent_loop_mod
+from alysis_code.agent.errors import AgentRuntimeError
 from alysis_code.agent_loop import _tool_event_metadata, build_tools
 from alysis_code.config import AppConfig
 from alysis_code.custom_tools.discovery import discover_custom_tools
 from alysis_code.custom_tools.trust import trust_project_tool
-from alysis_code.mcp.manager import McpHostToolBinding, McpToolBinding
+from alysis_code.mcp.manager import (
+    McpHostToolBinding,
+    McpToolBinding,
+    mcp_tool_approval_hints,
+)
 from alysis_code.runtime_kind import RuntimeKind
 from alysis_code.session_store import SessionStore
 from alysis_code.surface import ApprovalDecision, ApprovalRequest, NoopSurface
@@ -68,7 +73,12 @@ class _RecordingSurface(NoopSurface):
         return ApprovalDecision(allow=self.allow)
 
 
-def _make_mcp_binding(*, session_mode: str | None = None) -> tuple[McpToolBinding, _FakeMcpClient]:
+def _make_mcp_binding(
+    *,
+    session_mode: str | None = None,
+    read_only_hint: bool = False,
+    destructive_hint: bool = False,
+) -> tuple[McpToolBinding, _FakeMcpClient]:
     client = _FakeMcpClient()
     binding = McpToolBinding(
         server_id="alpha",
@@ -78,6 +88,8 @@ def _make_mcp_binding(*, session_mode: str | None = None) -> tuple[McpToolBindin
         parameters={"type": "object", "properties": {}, "required": []},
         client=client,
         session_mode=session_mode,
+        read_only_hint=read_only_hint,
+        destructive_hint=destructive_hint,
     )
     return binding, client
 
@@ -156,14 +168,19 @@ def _build_tools(
     surface: object | None = None,
     cfg: AppConfig | None = None,
     yes: bool = True,
+    subagent_depth: int = 0,
+    store: object | None = None,
     skills_enabled: bool = True,
+    subagent_coordinator: object | None = None,
+    subagent_coordinator_sink: object | None = None,
+    child_scheduler_sink: object | None = None,
 ) -> dict[str, object]:
     _fake_git_repo(tmp_path)
     return build_tools(
         root=tmp_path,
         console=Console(file=io.StringIO()),
         surface=surface,
-        store=_store(tmp_path, enabled=True),
+        store=store or _store(tmp_path, enabled=True),  # type: ignore[arg-type]
         mode=mode,
         yes=yes,
         cfg=cfg
@@ -179,9 +196,13 @@ def _build_tools(
         verification_enabled=True,
         skills_enabled=skills_enabled,
         subagents_enabled=True,
+        subagent_depth=subagent_depth,
         subagent_registry={},
         runtime_kind=runtime_kind,
         mcp_manager=mcp_manager,  # type: ignore[arg-type]
+        subagent_coordinator=subagent_coordinator,  # type: ignore[arg-type]
+        subagent_coordinator_sink=subagent_coordinator_sink,  # type: ignore[arg-type]
+        child_scheduler_sink=child_scheduler_sink,  # type: ignore[arg-type]
     )
 
 
@@ -203,10 +224,232 @@ def test_build_tools_readonly_excludes_mutating_and_higher_risk_tools(tmp_path: 
         "shell_run",
         "verify_run",
         "git_apply_patch",
-        "subagent_run",
         "mcp__alpha__echo",
     ):
         assert name not in tools
+
+    for name in (
+        "subagent_run",
+        "subagent_spawn",
+        "subagent_send",
+        "subagent_resume",
+        "subagent_status",
+        "subagent_wait",
+        "subagent_cancel",
+    ):
+        assert name in tools
+    assert "subagent_apply" not in tools
+    assert "subagent_discard" not in tools
+
+
+def test_build_tools_nested_readonly_does_not_expose_delegation(
+    tmp_path: Path,
+) -> None:
+    tools = _build_tools(tmp_path, mode="readonly", subagent_depth=1)
+
+    assert not {name for name in tools if name.startswith("subagent_")}
+
+
+def test_live_tool_rebuild_reuses_session_subagent_coordinator(
+    tmp_path: Path,
+) -> None:
+    session_store = _store(tmp_path, enabled=True)
+    coordinators: list[object] = []
+    schedulers: list[object] = []
+    first = _build_tools(
+        tmp_path,
+        mode="review",
+        store=session_store,
+        subagent_coordinator_sink=coordinators.append,
+        child_scheduler_sink=schedulers.append,
+    )
+    coordinator = coordinators[0]
+    scheduler = schedulers[0]
+    first_status = first["subagent_status"]
+    first_spawn = first["subagent_spawn"]
+
+    second = _build_tools(
+        tmp_path,
+        mode="readonly",
+        store=session_store,
+        skills_enabled=False,
+        subagent_coordinator=coordinator,
+        subagent_coordinator_sink=coordinators.append,
+        child_scheduler_sink=schedulers.append,
+    )
+    try:
+        assert coordinators == [coordinator, coordinator]
+        assert schedulers == [scheduler, scheduler]
+        assert coordinator.registry is scheduler.registry  # type: ignore[attr-defined]
+        assert scheduler._closed is False  # type: ignore[attr-defined]  # noqa: SLF001
+        assert first_status.run({}) == second["subagent_status"].run({})
+        stale_spawn_result = first_spawn.run(
+            {"name": "missing-role", "task": "Exercise the captured tool closure."}
+        )
+        assert stale_spawn_result["error_code"] == "unknown_subagent"
+        assert "closed" not in str(stale_spawn_result["error"]).casefold()
+        assert coordinator.launcher.skills_enabled is False  # type: ignore[attr-defined]
+    finally:
+        coordinator.shutdown(cancel_pending=True)  # type: ignore[attr-defined]
+
+
+def test_failed_tool_rebuild_does_not_rebind_session_subagent_coordinator(
+    tmp_path: Path,
+) -> None:
+    class _FailingBinding:
+        def bind_session_mode(self, _mode: str) -> object:
+            raise RuntimeError("late MCP binding failure")
+
+    session_store = _store(tmp_path, enabled=True)
+    coordinators: list[object] = []
+    first = _build_tools(
+        tmp_path,
+        mode="review",
+        store=session_store,
+        subagent_coordinator_sink=coordinators.append,
+    )
+    coordinator = coordinators[0]
+    original_launcher = coordinator.launcher  # type: ignore[attr-defined]
+    old_spawn = first["subagent_spawn"]
+    failed_publish: list[object] = []
+    try:
+        with pytest.raises(RuntimeError, match="late MCP binding failure"):
+            _build_tools(
+                tmp_path,
+                mode="auto",
+                store=session_store,
+                mcp_manager=_DummyMcpManager(_FailingBinding()),  # type: ignore[arg-type]
+                subagent_coordinator=coordinator,
+                subagent_coordinator_sink=failed_publish.append,
+            )
+
+        assert failed_publish == []
+        assert coordinator.launcher is original_launcher  # type: ignore[attr-defined]
+        stale_result = old_spawn.run(
+            {"name": "missing-role", "task": "Use the last committed launcher."}
+        )
+        assert stale_result["error_code"] == "unknown_subagent"
+        assert "closed" not in str(stale_result["error"]).casefold()
+    finally:
+        coordinator.shutdown(cancel_pending=True)  # type: ignore[attr-defined]
+
+
+def test_failed_schema_conversion_does_not_rebind_session_subagent_coordinator(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_store = _store(tmp_path, enabled=True)
+    coordinators: list[object] = []
+    first = _build_tools(
+        tmp_path,
+        mode="review",
+        store=session_store,
+        subagent_coordinator_sink=coordinators.append,
+    )
+    coordinator = coordinators[0]
+    original_launcher = coordinator.launcher  # type: ignore[attr-defined]
+    tool_type = type(first["subagent_spawn"])
+    original_conversion = tool_type.as_openai_tool
+
+    def _fail_late_schema_conversion(tool: object) -> dict[str, object]:
+        if getattr(tool, "name", "") == "subagent_wait":
+            raise RuntimeError("late schema conversion failure")
+        return original_conversion(tool)
+
+    monkeypatch.setattr(tool_type, "as_openai_tool", _fail_late_schema_conversion)
+    failed_publish: list[object] = []
+    try:
+        with pytest.raises(RuntimeError, match="late schema conversion failure"):
+            _build_tools(
+                tmp_path,
+                mode="auto",
+                store=session_store,
+                subagent_coordinator=coordinator,
+                subagent_coordinator_sink=failed_publish.append,
+            )
+
+        assert failed_publish == []
+        assert coordinator.launcher is original_launcher  # type: ignore[attr-defined]
+    finally:
+        coordinator.shutdown(cancel_pending=True)  # type: ignore[attr-defined]
+
+
+def test_live_tool_rebuild_commits_background_cap_changes(tmp_path: Path) -> None:
+    session_store = _store(tmp_path, enabled=True)
+    coordinators: list[object] = []
+    initial_cfg = AppConfig(model="test-model", web_search_mode="off")
+    initial_cfg.subagent_orchestration.max_background_children = 1
+    _build_tools(
+        tmp_path,
+        mode="review",
+        store=session_store,
+        cfg=initial_cfg,
+        subagent_coordinator_sink=coordinators.append,
+    )
+    coordinator = coordinators[0]
+    try:
+        expanded_cfg = initial_cfg.model_copy(deep=True)
+        expanded_cfg.subagent_orchestration.max_background_children = 5
+        _build_tools(
+            tmp_path,
+            mode="review",
+            store=session_store,
+            cfg=expanded_cfg,
+            subagent_coordinator=coordinator,
+        )
+        assert coordinator.max_background_children == 5  # type: ignore[attr-defined]
+        assert coordinator._executor_worker_capacity >= 5  # type: ignore[attr-defined]  # noqa: SLF001
+
+        reduced_cfg = expanded_cfg.model_copy(deep=True)
+        reduced_cfg.subagent_orchestration.max_background_children = 2
+        _build_tools(
+            tmp_path,
+            mode="review",
+            store=session_store,
+            cfg=reduced_cfg,
+            subagent_coordinator=coordinator,
+        )
+        assert coordinator.max_background_children == 2  # type: ignore[attr-defined]
+    finally:
+        coordinator.shutdown(cancel_pending=True)  # type: ignore[attr-defined]
+
+
+def test_live_tool_rebuild_can_enable_workspace_isolation(
+    tmp_path: Path,
+) -> None:
+    session_store = _store(tmp_path, enabled=True)
+    coordinators: list[object] = []
+    disabled_cfg = AppConfig(model="test-model", web_search_mode="off")
+    disabled_cfg.subagent_orchestration.workspace_isolation_enabled = False
+    disabled_tools = _build_tools(
+        tmp_path,
+        mode="review",
+        store=session_store,
+        cfg=disabled_cfg,
+        subagent_coordinator_sink=coordinators.append,
+    )
+    coordinator = coordinators[0]
+    workspace_provider = coordinator.workspace_provider  # type: ignore[attr-defined]
+    try:
+        assert workspace_provider is not None
+        assert "subagent_apply" not in disabled_tools
+        assert "subagent_discard" not in disabled_tools
+
+        enabled_cfg = disabled_cfg.model_copy(deep=True)
+        enabled_cfg.subagent_orchestration.workspace_isolation_enabled = True
+        enabled_tools = _build_tools(
+            tmp_path,
+            mode="review",
+            store=session_store,
+            cfg=enabled_cfg,
+            subagent_coordinator=coordinator,
+        )
+
+        assert coordinator.workspace_provider is workspace_provider  # type: ignore[attr-defined]
+        assert "subagent_apply" in enabled_tools
+        assert "subagent_discard" in enabled_tools
+    finally:
+        coordinator.shutdown(cancel_pending=True)  # type: ignore[attr-defined]
 
 
 def test_build_tools_readonly_keeps_expected_read_safe_inspection_tools(tmp_path: Path) -> None:
@@ -214,7 +457,6 @@ def test_build_tools_readonly_keeps_expected_read_safe_inspection_tools(tmp_path
 
     for name in (
         "fs_read",
-        "fs_read_lines",
         "fs_list",
         "search_rg",
         "symbol_search",
@@ -230,6 +472,8 @@ def test_build_tools_readonly_keeps_expected_read_safe_inspection_tools(tmp_path
         "web_search",
     ):
         assert name in tools
+
+    assert "fs_read_lines" not in tools
 
 
 def test_build_tools_readonly_does_not_construct_shell_runner(
@@ -645,7 +889,7 @@ def test_review_mode_custom_tool_execution_requires_approval(
 
 
 @pytest.mark.parametrize("mode", ["auto", "fullaccess"])
-def test_trusted_custom_tools_do_not_require_per_call_approval_outside_review(
+def test_trusted_custom_tools_follow_action_approval_mode(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     mode: str,
@@ -667,7 +911,7 @@ def test_trusted_custom_tools_do_not_require_per_call_approval_outside_review(
     result = tools["project_echo"].run({})
 
     assert result["success"] is True
-    assert surface.requests == []
+    assert len(surface.requests) == (1 if mode == "auto" else 0)
 
 
 def test_build_tools_custom_tools_disabled_by_config_excludes_custom_tools(
@@ -692,3 +936,166 @@ def test_build_tools_custom_tools_disabled_by_config_excludes_custom_tools(
     )
 
     assert "project_echo" not in tools
+
+
+def test_review_mode_asks_before_each_unscoped_mcp_tool_call(
+    tmp_path: Path,
+) -> None:
+    binding, client = _make_mcp_binding()
+    surface = _RecordingSurface(allow=True)
+    tools = _build_tools(
+        tmp_path,
+        mode="review",
+        mcp_manager=_DummyMcpManager(binding),
+        non_interactive=False,
+        surface=surface,
+    )
+
+    tools["mcp__alpha__echo"].run({"text": "hi"})
+
+    assert client.called is True
+    [request] = surface.requests
+    assert request.kind == "mcp"
+    assert request.command == "mcp__alpha__echo"
+    assert request.metadata["mcp_server_id"] == "alpha"
+    assert request.metadata["mcp_tool_id"] == "echo"
+    assert request.metadata["access"] == "write"
+    assert '"text": "hi"' in request.preview
+    assert request.allow_for_session_scope is None
+
+
+def test_review_mode_declined_mcp_tool_call_never_reaches_the_server(tmp_path: Path) -> None:
+    binding, client = _make_mcp_binding()
+    surface = _RecordingSurface(allow=False)
+    tools = _build_tools(
+        tmp_path,
+        mode="review",
+        mcp_manager=_DummyMcpManager(binding),
+        non_interactive=False,
+        surface=surface,
+    )
+
+    with pytest.raises(AgentRuntimeError, match="MCP action was not approved"):
+        tools["mcp__alpha__echo"].run({})
+
+    assert client.called is False
+
+
+def test_review_mode_runs_a_tool_its_server_marks_read_only_without_asking(
+    tmp_path: Path,
+) -> None:
+    binding, client = _make_mcp_binding(read_only_hint=True)
+    surface = _RecordingSurface(allow=False)
+    tools = _build_tools(
+        tmp_path,
+        mode="review",
+        mcp_manager=_DummyMcpManager(binding),
+        non_interactive=False,
+        surface=surface,
+    )
+
+    tools["mcp__alpha__echo"].run({})
+
+    assert client.called is True
+    assert surface.requests == []
+
+
+def test_review_mode_mcp_tool_call_fails_closed_when_nobody_can_be_asked(
+    tmp_path: Path,
+) -> None:
+    binding, client = _make_mcp_binding()
+    tools = _build_tools(
+        tmp_path,
+        mode="review",
+        mcp_manager=_DummyMcpManager(binding),
+        non_interactive=True,
+        surface=_RecordingSurface(allow=True),
+    )
+
+    with pytest.raises(AgentRuntimeError, match="Nobody can be asked"):
+        tools["mcp__alpha__echo"].run({})
+
+    assert client.called is False
+
+
+def test_auto_mode_asks_for_unscoped_and_destructive_mcp_tools(tmp_path: Path) -> None:
+    plain, plain_client = _make_mcp_binding()
+    surface = _RecordingSurface(allow=True)
+    tools = _build_tools(
+        tmp_path,
+        mode="auto",
+        mcp_manager=_DummyMcpManager(plain),
+        non_interactive=False,
+        surface=surface,
+        yes=False,
+    )
+    tools["mcp__alpha__echo"].run({})
+    assert plain_client.called is True
+    assert len(surface.requests) == 1
+    surface.requests.clear()
+
+    destructive, destructive_client = _make_mcp_binding(destructive_hint=True)
+    tools = _build_tools(
+        tmp_path,
+        mode="auto",
+        mcp_manager=_DummyMcpManager(destructive),
+        non_interactive=False,
+        surface=surface,
+        yes=False,
+    )
+    tools["mcp__alpha__echo"].run({})
+    assert destructive_client.called is True
+    [request] = surface.requests
+    assert request.kind == "mcp"
+    assert request.metadata["destructive"] is True
+    assert "outside the project sandbox" in request.reason
+    # A destructive tool asks every time: no "allow for this chat".
+    assert request.allow_for_session_scope is None
+
+
+@pytest.mark.parametrize(("mode", "yes"), [("auto", True), ("fullaccess", False)])
+def test_full_access_bypasses_mcp_prompts_but_yes_does_not(
+    tmp_path: Path, mode: str, yes: bool
+) -> None:
+    binding, client = _make_mcp_binding(destructive_hint=True)
+    surface = _RecordingSurface(allow=False)
+    tools = _build_tools(
+        tmp_path,
+        mode=mode,
+        mcp_manager=_DummyMcpManager(binding),
+        non_interactive=False,
+        surface=surface,
+        yes=yes,
+    )
+
+    if mode == "auto":
+        with pytest.raises(AgentRuntimeError, match="MCP action was not approved"):
+            tools["mcp__alpha__echo"].run({})
+        assert client.called is False
+        assert len(surface.requests) == 1
+    else:
+        tools["mcp__alpha__echo"].run({})
+        assert client.called is True
+        assert surface.requests == []
+
+
+@pytest.mark.parametrize(
+    ("annotations", "expected"),
+    [
+        (None, (False, False)),
+        ({}, (False, False)),
+        ({"readOnlyHint": True}, (True, False)),
+        ({"readOnlyHint": True, "destructiveHint": False}, (True, False)),
+        ({"destructiveHint": True}, (False, True)),
+        ({"readOnlyHint": True, "destructiveHint": True}, (False, True)),
+        ({"readOnlyHint": "true"}, (False, False)),
+        ("not-an-object", (False, False)),
+    ],
+)
+def test_mcp_tool_approval_hints_trust_only_explicit_booleans(
+    annotations: object, expected: tuple[bool, bool]
+) -> None:
+    raw_tool: dict[str, object] = {"name": "echo", "inputSchema": {"type": "object"}}
+    if annotations is not None:
+        raw_tool["annotations"] = annotations
+    assert mcp_tool_approval_hints(raw_tool) == expected

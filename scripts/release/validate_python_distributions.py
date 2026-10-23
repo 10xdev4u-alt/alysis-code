@@ -30,7 +30,7 @@ _FORBIDDEN_SUFFIXES = {".jks", ".key", ".keystore", ".p12", ".pfx", ".pem", ".pp
 _FORBIDDEN_DIRECTORIES = {".aws", ".docker", ".gnupg", ".kube", ".ssh"}
 _MAX_ARCHIVE_BYTES = 256 * 1024 * 1024
 _MAX_MEMBER_BYTES = 64 * 1024 * 1024
-_SDIST_ROOT_FILES = {
+_SDIST_FILES = {
     ".gitignore",
     "docs/CHANGELOG.md",
     "LICENSE",
@@ -181,7 +181,11 @@ def _validate_sdist(
 
 
 def _is_allowed_sdist_member(relative_name: str) -> bool:
-    return relative_name in _SDIST_ROOT_FILES or relative_name.startswith("src/alysis_code/")
+    return (
+        relative_name in _SDIST_FILES
+        or relative_name.startswith("src/alysis_code/")
+        or relative_name == "schemas/forge-host-v2/forge-host-v2.schema.json"
+    )
 
 
 def _validate_member_names(
@@ -281,6 +285,18 @@ def _smoke_wheel(wheel: Path, *, name: str, version: str) -> None:
                 raise DistributionValidationError(
                     f"Installed {name} wheel reported the wrong version."
                 )
+        subprocess.run(
+            [
+                sys.executable,
+                os.fspath(Path(__file__).with_name("smoke_hosted_login.py")),
+                "--expected-root",
+                os.fspath(target),
+            ],
+            cwd=directory,
+            env=environment,
+            check=True,
+            timeout=60,
+        )
 
 
 def main() -> int:

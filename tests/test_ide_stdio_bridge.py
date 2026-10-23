@@ -55,6 +55,138 @@ def test_turn_touched_path_set_records_repeated_touches_without_losing_history()
     assert paths.recorded == {"already-touched.py", "new-this-turn.py"}
 
 
+@pytest.mark.parametrize("verified", [False, True])
+def test_chat_completion_exposes_host_verification_verdict(tmp_path, monkeypatch, verified):
+    from alysis_code.run_outcome import task_outcome_record
+
+    out = io.StringIO()
+    monkeypatch.setattr(stdio_bridge, "load_config", lambda: AppConfig(model="test-model"))
+
+    class FakeSession:
+        def __init__(self, **kwargs):
+            self.cfg = kwargs["cfg"]
+            self.surface = kwargs["surface"]
+            self.messages = []
+
+        def run_turn(self, _message):
+            self.last_turn_outcome = task_outcome_record(
+                exit_code=0,
+                reason="completed",
+                state={
+                    "completion_certificate": {"status": "SUFFICIENT"},
+                    "accepted_verification_evidence": [{"evidence_category": "USER_EXPLICIT"}],
+                    "acceptance_contract": {
+                        "criteria": [
+                            {
+                                "id": "requested-check",
+                                "enforcement": "HARD",
+                                "required": True,
+                                "required_for_finalization": True,
+                                "status": "PASSED",
+                            }
+                        ],
+                    },
+                }
+                if verified
+                else None,
+            )
+            self.surface.emit_message_end("done")
+            return 0
+
+        def close(self):
+            pass
+
+    bridge = StdioBridge(stdout=out, create_session_fn=lambda **kwargs: FakeSession(**kwargs))
+    created = _send_bridge_request(
+        bridge, out, "session.create", {"workspace": str(tmp_path), "mode": "readonly"}
+    )
+    session_id = created["result"]["session_id"]
+    _send_bridge_request(
+        bridge, out, "chat.send", {"session_id": session_id, "message": "Report the result."}
+    )
+    activity = _wait_for_line(
+        out,
+        lambda line: (
+            line.get("type") == "activity_update"
+            and line.get("payload", {}).get("display_title", "").startswith("Request ")
+        ),
+    )
+    assert activity["payload"]["status"] == ("succeeded" if verified else "completed_unverified")
+    status = _send_bridge_request(bridge, out, "session.status", {"session_id": session_id})
+    result = status["result"]["last_job"]["result"]
+    assert result["verified_success"] is verified
+    assert result["task_outcome"]["outcome"] == (
+        "verified_success" if verified else "completed_unverified"
+    )
+
+
+@pytest.mark.parametrize(
+    "failure",
+    ["provider_failure", "deadline_exhausted", "cancelled", "rejected", "post_completion_failure"],
+)
+def test_chat_error_outcome_retains_current_failure_but_never_prior_success(
+    tmp_path, monkeypatch, failure
+):
+    from alysis_code.run_outcome import task_outcome_record
+
+    out = io.StringIO()
+    monkeypatch.setattr(stdio_bridge, "load_config", lambda: AppConfig(model="test-model"))
+    success_state = {
+        "material_edit_count": 1,
+        "completion_certificate": {"status": "SUFFICIENT"},
+        "accepted_verification_evidence": [{}],
+    }
+
+    class FakeSession:
+        def __init__(self, **kwargs):
+            self.cfg = kwargs["cfg"]
+            self.surface = kwargs["surface"]
+            self.messages = []
+            self.last_turn_outcome = task_outcome_record(
+                exit_code=0, reason="completed", task_id="prior-task", state=success_state
+            )
+
+        def run_turn(self, _message):
+            if failure != "rejected":
+                self.last_turn_outcome = task_outcome_record(
+                    exit_code=0 if failure == "post_completion_failure" else 1,
+                    reason="completed" if failure == "post_completion_failure" else failure,
+                    task_id="current-task",
+                    state={**success_state, "verification_relevant_edit_generation": 4},
+                )
+            if failure == "cancelled":
+                raise stdio_bridge.BridgeCancellationError("cancelled_by_user")
+            raise RuntimeError("test adapter boundary failure")
+
+        def close(self):
+            pass
+
+    bridge = StdioBridge(stdout=out, create_session_fn=lambda **kwargs: FakeSession(**kwargs))
+    created = _send_bridge_request(
+        bridge, out, "session.create", {"workspace": str(tmp_path), "mode": "readonly"}
+    )
+    session_id = created["result"]["session_id"]
+    _send_bridge_request(
+        bridge, out, "chat.send", {"session_id": session_id, "message": "Run the current task."}
+    )
+    _wait_for_line(out, lambda line: "job_cancelled" in str(line) or "job_failed" in str(line))
+    status = _send_bridge_request(bridge, out, "session.status", {"session_id": session_id})
+    result = status["result"]["last_job"]["result"]
+    assert result["verified_success"] is False
+    record = result["task_outcome"]
+    expected = {
+        "provider_failure": "provider_failure",
+        "deadline_exhausted": "deadline_exceeded",
+        "cancelled": "cancelled",
+        "rejected": "incomplete",
+        "post_completion_failure": "incomplete",
+    }
+    assert record["outcome"] == expected[failure]
+    assert record["task_id"] == ("" if failure == "rejected" else "current-task")
+    if failure != "rejected":
+        assert record["generation"] == 4
+
+
 def _request(method: str, params: dict[str, Any] | None = None, request_id: str = "req") -> str:
     return json.dumps(
         {
@@ -81,7 +213,10 @@ def _send_bridge_request(
 ) -> dict[str, Any]:
     before = len(_json_lines(out))
     bridge.process_line(_request(method, params or {}, request_id=request_id or method) + "\n")
-    return _json_lines(out)[before]
+    # A method may emit notices before its response (for example, optional Git checkpoints).
+    return next(
+        line for line in _json_lines(out)[before:] if line.get("id") == (request_id or method)
+    )
 
 
 def _wait_for_line(out: io.StringIO, predicate: Any, *, timeout: float = 2.0) -> dict[str, Any]:
@@ -547,8 +682,11 @@ def test_run_stdio_bridge_keeps_incidental_prints_off_protocol_stdout(
     protocol_out = io.StringIO()
     diagnostics = io.StringIO()
 
+    protocol_in = io.StringIO()
+
     class FakeBridge:
-        def __init__(self, *, stdout: Any) -> None:
+        def __init__(self, *, stdin: Any, stdout: Any) -> None:
+            assert stdin is protocol_in
             assert stdout is protocol_out
 
         def run(self) -> int:
@@ -557,6 +695,9 @@ def test_run_stdio_bridge_keeps_incidental_prints_off_protocol_stdout(
             return 0
 
     monkeypatch.setattr(stdio_bridge, "StdioBridge", FakeBridge)
+    # The real claim moves descriptors 0 and 1 to the null device; it has its own
+    # subprocess test in test_ide_protocol_stream_isolation.py.
+    monkeypatch.setattr(stdio_bridge, "claim_protocol_streams", lambda: (protocol_in, protocol_out))
     monkeypatch.setattr(sys, "stdout", protocol_out)
     monkeypatch.setattr(sys, "stderr", diagnostics)
 
@@ -1278,7 +1419,9 @@ def test_stdio_bridge_conventions_and_extension_package_methods(
         management_protocol, "load_project_overrides", lambda _root: project_overrides
     )
     monkeypatch.setattr(
-        management_protocol, "compute_effective_enabled", lambda *_args: {"demo.ext"}
+        management_protocol,
+        "resolve_active_plugins",
+        lambda **_kwargs: SimpleNamespace(enabled_plugin_ids=frozenset({"demo.ext"})),
     )
     monkeypatch.setattr(
         management_protocol, "uninstall_plugin", lambda **_kwargs: {"id": "demo.ext"}
@@ -2946,11 +3089,32 @@ def test_stdio_bridge_session_compact_redacts_errors(
     assert "api_key=<redacted>" in compact["error"]["message"]
 
 
+@pytest.mark.parametrize(
+    "git_available, checkpoint_state_exists", [(True, False), (False, False), (False, True)]
+)
 def test_stdio_bridge_session_resume_replays_bounded_redacted_history(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    git_available: bool,
+    checkpoint_state_exists: bool,
 ) -> None:
     _isolate_alysis_state(tmp_path, monkeypatch)
+    if not git_available:
+        original_which = stdio_bridge.shutil.which
+        monkeypatch.setattr(
+            stdio_bridge.shutil,
+            "which",
+            lambda command: None if command == "git" else original_which(command),
+        )
+        monkeypatch.setattr(
+            stdio_bridge, "checkpoint_storage_exists", lambda root: checkpoint_state_exists
+        )
+        if checkpoint_state_exists:
+
+            def unavailable_checkpoints(*args: Any) -> None:
+                raise stdio_bridge.ChangeLedgerError("Checkpoint storage could not start Git.")
+
+            monkeypatch.setattr(StdioBridge, "_change_ledger_for_session", unavailable_checkpoints)
     out = io.StringIO()
     artifact_root = tmp_path / "session-artifacts"
     sessions_dir = tmp_path / "sessions"
@@ -3022,12 +3186,20 @@ def test_stdio_bridge_session_resume_replays_bounded_redacted_history(
         },
     )
 
+    if checkpoint_state_exists and not git_available:
+        assert resume["ok"] is False
+        assert resume["error"]["code"] == "checkpoint_recovery_failed"
+        assert created_sessions[0].messages == []
+        return
     assert resume["ok"] is True
     assert resume["result"]["resumed"] is True
     assert resume["result"]["history_count"] == 3
     assert resume["result"]["history_count_total"] == 3
     assert resume["result"]["bounded"] is False
     assert resume["result"]["resume_context_loaded"] is True
+    if not git_available:
+        assert resume["result"]["checkpoint_lineage_adopted"] is False
+        assert "file checkpoints need Git" in out.getvalue()
     assert "must-not-leak" not in out.getvalue()
     assert all(
         "must-not-leak" not in json.dumps(message) for message in created_sessions[0].messages
@@ -3133,6 +3305,147 @@ def test_stdio_bridge_session_resume_validates_ids_and_bounds_replay(
     assert "message 4" in rendered
     assert "must-not-leak" not in rendered
     assert "must-not-leak" not in out.getvalue()
+
+
+def test_stdio_bridge_and_terminal_resume_share_context_message(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _isolate_alysis_state(tmp_path, monkeypatch)
+    out = io.StringIO()
+    artifact_root = tmp_path / "session-artifacts"
+    sessions_dir = tmp_path / "sessions"
+    artifact_root.mkdir()
+    sessions_dir.mkdir()
+    (tmp_path / "pyproject.toml").write_text("[project]\nname='demo'\n", encoding="utf-8")
+    monkeypatch.setattr(
+        stdio_bridge,
+        "load_config",
+        lambda: AppConfig(model="test-model", session_log_dir=os.fspath(sessions_dir)),
+    )
+
+    from alysis_code import cli as cli_mod
+
+    target_id = "retained_parity"
+    retained_events = [
+        {
+            "type": "session_start",
+            "payload": {"mode": "review", "active_workdir_relpath": "."},
+        },
+        {"type": "user_message", "payload": {"content": "parity turn"}},
+        {"type": "assistant_message", "payload": {"content": "parity reply"}},
+    ]
+    (sessions_dir / f"{target_id}.jsonl").write_text(
+        "\n".join(json.dumps(event, sort_keys=True) for event in retained_events) + "\n",
+        encoding="utf-8",
+    )
+
+    # IDE bridge resume.
+    FakeStore = type(
+        "FakeStore",
+        (),
+        {"session_artifact_root": artifact_root, "sessions_dir": sessions_dir},
+    )
+
+    class FakeSession:
+        store = FakeStore()
+
+        def __init__(self, **kwargs: Any) -> None:
+            self.cfg = kwargs["cfg"]
+            self.messages: list[dict[str, Any]] = []
+            self.pinned_prefix_len = 0
+            self.conversation_compactor = SimpleNamespace(
+                state=SimpleNamespace(pinned_prefix_len=0)
+            )
+
+        def close(self) -> None:
+            pass
+
+    created_sessions: list[FakeSession] = []
+
+    def fake_create_session(**kwargs: Any) -> FakeSession:
+        session = FakeSession(**kwargs)
+        created_sessions.append(session)
+        return session
+
+    bridge = StdioBridge(stdout=out, create_session_fn=fake_create_session)
+    create = _send_bridge_request(
+        bridge,
+        out,
+        "session.create",
+        {"workspace": os.fspath(tmp_path), "mode": "readonly"},
+    )
+    resume = _send_bridge_request(
+        bridge,
+        out,
+        "session.resume",
+        {
+            "session_id": create["result"]["session_id"],
+            "target_session_id": target_id,
+        },
+    )
+    assert resume["ok"] is True
+    assert resume["result"]["bounded"] is False
+    bridge_context = str(created_sessions[0].messages[0].get("content"))
+
+    # Terminal resume against the same fixture.
+    class _TerminalStore:
+        def __init__(self, *, session_id: str) -> None:
+            self.sessions_dir = sessions_dir
+            self.session_id = session_id
+            self.notes: list[tuple[str, dict[str, Any]]] = []
+
+        def append(self, event_type: str, payload: dict[str, Any]) -> None:
+            self.notes.append((event_type, payload))
+
+    class _TerminalSession:
+        pass
+
+    current = _TerminalSession()
+    current.cfg = AppConfig(model="test-model", max_steps=10)
+    current.root = tmp_path
+    current.mode = "review"
+    current.yes = True
+    current.max_steps = 5
+    current.console = None
+    current.surface = object()
+    current.store = _TerminalStore(session_id="current-terminal")
+    current.client = SimpleNamespace(api_key="override-key")
+    current.usage_role = "main"
+    current.tool_output_offloader = None
+    current.conversation_compactor = None
+    current.messages = []
+    current.close = lambda: None
+
+    def fake_terminal_create_session(**kwargs: Any) -> Any:
+        session = _TerminalSession()
+        session.cfg = kwargs["cfg"]
+        session.root = kwargs["root"]
+        session.mode = kwargs["mode"]
+        session.yes = kwargs["yes"]
+        session.max_steps = kwargs["max_steps"]
+        session.console = kwargs["console"]
+        session.surface = kwargs["surface"]
+        session.store = _TerminalStore(session_id=kwargs["session_id_override"])
+        session.client = SimpleNamespace(api_key="override-key")
+        session.usage_role = kwargs["usage_role"]
+        session.tool_output_offloader = None
+        session.conversation_compactor = None
+        session.messages = []
+        session.pinned_prefix_len = 0
+        return session
+
+    monkeypatch.setattr(cli_mod, "create_session", fake_terminal_create_session)
+
+    ok, _message, _history = cli_mod._resume_chat_session(
+        session=current,
+        target_session_id=target_id,
+    )
+
+    assert ok is True
+    terminal_context = str(current.messages[0].get("content"))
+    assert terminal_context.startswith("<resume_context>")
+    assert terminal_context == bridge_context
 
 
 def test_stdio_bridge_session_history_redacts_live_messages(
@@ -3684,6 +3997,52 @@ def test_stdio_bridge_live_session_setters_refresh_underlying_runtime(
     assert refreshed == [("next-model", True), ("next-model", False)]
 
 
+def test_stdio_bridge_set_mode_rejects_an_active_turn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _isolate_alysis_state(tmp_path, monkeypatch)
+    started = threading.Event()
+    release = threading.Event()
+
+    def run_turn(_surface: Any, _message: str) -> int:
+        started.set()
+        assert release.wait(timeout=3.0)
+        return 0
+
+    out, bridge, session_id = _create_review_session(
+        tmp_path,
+        monkeypatch,
+        run_turn,
+    )
+    bridge.process_line(
+        _request(
+            "chat.send",
+            {"session_id": session_id, "message": "work"},
+            request_id="chat",
+        )
+        + "\n"
+    )
+    assert started.wait(timeout=1.0)
+
+    bridge.process_line(
+        _request(
+            "session.setMode",
+            {"session_id": session_id, "mode": "auto"},
+            request_id="set-mode-busy",
+        )
+        + "\n"
+    )
+
+    response = _response_by_id(out, "set-mode-busy")
+    assert response["ok"] is False
+    assert response["error"]["code"] == "session_busy"
+    assert bridge._sessions[session_id].mode == "review"
+
+    release.set()
+    bridge.close()
+
+
 def test_stdio_bridge_management_config_profile_do_not_leak_secret_values(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -4102,6 +4461,115 @@ def test_stdio_bridge_approval_allow_for_session_exact_shell_scope_auto_allows(
         for line in lines
     )
     assert decisions == [(True, True), (True, True)]
+
+
+def _mcp_tool_approval_request(text: str, *, destructive: bool = False) -> ApprovalRequest:
+    return ApprovalRequest(
+        kind="mcp_tool_run:alpha/echo",
+        reason="review mode requires confirmation for MCP tools",
+        preview=f'Run MCP tool\nserver: alpha\ntool: echo\nargs:\n{{"text": "{text}"}}',
+        command="mcp__alpha__echo",
+        metadata={
+            "mcp_server_id": "alpha",
+            "mcp_tool_id": "echo",
+            **({"destructive": True} if destructive else {}),
+        },
+    )
+
+
+def test_stdio_bridge_mcp_tool_allow_for_session_covers_the_tool_for_any_arguments(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    decisions: list[tuple[bool, bool]] = []
+
+    def run_turn(surface: Any, message: str) -> int:
+        _ = message
+        for text in ("one", "two"):
+            decision = surface.request_approval(_mcp_tool_approval_request(text))
+            decisions.append((decision.allow, decision.allow_for_session))
+        surface.emit_message_end("done")
+        return 0
+
+    out, bridge, session_id = _create_review_session(tmp_path, monkeypatch, run_turn)
+    bridge.process_line(
+        _request("chat.send", {"session_id": session_id, "message": "approve"}, request_id="chat")
+        + "\n"
+    )
+    approval = _wait_for_line(
+        out,
+        lambda line: (
+            line.get("type") == "prompt_for_input"
+            and line.get("payload", {}).get("kind") == "approval"
+        ),
+    )
+    payload = approval["payload"]
+    assert payload["approval_kind"] == "mcp_tool_run:alpha/echo"
+    assert payload["allow_for_session_supported"] is True
+    assert payload["action"]["tool_identity"] == {"mcp_server_id": "alpha", "mcp_tool_id": "echo"}
+    assert payload["action"]["access"] == "execute"
+
+    bridge.process_line(
+        _request(
+            "approval.respond",
+            {
+                "session_id": session_id,
+                "approval_id": payload["approval_id"],
+                "allow": True,
+                "allow_for_session": True,
+            },
+            request_id="approve",
+        )
+        + "\n"
+    )
+
+    _wait_for_line(out, lambda line: line.get("type") == "message_end")
+    approval_events = [
+        line
+        for line in _json_lines(out)
+        if line.get("type") == "prompt_for_input"
+        and line.get("payload", {}).get("kind") == "approval"
+    ]
+    assert len(approval_events) == 1
+    assert decisions == [(True, True), (True, True)]
+
+
+def test_stdio_bridge_destructive_mcp_tool_never_offers_allow_for_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def run_turn(surface: Any, message: str) -> int:
+        _ = message
+        surface.request_approval(_mcp_tool_approval_request("one", destructive=True))
+        surface.emit_message_end("done")
+        return 0
+
+    out, bridge, session_id = _create_review_session(tmp_path, monkeypatch, run_turn)
+    bridge.process_line(
+        _request("chat.send", {"session_id": session_id, "message": "approve"}, request_id="chat")
+        + "\n"
+    )
+    approval = _wait_for_line(
+        out,
+        lambda line: (
+            line.get("type") == "prompt_for_input"
+            and line.get("payload", {}).get("kind") == "approval"
+        ),
+    )
+    assert approval["payload"]["allow_for_session_supported"] is False
+    assert approval["payload"]["action"]["destructive"] is True
+    bridge.process_line(
+        _request(
+            "approval.respond",
+            {
+                "session_id": session_id,
+                "approval_id": approval["payload"]["approval_id"],
+                "allow": False,
+                "allow_for_session": False,
+            },
+            request_id="deny",
+        )
+        + "\n"
+    )
+    _wait_for_line(out, lambda line: line.get("type") == "message_end")
 
 
 def test_stdio_bridge_approval_allow_for_session_unsafe_scope_is_downgraded(
@@ -10990,8 +11458,8 @@ def test_stdio_bridge_swarm_pre_granted_scope_never_prompts(
             ApprovalRequest(
                 kind="shell_run",
                 reason="sensitive command",
-                preview="rm -rf build",
-                command="rm -rf build",
+                preview="make build",
+                command="make build",
             )
         )
         decisions.append(decision.allow)
@@ -11002,7 +11470,9 @@ def test_stdio_bridge_swarm_pre_granted_scope_never_prompts(
 
     monkeypatch.setattr("alysis_code.swarm_worker.run_agent", fake_run_agent)
 
-    grant_scope = exact_command_scope("rm -rf build", kind="shell_run")
+    # Destructive commands never reuse a scope (they always need a fresh decision),
+    # so the pre-grant is exercised with an ordinary build command.
+    grant_scope = exact_command_scope("make build", kind="shell_run")
     bridge.process_line(
         _request(
             "forge.swarm.start",

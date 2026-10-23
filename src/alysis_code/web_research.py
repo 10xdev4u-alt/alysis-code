@@ -11,7 +11,7 @@ from urllib.parse import urlsplit, urlunsplit
 # Surrounding wrapper brackets are removed later by context-aware cleanup.
 _URL_RE = re.compile(r"https?://[^\s<>{}\"]+", re.IGNORECASE)
 _URL_CANDIDATE_STOP_CHARS = set('<>{}"')
-_STRUCTURED_URL_FORBIDDEN_CHARS = set('<>{}"')
+_STRUCTURED_URL_FORBIDDEN_CHARS = set('<>{}"\\')
 _SIMPLE_TRAILING_URL_PUNCTUATION = ".,;:?"
 _TRAILING_URL_QUOTES = '"'
 _URL_QUOTE_WRAPPERS = {"'", '"'}
@@ -32,10 +32,13 @@ _SAME_ORIGIN_DERIVED = "same_origin_derived_search_result"
 _FETCHED_PAGE_LINK = "fetched_page_link"
 _TRUSTED_LOCAL_FILE = "trusted_local_file"
 _TRUSTED_TOOL_OUTPUT = "trusted_tool_output"
+_TRUSTED_DOMAIN_ALLOWLIST = "trusted_domain_allowlist"
 _MAX_PROVENANCE_NODES = 512
 _MAX_URLS_PER_EVENT = 24
 _MAX_URL_TEXT_CHARS = 32_000
 _MAX_PROVENANCE_URL_LENGTH = 2048
+_MAX_RESULT_TEXT_NODES = 256
+_MAX_RESULT_TEXT_DEPTH = 12
 _FETCHABLE_PROVENANCE_CLASSES = {
     _USER_PROVIDED,
     _RETURNED_BY_WEB_SEARCH,
@@ -47,12 +50,121 @@ _FETCHABLE_PROVENANCE_CLASSES = {
     _SAME_ORIGIN_DERIVED,
 }
 
+# Ordered, model-facing list mirrored into web_fetch rejection payloads. Keep in
+# sync with _FETCHABLE_PROVENANCE_CLASSES plus the configured-allowlist class,
+# which is fetchable only when the session's tracker has trusted domains set.
+FETCHABLE_PROVENANCE_CLASSIFICATIONS: tuple[str, ...] = (
+    _USER_PROVIDED,
+    _RETURNED_BY_WEB_SEARCH,
+    _FETCHED_PAGE_LINK,
+    _TRUSTED_LOCAL_FILE,
+    _TRUSTED_TOOL_OUTPUT,
+    _CANONICAL_REDIRECT,
+    _SEARCH_MEDIATED_RECOVERY,
+    _SAME_ORIGIN_DERIVED,
+    _TRUSTED_DOMAIN_ALLOWLIST,
+)
+
+
+def iter_result_text_snippets(value: Any) -> Iterable[str]:
+    """Read bounded result data, decoding JSON rather than treating escapes as URLs.
+
+    MCP fences remain in the model-facing result. Removing the host's fence here
+    is only for extracting data references; it never promotes source instructions.
+    """
+    remaining = _MAX_RESULT_TEXT_NODES
+
+    def walk(item: Any, depth: int) -> Iterable[str]:
+        nonlocal remaining
+        if depth > _MAX_RESULT_TEXT_DEPTH or remaining <= 0:
+            return
+        remaining -= 1
+        if isinstance(item, str):
+            text = item.strip()
+            begin = "\n--- BEGIN UNTRUSTED MCP TEXT ---\n"
+            end = "\n--- END UNTRUSTED MCP TEXT ---\n[/MCP_UNTRUSTED_TEXT]"
+            if text.startswith("[MCP_UNTRUSTED_TEXT]\n") and text.endswith(end):
+                _, marker, body = text.partition(begin)
+                if marker:
+                    text = body[: -len(end)]
+            if len(text) <= _MAX_URL_TEXT_CHARS and text.startswith(("{", "[", '"')):
+                try:
+                    decoded = json.loads(text)
+                except RecursionError:
+                    return
+                except ValueError:
+                    pass
+                else:
+                    yield from walk(decoded, depth + 1)
+                    return
+            if "http://" in text.casefold() or "https://" in text.casefold():
+                yield text[:_MAX_URL_TEXT_CHARS]
+        elif isinstance(item, dict):
+            for child in item.values():
+                if remaining <= 0:
+                    break
+                yield from walk(child, depth + 1)
+        elif isinstance(item, list):
+            for child in item[:64]:
+                if remaining <= 0:
+                    break
+                yield from walk(child, depth + 1)
+
+    yield from walk(value, 0)
+
+
+def extract_result_web_urls(value: Any) -> list[dict[str, str]]:
+    """Preserve complete structured URL values, including legal trailing punctuation."""
+    found: dict[str, dict[str, str]] = {}
+    for snippet in iter_result_text_snippets(value):
+        normalized = normalize_web_url(snippet)
+        candidates = (
+            [{"url": snippet, "normalized_url": normalized, "domain": _domain_for_url(normalized)}]
+            if normalized is not None
+            else extract_public_web_urls(snippet)
+        )
+        for entry in candidates:
+            if len(entry["url"]) <= _MAX_PROVENANCE_URL_LENGTH:
+                found.setdefault(entry["normalized_url"], entry)
+            if len(found) >= _MAX_URLS_PER_EVENT:
+                return list(found.values())
+    return list(found.values())
+
 
 def _domain_for_url(url: str) -> str:
     try:
         return (urlsplit(url).hostname or "").rstrip(".").lower()
     except ValueError:
         return ""
+
+
+def normalize_trusted_domain_entry(raw_entry: Any) -> str | None:
+    """Normalize one configured trusted-domain entry to a bare lowercase host.
+
+    Accepts plain hosts (``registry.npmjs.org``), leading-wildcard or leading-dot
+    forms (``*.npmjs.org``, ``.npmjs.org`` — equivalent to the bare host, since
+    matching already covers subdomains), and full URLs
+    (``https://registry.npmjs.org/anything``). Schemes, credentials, ports, and
+    paths are dropped. Returns ``None`` when no usable host remains.
+    """
+    text = str(raw_entry or "").strip().lower()
+    for prefix in ("*.", "."):
+        if text.startswith(prefix):
+            text = text[len(prefix) :]
+    if not text:
+        return None
+    if "://" not in text:
+        head = text.split("/", 1)[0]
+        if "@" in head:
+            return None
+        text = f"https://{head}"
+    try:
+        host = (urlsplit(text).hostname or "").strip().rstrip(".")
+    except ValueError:
+        return None
+    if not host or any(ch.isspace() for ch in host):
+        return None
+    return host
 
 
 def _dedupe_ordered(items: list[str]) -> list[str]:
@@ -638,6 +750,7 @@ def extract_public_web_urls(text: Any) -> list[dict[str, str]]:
 
 class SessionWebResearchTracker:
     def __init__(self) -> None:
+        self._trusted_domains: tuple[str, ...] = ()
         self._user_urls: dict[str, dict[str, Any]] = {}
         self._returned_source_urls: dict[str, dict[str, Any]] = {}
         self._canonical_redirect_urls: dict[str, dict[str, Any]] = {}
@@ -647,6 +760,34 @@ class SessionWebResearchTracker:
         self._fetches: list[dict[str, Any]] = []
         self._pending_search_indices: list[int] = []
         self._pending_fetch_indices: list[int] = []
+
+    def configure_trusted_domains(self, domains: Iterable[Any] | None) -> tuple[str, ...]:
+        """Set the configured trusted-domain allowlist for this tracker.
+
+        Entries are normalized via :func:`normalize_trusted_domain_entry`;
+        unusable entries are dropped. This is session configuration, not
+        observed evidence: it is never persisted to or hydrated from the
+        web-research artifact, and replacing it is idempotent.
+        """
+        normalized = _dedupe_ordered(
+            [normalize_trusted_domain_entry(entry) or "" for entry in list(domains or [])]
+        )
+        self._trusted_domains = tuple(normalized)
+        return self._trusted_domains
+
+    def trusted_domains(self) -> tuple[str, ...]:
+        return self._trusted_domains
+
+    def _trusted_domain_for_url(self, normalized_url: str) -> str | None:
+        if not self._trusted_domains:
+            return None
+        host = _domain_for_url(normalized_url)
+        if not host:
+            return None
+        for domain in self._trusted_domains:
+            if host == domain or host.endswith("." + domain):
+                return domain
+        return None
 
     def classify_fetch_url(self, raw_url: Any) -> str | None:
         classification, _effective_url = self.resolve_fetch_url(raw_url)
@@ -829,6 +970,8 @@ class SessionWebResearchTracker:
                 classification = str(node.get("provenance_classification") or "").strip()
                 if classification in _FETCHABLE_PROVENANCE_CLASSES:
                     return classification
+        if self._trusted_domain_for_url(normalized) is not None:
+            return _TRUSTED_DOMAIN_ALLOWLIST
         if self._is_same_origin_derived_search_url(normalized):
             return _SAME_ORIGIN_DERIVED
         return None
@@ -1064,13 +1207,10 @@ class SessionWebResearchTracker:
             )
         if tool_name in {"web_search", "web_fetch"}:
             return False
-        snippets = list(self._iter_result_text_snippets(result))
-        if not snippets:
-            return False
         changed = False
-        for snippet in snippets[:8]:
-            changed |= self._record_urls_from_text(
-                text=snippet,
+        for entry in extract_result_web_urls(result):
+            changed |= self._add_provenance_node(
+                raw_url=entry["url"],
                 provenance_classification=_TRUSTED_TOOL_OUTPUT,
                 source_event_id=event_id,
                 parent_url=tool_name,
@@ -1078,28 +1218,10 @@ class SessionWebResearchTracker:
                 discovery_mechanism="registered_tool_output",
                 source_type=tool_name,
                 ts=ts,
+                redirect_chain=(),
+                security_validation_status="syntax_validated_fetch_revalidates_target",
             )
         return changed
-
-    def _iter_result_text_snippets(
-        self,
-        value: Any,
-        *,
-        depth: int = 0,
-    ) -> Iterable[str]:
-        if depth > 4:
-            return
-        if isinstance(value, str):
-            if "http://" in value or "https://" in value:
-                yield value[:_MAX_URL_TEXT_CHARS]
-            return
-        if isinstance(value, dict):
-            for item in value.values():
-                yield from self._iter_result_text_snippets(item, depth=depth + 1)
-            return
-        if isinstance(value, list):
-            for item in value[:64]:
-                yield from self._iter_result_text_snippets(item, depth=depth + 1)
 
     def _record_user_message(
         self,
