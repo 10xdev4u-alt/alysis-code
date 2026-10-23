@@ -93,7 +93,17 @@ def test_rejects_any_other_sdist_pem(tmp_path: Path) -> None:
         validate_distributions(dist, project_file=project, smoke=False)
 
 
-def test_rejects_files_outside_exact_release_inventory(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "sdist_entry",
+    [
+        "workspace-output.txt",
+        "docs/debug.txt",
+        "CHANGELOG.md",
+        "schemas/forge-host-v2/fixtures/debug.json",
+        "schemas/other.schema.json",
+    ],
+)
+def test_rejects_files_outside_exact_release_inventory(tmp_path: Path, sdist_entry: str) -> None:
     dist, project = _candidate(
         tmp_path / "wheel",
         wheel_extra=("documentation/debug.txt", b"debug"),
@@ -104,7 +114,7 @@ def test_rejects_files_outside_exact_release_inventory(tmp_path: Path) -> None:
 
     dist, project = _candidate(
         tmp_path / "sdist",
-        sdist_extra=(f"{NORMALIZED}-{VERSION}/workspace-output.txt", b"debug"),
+        sdist_extra=(f"{NORMALIZED}-{VERSION}/{sdist_entry}", b"debug"),
     )
 
     with pytest.raises(DistributionValidationError, match="outside the release inventory"):
@@ -122,6 +132,7 @@ def test_hatch_sdist_uses_an_explicit_release_inventory() -> None:
         "/README.md",
         "/pyproject.toml",
         "/src/alysis_code",
+        "/schemas/forge-host-v2/forge-host-v2.schema.json",
     ]
 
 
@@ -180,6 +191,7 @@ def _candidate(
     with tarfile.open(sdist, "w:gz") as archive:
         _tar_file(archive, f"{root}/pyproject.toml", project.read_bytes())
         _tar_file(archive, f"{root}/src/alysis_code/__init__.py", b"")
+        _tar_file(archive, f"{root}/docs/CHANGELOG.md", b"# Changelog\n")
         if sdist_extra is not None:
             _tar_file(archive, *sdist_extra)
         if sdist_link:

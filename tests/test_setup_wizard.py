@@ -45,11 +45,11 @@ _ORIGINAL_VALIDATE_API_KEY = setup_wizard_mod._validate_api_key
 
 class FakeSubscriptionAdapter:
     provider_id = "openai-codex"
-    display_name = "ChatGPT Codex subscription"
+    display_name = "ChatGPT subscription"
     description = "test"
     profile_name = "chatgpt-codex"
     auth_hint = "test"
-    base_url = "https://chatgpt.com/backend-api/codex"
+    base_url = "https://api.openai.com/v1"
     protocol = "openai_responses"
     supports_previous_response_id = False
 
@@ -323,12 +323,12 @@ def test_setup_wizard_subscription_uses_native_profile_and_preserves_api_credent
         "AI Subscription",
     ]
     assert "OpenAI Codex" not in str(picker.connection_calls[0]["rows"])
-    assert "ChatGPT Codex subscription" in str(picker.connection_calls[1]["rows"])
+    assert "ChatGPT subscription" in str(picker.connection_calls[1]["rows"])
     assert "Connection method selected: Use an AI subscription" in rendered
     assert "Connection:" in rendered
     assert "AI subscription" in rendered
     assert "Subscription:" in rendered
-    assert "ChatGPT Codex subscription" in rendered
+    assert "ChatGPT subscription" in rendered
     assert "immediate external side effect" in rendered
     assert "alysis auth login openai-codex" in rendered
     assert "not connected" in rendered
@@ -346,7 +346,7 @@ def test_subscription_setup_rerun_preserves_config_selected_model_and_effort(
     profile = ProfileSpec(
         name="chatgpt-codex",
         protocol="openai_responses",
-        base_url="https://chatgpt.com/backend-api/codex",
+        base_url="https://api.openai.com/v1",
         auth_provider="openai-codex",
         default_model="kept-model",
         reasoning_effort="high",
@@ -859,7 +859,7 @@ def test_model_picker_rows_include_preset_suggestions(monkeypatch, tmp_path: Pat
 def test_deepseek_model_picker_uses_v4_models(monkeypatch, tmp_path: Path) -> None:
     _config_env(tmp_path, monkeypatch)
     _patch_console(monkeypatch)
-    picker = PickerScript(["deepseek", "deepseek-v4-flash"])
+    picker = PickerScript(["deepseek", "deepseek-flash"])
     monkeypatch.setattr(setup_wizard_mod, "_run_wizard_picker", picker)
     monkeypatch.setattr(
         setup_wizard_mod.typer, "prompt", PromptScript(["", "sk-test-1234", os.fspath(tmp_path)])
@@ -868,7 +868,7 @@ def test_deepseek_model_picker_uses_v4_models(monkeypatch, tmp_path: Path) -> No
     assert setup_wizard_mod.run_setup_wizard() is True
     model_values = [value for value, _label, _description in picker.calls[1]["rows"]]
     assert "deepseek-v4-pro" in model_values
-    assert "deepseek-v4-flash" in model_values
+    assert "deepseek-flash" in model_values
     assert "deepseek-coder" not in model_values
 
 

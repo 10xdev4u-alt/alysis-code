@@ -656,28 +656,19 @@ def test_explicit_endpoint_pricing_overrides_unknown_compatible_route() -> None:
         "output_cost",
     ),
     [
-        (
-            "https://api.deepseek.com",
-            "deepseek-v4-flash-vision-exp",
-            1_000_000,
-            384_000,
-            "deepseek-v4-flash-vision-exp",
-            True,
-            0.00000044,
-            0.00000132,
-        ),
-        # V4.1 Flash internal beta (2026-09-08): temporary id on the same
-        # base_url, multimodal, billed at the v4-flash rate.
-        (
-            "https://api.deepseek.com",
-            "deepseek-v4.1-flash-expires-on-0910",
-            1_000_000,
-            384_000,
-            "deepseek-v4.1-flash-expires-on-0910",
-            True,
-            0.00000044,
-            0.00000132,
-        ),
+        *[
+            (base_url, model, 1_048_576, 393_216, "deepseek-flash", True, 0.0000003, 0.0000012)
+            for base_url in (
+                "https://api.deepseek.com",
+                "https://hosted.example.invalid/api/llm/v1",
+            )
+            for model in (
+                "deepseek-flash",
+                "deepseek-v4-flash",
+                "deepseek-v4-flash-vision-exp",
+                "deepseek-v4.1-flash-expires-on-0910",
+            )
+        ],
         (
             "https://openrouter.ai/api/v1",
             "qwen/qwen3.8-max",
@@ -821,6 +812,7 @@ def test_official_catalog_covers_current_qwen_and_deepseek_routes(
     supports_vision: bool,
     input_cost: float,
     output_cost: float,
+    configured_hosted_api: str,
 ) -> None:
     meta = ModelRegistry(cfg=AppConfig(base_url=base_url, model=model)).get(model)
 
@@ -990,14 +982,14 @@ def test_official_anthropic_metadata_covers_opus_5_absent_from_the_snapshot() ->
     )
 
 
-def test_every_suggested_hosted_model_resolves_real_capacity() -> None:
+def test_every_suggested_hosted_model_resolves_real_capacity(configured_hosted_api: str) -> None:
     """No model a preset recommends may fall back to the unknown 128K/8K shape.
 
     A fallback here means the TUI would show the model with a shrunken context
     budget and a metadata warning on every turn (qwen3.7-plus, Cohere's
     default and OpenRouter's default all did this before 2026-09-02).
     """
-    from alysis_code.profile_presets import PROFILE_PRESETS
+    from alysis_code.profile_presets import PROFILE_PRESETS, make_profile_from_preset
 
     local_or_custom = {"ollama", "lm-studio", "vllm", "custom"}
     fallbacks: list[tuple[str, str]] = []
@@ -1005,7 +997,7 @@ def test_every_suggested_hosted_model_resolves_real_capacity() -> None:
         if preset.key in local_or_custom:
             continue
         for model in preset.suggested_models:
-            cfg = AppConfig(base_url=preset.base_url, model=model)
+            cfg = AppConfig(base_url=make_profile_from_preset(preset).base_url, model=model)
             meta = ModelRegistry(cfg=cfg).get(model, include_provider_auth=False)
             if any("fallback context/max_output" in warning for warning in meta.warnings):
                 fallbacks.append((preset.key, model))
@@ -1065,18 +1057,34 @@ def test_official_openai_metadata_overrides_pre_cut_snapshot_prices(
     )
 
 
-def test_built_in_mimo_metadata_uses_current_list_prices() -> None:
-    cfg = AppConfig(base_url="https://api.xiaomimimo.com/v1", model="mimo-v2.5-pro")
+@pytest.mark.parametrize(
+    ("model", "vision", "input_cost", "output_cost", "cache_read_cost"),
+    [
+        ("mimo-v2.6-pro", True, 0.000000435, 0.00000087, 0.0000000036),
+        ("mimo-v2.6-flash", True, 0.00000014, 0.00000028, 0.0000000028),
+        ("mimo-v2.6-pro-ultraspeed", True, 0.00000435, 0.0000087, 0.000000036),
+        ("mimo-v2.5-pro", False, 0.000000435, 0.00000087, 0.0000000036),
+        ("mimo-v2.5", True, 0.00000014, 0.00000028, 0.0000000028),
+    ],
+)
+def test_built_in_mimo_metadata_uses_current_list_prices(
+    model: str,
+    vision: bool,
+    input_cost: float,
+    output_cost: float,
+    cache_read_cost: float,
+) -> None:
+    cfg = AppConfig(base_url="https://api.xiaomimimo.com/v1", model=model)
+    meta = ModelRegistry(cfg=cfg).get(model)
 
-    pro = ModelRegistry(cfg=cfg).get("mimo-v2.5-pro")
-    omni = ModelRegistry(cfg=cfg).get("mimo-v2.5")
-
-    assert pro.context_window_tokens == 1_000_000
-    assert pro.input_cost_per_token == 0.000000435
-    assert pro.output_cost_per_token == 0.00000087
-    assert omni.supports_vision is True
-    assert omni.input_cost_per_token == 0.00000014
-    assert omni.output_cost_per_token == 0.00000028
+    assert meta.context_window_tokens == 1_000_000
+    assert meta.max_output_tokens == 131_072
+    assert meta.supports_vision is vision
+    assert meta.supports_reasoning is True
+    assert meta.input_cost_per_token == input_cost
+    assert meta.output_cost_per_token == output_cost
+    assert meta.cache_read_input_cost_per_token == cache_read_cost
+    assert not any("fallback context/max_output" in warning for warning in meta.warnings)
 
 
 def test_official_perplexity_agent_api_metadata_covers_hosted_routes() -> None:
@@ -1295,7 +1303,7 @@ def test_registry_records_bundled_catalog_error_and_fallback_warning(monkeypatch
     registry = ModelRegistry(cfg=cfg)
     meta = registry.get("gpt-5-nano")
     assert meta.context_window_tokens == 128000
-    assert meta.max_output_tokens == 8192
+    assert meta.max_output_tokens == 32_000
     assert registry.last_error == "bundled model catalog missing"
     assert any("fallback context/max_output" in warning for warning in meta.warnings)
 

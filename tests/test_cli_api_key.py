@@ -26,6 +26,7 @@ from alysis_code.agent.turn_contract import (
     TurnSemantics,
 )
 from alysis_code.agent_loop import SYSTEM_PROMPT, create_session
+from alysis_code.cancellation import InteractiveCancellationToken
 from alysis_code.cli import app as alysis_app
 from alysis_code.config import AppConfig, ConfigError
 from alysis_code.interactive_input_guard import interactive_prompt_guard
@@ -139,8 +140,8 @@ def test_create_session_prefers_repo_inferred_verify_commands_for_normal_chat_js
     try:
         assert session.effective_verification_commands == ["npm test"]
         assert session.verification_selection_source == "repo_scan.likely_test_commands"
-        assert session.verification_contract_type == "repo_native"
-        assert session.verification_authoritative is True
+        assert session.verification_contract_type == "selected"
+        assert session.verification_authoritative is False
     finally:
         session.close()
 
@@ -246,24 +247,17 @@ def test_create_session_skips_repo_scan_when_normal_chat_does_not_need_it(
         session.close()
 
 
-@pytest.mark.parametrize(
-    ("resolved_timeout_s", "expected_selector_timeout_s"),
-    [(44.0, 15.0), (7.0, 7.0)],
-)
-def test_create_session_bounds_selector_independently_from_main_and_compactor(
+@pytest.mark.parametrize("resolved_timeout_s", [44.0, 7.0])
+def test_create_session_applies_timeout_to_main_and_compactor_only(
     tmp_path: Path,
     monkeypatch,
     resolved_timeout_s: float,
-    expected_selector_timeout_s: float,
 ) -> None:
-    # The main and compactor use the resolved timeout while automatic skill
-    # selection gets an independent ceiling, including forced-SSE transports.
+    # Automatic skill choice adds no separate client or timeout policy.
     captured: list[dict[str, Any]] = []
     monkeypatch.setenv("ALYSIS_LLM_TIMEOUT_S", str(resolved_timeout_s))
 
     class FakeClient:
-        # Provisioning happens before runtime protocol compatibility is known;
-        # a no-tool main route must not suppress the independent selector.
         supports_tool_calling = False
 
         def __init__(self, **kwargs) -> None:  # type: ignore[no-untyped-def]
@@ -291,14 +285,9 @@ def test_create_session_bounds_selector_independently_from_main_and_compactor(
         session_log_dir_override=tmp_path / "sessions",
     )
     try:
-        assert len(captured) == 3
-        selector = next(item for item in captured if item["temperature"] == 0.0)
-        non_selectors = [item for item in captured if item is not selector]
-        assert selector["timeout_s"] == expected_selector_timeout_s
-        assert {item["timeout_s"] for item in non_selectors} == {resolved_timeout_s}
-        assert session.router_client.stream_no_progress_timeout_s == expected_selector_timeout_s
-        assert selector["enable_thinking"] is False
-        assert selector["reasoning_effort"] == ""
+        assert len(captured) == 2
+        assert {item["timeout_s"] for item in captured} == {resolved_timeout_s}
+        assert session.router_client is None
     finally:
         session.close()
 
@@ -418,8 +407,8 @@ def test_create_session_records_model_metadata_diagnostics_and_dedupes_same_mode
     surface = _Surface()
     session_id = "metadata-warn"
     sessions_dir = tmp_path / "sessions"
-    # The selector and compactor share the main model, exercising warning
-    # deduplication across all three active roles.
+    # The compactor shares the main model, exercising warning deduplication
+    # across the two active roles.
     session = create_session(
         cfg=AppConfig(model="unknown-model-xyz"),
         root=tmp_path,
@@ -443,7 +432,7 @@ def test_create_session_records_model_metadata_diagnostics_and_dedupes_same_mode
     payload = dict(session_start.get("payload") or {})
     diagnostics = list(payload.get("model_metadata_diagnostics") or [])
     assert payload["model_metadata_policy"] == "warn"
-    assert {item["role"] for item in diagnostics} == {"coding", "router", "compactor"}
+    assert {item["role"] for item in diagnostics} == {"coding", "compactor"}
     assert all(item["fallback_capacity_active"] is True for item in diagnostics)
     assert all("context_window_tokens" in item["fallback_capacity_fields"] for item in diagnostics)
     assert all("max_output_tokens" in item["fallback_capacity_fields"] for item in diagnostics)
@@ -645,12 +634,15 @@ def test_create_session_strict_model_metadata_policy_allows_override_backed_capa
 def test_agent_session_context_left_uses_model_window_and_effective_budget(
     tmp_path: Path,
 ) -> None:
+    from alysis_code.cli_impl.tui.footer import footer_fragments
+    from alysis_code.cli_impl.tui.state import TuiState
+
     cfg = AppConfig(model="custom-model", model_metadata_policy="strict")
     cfg.extra_fields = {
         "model_metadata_overrides": {
             "models": {
                 "custom-model": {
-                    "context_window_tokens": 10000,
+                    "context_window_tokens": 20000,
                     "max_output_tokens": 2000,
                 }
             }
@@ -694,6 +686,12 @@ def test_agent_session_context_left_uses_model_window_and_effective_budget(
         assert ctx.dynamic_context_used_tokens == 0
         assert ctx.dynamic_context_percent_left == 100.0
 
+        session._hud_context_cache = ctx
+        fresh_footer = footer_fragments(
+            TuiState(context_pct=cli_mod._chat_context_percent_value(session)), width=120
+        )
+        assert "context: 100% left" in "".join(text for _, text in fresh_footer)
+
         session.messages.append({"role": "user", "content": "additional context " * 100})
         grown_ctx = session.context_left()
         assert grown_ctx.startup_baseline_tokens == expected_used
@@ -703,6 +701,14 @@ def test_agent_session_context_left_uses_model_window_and_effective_budget(
         )
         assert grown_ctx.dynamic_context_percent_left is not None
         assert grown_ctx.dynamic_context_percent_left < 100.0
+        session._hud_context_cache = grown_ctx
+        grown_footer = footer_fragments(
+            TuiState(context_pct=cli_mod._chat_context_percent_value(session)), width=120
+        )
+        grown_text = "".join(text for _, text in grown_footer)
+        assert "context:" in grown_text
+        assert "context: 100% left" not in grown_text
+        assert "context: n/a" not in grown_text
     finally:
         session.close()
 
@@ -819,747 +825,6 @@ def test_create_session_adds_untrusted_prompt_prelude_without_replacing_system_p
         )
         assert "UNTRUSTED CUSTOM SUBAGENT GUIDANCE" in prelude_message
         assert "higher-priority system, developer, and direct user instructions" in prelude_message
-    finally:
-        session.close()
-
-
-def test_refresh_session_task_brief_adds_pinned_repo_context(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.delenv("ALYSIS_API_KEY", raising=False)
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-
-    repo = tmp_path / "repo"
-    _init_git_repo_with_commit(repo)
-
-    cfg = AppConfig(model="test-model")
-    session = create_session(
-        cfg=cfg,
-        root=repo,
-        mode="review",
-        yes=False,
-        max_steps=1,
-        no_log=True,
-        api_key_override="override-key",
-    )
-    try:
-        initial_task_brief = next(
-            (
-                str(message.get("content") or "")
-                for message in session.messages
-                if str(message.get("content") or "").startswith("<task_brief>")
-            ),
-            "",
-        )
-        original_pinned_prefix_len = session.pinned_prefix_len
-        refreshed = agent_loop_mod.refresh_session_task_brief_message(
-            session,
-            pending_instruction=(
-                "Fix src/parser.py without changing the CSV shape and keep the public API stable."
-            ),
-            turn_semantics=_workspace_turn_semantics(),
-        )
-        task_brief = next(
-            (
-                str(message.get("content") or "")
-                for message in session.messages
-                if str(message.get("content") or "").startswith("<task_brief>")
-            ),
-            "",
-        )
-        env_index = next(
-            idx
-            for idx, message in enumerate(session.messages)
-            if str(message.get("content") or "").startswith("<environment_context>")
-        )
-        task_brief_index = next(
-            idx
-            for idx, message in enumerate(session.messages)
-            if str(message.get("content") or "").startswith("<task_brief>")
-        )
-
-        assert "status: awaiting_substantive_repo_request" in initial_task_brief
-        assert refreshed is True
-        assert "Fix src/parser.py without changing the CSV shape" in task_brief
-        assert "keep the public API stable" in task_brief
-        assert task_brief_index < env_index
-        assert session.pinned_prefix_len == original_pinned_prefix_len
-        assert session.pinned_prefix_len == env_index + 1
-    finally:
-        session.close()
-
-
-def test_refresh_session_task_brief_refreshes_in_place_with_new_constraints(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    monkeypatch.delenv("ALYSIS_API_KEY", raising=False)
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-
-    repo = tmp_path / "repo"
-    _init_git_repo_with_commit(repo)
-
-    cfg = AppConfig(model="test-model")
-    session = create_session(
-        cfg=cfg,
-        root=repo,
-        mode="review",
-        yes=False,
-        max_steps=1,
-        no_log=True,
-        api_key_override="override-key",
-    )
-    try:
-        agent_loop_mod.refresh_session_task_brief_message(
-            session,
-            pending_instruction="Fix src/parser.py without changing the CSV shape.",
-            turn_semantics=_workspace_turn_semantics(),
-        )
-        session.messages.append(
-            {
-                "role": "user",
-                "content": "Fix src/parser.py without changing the CSV shape.",
-            }
-        )
-
-        refreshed = agent_loop_mod.refresh_session_task_brief_message(
-            session,
-            pending_instruction="Also preserve unknown values like pending and add a regression test in tests/test_parser.py.",
-            turn_semantics=_workspace_turn_semantics(relation=TurnRelation.REFINE),
-        )
-        task_brief_messages = [
-            str(message.get("content") or "")
-            for message in session.messages
-            if str(message.get("content") or "").startswith("<task_brief>")
-        ]
-
-        assert refreshed is True
-        assert len(task_brief_messages) == 1
-        assert "Also preserve unknown values like pending" in task_brief_messages[0]
-        assert "add a regression test in tests/test_parser.py" in task_brief_messages[0]
-        assert "Fix src/parser.py without changing the CSV shape." in task_brief_messages[0]
-        assert session.pinned_prefix_len == next(
-            idx + 1
-            for idx, message in enumerate(session.messages)
-            if str(message.get("content") or "").startswith("<environment_context>")
-        )
-    finally:
-        session.close()
-
-
-@pytest.mark.parametrize(
-    "follow_up",
-    [
-        "ok",
-        "can you elaborate",
-        "could you explain that a bit more",
-        "could you explain how this works without changing anything",
-        "sounds good thanks",
-        "sounds good\nplease continue",
-        "please continue",
-        "could you maybe elaborate on that a little more",
-        "please keep going and explain a bit more first",
-        "go ahead",
-    ],
-)
-def test_refresh_session_task_brief_keeps_existing_content_for_generic_follow_up(
-    tmp_path: Path,
-    monkeypatch,
-    follow_up: str,
-) -> None:
-    monkeypatch.delenv("ALYSIS_API_KEY", raising=False)
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-
-    repo = tmp_path / "repo"
-    _init_git_repo_with_commit(repo)
-
-    cfg = AppConfig(model="test-model")
-    session = create_session(
-        cfg=cfg,
-        root=repo,
-        mode="review",
-        yes=False,
-        max_steps=1,
-        no_log=True,
-        api_key_override="override-key",
-    )
-    try:
-        agent_loop_mod.refresh_session_task_brief_message(
-            session,
-            pending_instruction="Only touch src/parser.py and keep the public API unchanged.",
-            turn_semantics=_workspace_turn_semantics(),
-        )
-        original_task_brief = next(
-            str(message.get("content") or "")
-            for message in session.messages
-            if str(message.get("content") or "").startswith("<task_brief>")
-        )
-
-        refreshed = agent_loop_mod.refresh_session_task_brief_message(
-            session,
-            pending_instruction=follow_up,
-            turn_semantics=_workspace_turn_semantics(
-                outcome=TurnOutcome.INSPECT,
-                relation=TurnRelation.EXPLAIN_PRIOR,
-            ),
-        )
-        task_brief_messages = [
-            str(message.get("content") or "")
-            for message in session.messages
-            if str(message.get("content") or "").startswith("<task_brief>")
-        ]
-
-        assert refreshed is False
-        assert len(task_brief_messages) == 1
-        assert task_brief_messages[0] == original_task_brief
-    finally:
-        session.close()
-
-
-@pytest.mark.parametrize(
-    "follow_up",
-    [
-        "sounds good\nplease continue",
-        "could you maybe elaborate on that a little more",
-        "could you explain how this works without changing anything",
-        "please keep going and explain a bit more first",
-    ],
-)
-def test_refresh_session_task_brief_keeps_placeholder_for_generic_follow_up_without_task(
-    tmp_path: Path,
-    monkeypatch,
-    follow_up: str,
-) -> None:
-    monkeypatch.delenv("ALYSIS_API_KEY", raising=False)
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-
-    repo = tmp_path / "repo"
-    _init_git_repo_with_commit(repo)
-
-    cfg = AppConfig(model="test-model")
-    session = create_session(
-        cfg=cfg,
-        root=repo,
-        mode="review",
-        yes=False,
-        max_steps=1,
-        no_log=True,
-        api_key_override="override-key",
-    )
-    try:
-        original_task_brief = next(
-            str(message.get("content") or "")
-            for message in session.messages
-            if str(message.get("content") or "").startswith("<task_brief>")
-        )
-
-        refreshed = agent_loop_mod.refresh_session_task_brief_message(
-            session,
-            pending_instruction=follow_up,
-            turn_semantics=_workspace_turn_semantics(
-                outcome=TurnOutcome.ANSWER,
-                relation=TurnRelation.ACKNOWLEDGE,
-            ),
-            route="general",
-        )
-        task_brief_messages = [
-            str(message.get("content") or "")
-            for message in session.messages
-            if str(message.get("content") or "").startswith("<task_brief>")
-        ]
-
-        assert refreshed is False
-        assert len(task_brief_messages) == 1
-        assert task_brief_messages[0] == original_task_brief
-        assert "status: awaiting_substantive_repo_request" in task_brief_messages[0]
-    finally:
-        session.close()
-
-
-def test_refresh_session_task_brief_keeps_anchored_focus_over_unanchored_constraint(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    monkeypatch.delenv("ALYSIS_API_KEY", raising=False)
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-
-    repo = tmp_path / "repo"
-    _init_git_repo_with_commit(repo)
-
-    cfg = AppConfig(model="test-model")
-    session = create_session(
-        cfg=cfg,
-        root=repo,
-        mode="review",
-        yes=False,
-        max_steps=1,
-        no_log=True,
-        api_key_override="override-key",
-    )
-    try:
-        agent_loop_mod.refresh_session_task_brief_message(
-            session,
-            pending_instruction="Fix src/parser.py without changing the CSV shape.",
-            turn_semantics=_workspace_turn_semantics(),
-        )
-        session.messages.append(
-            {
-                "role": "user",
-                "content": "Fix src/parser.py without changing the CSV shape.",
-            }
-        )
-
-        refreshed = agent_loop_mod.refresh_session_task_brief_message(
-            session,
-            pending_instruction="Also preserve unknown values like pending.",
-            turn_semantics=_workspace_turn_semantics(relation=TurnRelation.REFINE),
-        )
-        task_brief_messages = [
-            str(message.get("content") or "")
-            for message in session.messages
-            if str(message.get("content") or "").startswith("<task_brief>")
-        ]
-        task_brief_lines = task_brief_messages[0].splitlines()
-
-        assert refreshed is True
-        assert len(task_brief_messages) == 1
-        assert task_brief_lines[2] == "current_focus:"
-        assert task_brief_lines[3] == "- Fix src/parser.py without changing the CSV shape."
-        assert "recent_user_constraints:" in task_brief_messages[0]
-        assert "- Also preserve unknown values like pending." in task_brief_messages[0]
-    finally:
-        session.close()
-
-
-def test_refresh_session_task_brief_keeps_short_meaningful_constraint(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    monkeypatch.delenv("ALYSIS_API_KEY", raising=False)
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-
-    repo = tmp_path / "repo"
-    _init_git_repo_with_commit(repo)
-
-    cfg = AppConfig(model="test-model")
-    session = create_session(
-        cfg=cfg,
-        root=repo,
-        mode="review",
-        yes=False,
-        max_steps=1,
-        no_log=True,
-        api_key_override="override-key",
-    )
-    try:
-        agent_loop_mod.refresh_session_task_brief_message(
-            session,
-            pending_instruction="Fix src/parser.py without changing the CSV shape.",
-            turn_semantics=_workspace_turn_semantics(),
-        )
-        session.messages.append(
-            {
-                "role": "user",
-                "content": "Fix src/parser.py without changing the CSV shape.",
-            }
-        )
-
-        refreshed = agent_loop_mod.refresh_session_task_brief_message(
-            session,
-            pending_instruction="Keep API stable.",
-            turn_semantics=_workspace_turn_semantics(relation=TurnRelation.REFINE),
-        )
-        task_brief = next(
-            str(message.get("content") or "")
-            for message in session.messages
-            if str(message.get("content") or "").startswith("<task_brief>")
-        )
-
-        assert refreshed is True
-        assert "- Fix src/parser.py without changing the CSV shape." in task_brief
-        assert "recent_user_constraints:" in task_brief
-        assert "- Keep API stable." in task_brief
-    finally:
-        session.close()
-
-
-def test_refresh_session_task_brief_keeps_concise_real_constraint(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    monkeypatch.delenv("ALYSIS_API_KEY", raising=False)
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-
-    repo = tmp_path / "repo"
-    _init_git_repo_with_commit(repo)
-
-    cfg = AppConfig(model="test-model")
-    session = create_session(
-        cfg=cfg,
-        root=repo,
-        mode="review",
-        yes=False,
-        max_steps=1,
-        no_log=True,
-        api_key_override="override-key",
-    )
-    try:
-        agent_loop_mod.refresh_session_task_brief_message(
-            session,
-            pending_instruction="Fix src/parser.py without changing the CSV shape.",
-            turn_semantics=_workspace_turn_semantics(),
-        )
-        session.messages.append(
-            {
-                "role": "user",
-                "content": "Fix src/parser.py without changing the CSV shape.",
-            }
-        )
-
-        refreshed = agent_loop_mod.refresh_session_task_brief_message(
-            session,
-            pending_instruction="Handle empty lines too.",
-            turn_semantics=_workspace_turn_semantics(relation=TurnRelation.REFINE),
-        )
-        task_brief = next(
-            str(message.get("content") or "")
-            for message in session.messages
-            if str(message.get("content") or "").startswith("<task_brief>")
-        )
-
-        assert refreshed is True
-        assert "- Fix src/parser.py without changing the CSV shape." in task_brief
-        assert "recent_user_constraints:" in task_brief
-        assert "- Handle empty lines too." in task_brief
-    finally:
-        session.close()
-
-
-def test_refresh_session_task_brief_promotes_strong_unanchored_task_shift(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    monkeypatch.delenv("ALYSIS_API_KEY", raising=False)
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-
-    repo = tmp_path / "repo"
-    _init_git_repo_with_commit(repo)
-
-    cfg = AppConfig(model="test-model")
-    session = create_session(
-        cfg=cfg,
-        root=repo,
-        mode="review",
-        yes=False,
-        max_steps=1,
-        no_log=True,
-        api_key_override="override-key",
-    )
-    try:
-        agent_loop_mod.refresh_session_task_brief_message(
-            session,
-            pending_instruction="Fix src/parser.py without changing the CSV shape.",
-            turn_semantics=_workspace_turn_semantics(),
-        )
-        session.messages.append(
-            {
-                "role": "user",
-                "content": "Fix src/parser.py without changing the CSV shape.",
-            }
-        )
-
-        refreshed = agent_loop_mod.refresh_session_task_brief_message(
-            session,
-            pending_instruction="Actually add a regression test and keep API stable.",
-            turn_semantics=_workspace_turn_semantics(relation=TurnRelation.NEW),
-        )
-        task_brief_lines = next(
-            str(message.get("content") or "").splitlines()
-            for message in session.messages
-            if str(message.get("content") or "").startswith("<task_brief>")
-        )
-
-        assert refreshed is True
-        assert task_brief_lines[2] == "current_focus:"
-        assert task_brief_lines[3] == "- Actually add a regression test and keep API stable."
-        assert "- Fix src/parser.py without changing the CSV shape." not in task_brief_lines
-    finally:
-        session.close()
-
-
-@pytest.mark.parametrize(
-    "follow_up",
-    [
-        "Can you explain more about src/parser.py?",
-        "How does src/parser.py work?",
-        "Can you explain `normalize_rows` more?",
-    ],
-)
-def test_refresh_session_task_brief_keeps_existing_focus_for_anchored_explanatory_follow_up(
-    tmp_path: Path,
-    monkeypatch,
-    follow_up: str,
-) -> None:
-    monkeypatch.delenv("ALYSIS_API_KEY", raising=False)
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-
-    repo = tmp_path / "repo"
-    _init_git_repo_with_commit(repo)
-
-    cfg = AppConfig(model="test-model")
-    session = create_session(
-        cfg=cfg,
-        root=repo,
-        mode="review",
-        yes=False,
-        max_steps=1,
-        no_log=True,
-        api_key_override="override-key",
-    )
-    try:
-        agent_loop_mod.refresh_session_task_brief_message(
-            session,
-            pending_instruction=(
-                "Fix src/parser.py without changing the CSV shape. Keep the public API stable."
-            ),
-            turn_semantics=_workspace_turn_semantics(),
-        )
-        original_task_brief = next(
-            str(message.get("content") or "")
-            for message in session.messages
-            if str(message.get("content") or "").startswith("<task_brief>")
-        )
-        session.messages.append(
-            {
-                "role": "user",
-                "content": (
-                    "Fix src/parser.py without changing the CSV shape. Keep the public API stable."
-                ),
-            }
-        )
-
-        refreshed = agent_loop_mod.refresh_session_task_brief_message(
-            session,
-            pending_instruction=follow_up,
-            turn_semantics=_workspace_turn_semantics(
-                outcome=TurnOutcome.INSPECT,
-                relation=TurnRelation.EXPLAIN_PRIOR,
-            ),
-        )
-        task_brief = next(
-            str(message.get("content") or "")
-            for message in session.messages
-            if str(message.get("content") or "").startswith("<task_brief>")
-        )
-
-        assert refreshed is False
-        assert "current_focus:" in task_brief
-        assert (
-            "- Fix src/parser.py without changing the CSV shape. Keep the public API stable."
-            in task_brief
-        )
-        assert follow_up not in task_brief
-        assert task_brief == original_task_brief
-    finally:
-        session.close()
-
-
-def test_refresh_session_task_brief_initializes_from_first_explanatory_repo_request(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    monkeypatch.delenv("ALYSIS_API_KEY", raising=False)
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-
-    repo = tmp_path / "repo"
-    _init_git_repo_with_commit(repo)
-
-    cfg = AppConfig(model="test-model")
-    session = create_session(
-        cfg=cfg,
-        root=repo,
-        mode="review",
-        yes=False,
-        max_steps=1,
-        no_log=True,
-        api_key_override="override-key",
-    )
-    try:
-        refreshed = agent_loop_mod.refresh_session_task_brief_message(
-            session,
-            pending_instruction="How does src/parser.py work?",
-            turn_semantics=_workspace_turn_semantics(
-                outcome=TurnOutcome.INSPECT,
-                relation=TurnRelation.NEW,
-            ),
-        )
-        task_brief = next(
-            str(message.get("content") or "")
-            for message in session.messages
-            if str(message.get("content") or "").startswith("<task_brief>")
-        )
-
-        assert refreshed is True
-        assert "current_focus:" in task_brief
-        assert "- How does src/parser.py work?" in task_brief
-    finally:
-        session.close()
-
-
-def test_refresh_session_task_brief_promotes_real_anchored_execution_follow_up(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    monkeypatch.delenv("ALYSIS_API_KEY", raising=False)
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-
-    repo = tmp_path / "repo"
-    _init_git_repo_with_commit(repo)
-
-    cfg = AppConfig(model="test-model")
-    session = create_session(
-        cfg=cfg,
-        root=repo,
-        mode="review",
-        yes=False,
-        max_steps=1,
-        no_log=True,
-        api_key_override="override-key",
-    )
-    try:
-        agent_loop_mod.refresh_session_task_brief_message(
-            session,
-            pending_instruction="Fix src/parser.py without changing the CSV shape.",
-            turn_semantics=_workspace_turn_semantics(),
-        )
-        session.messages.append(
-            {
-                "role": "user",
-                "content": "Fix src/parser.py without changing the CSV shape.",
-            }
-        )
-
-        refreshed = agent_loop_mod.refresh_session_task_brief_message(
-            session,
-            pending_instruction="Only touch src/parser.py and tests/test_parser.py.",
-            turn_semantics=_workspace_turn_semantics(relation=TurnRelation.REFINE),
-        )
-        task_brief = next(
-            str(message.get("content") or "")
-            for message in session.messages
-            if str(message.get("content") or "").startswith("<task_brief>")
-        )
-
-        assert refreshed is True
-        assert "current_focus:" in task_brief
-        assert "- Fix src/parser.py without changing the CSV shape." in task_brief
-        assert "recent_user_constraints:" in task_brief
-        assert "- Only touch src/parser.py and tests/test_parser.py." in task_brief
-    finally:
-        session.close()
-
-
-def test_refresh_session_task_brief_adds_pinned_plain_dir_context(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    monkeypatch.delenv("ALYSIS_API_KEY", raising=False)
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-
-    cfg = AppConfig(model="test-model")
-    session = create_session(
-        cfg=cfg,
-        root=tmp_path,
-        mode="review",
-        yes=False,
-        max_steps=1,
-        no_log=True,
-        api_key_override="override-key",
-    )
-    try:
-        initial_task_brief = next(
-            (
-                str(message.get("content") or "")
-                for message in session.messages
-                if str(message.get("content") or "").startswith("<task_brief>")
-            ),
-            "",
-        )
-        original_pinned_prefix_len = session.pinned_prefix_len
-        refreshed = agent_loop_mod.refresh_session_task_brief_message(
-            session,
-            pending_instruction="Create timer.py here and keep the output simple.",
-            turn_semantics=_workspace_turn_semantics(),
-        )
-        task_brief = next(
-            (
-                str(message.get("content") or "")
-                for message in session.messages
-                if str(message.get("content") or "").startswith("<task_brief>")
-            ),
-            "",
-        )
-        env_index = next(
-            idx
-            for idx, message in enumerate(session.messages)
-            if str(message.get("content") or "").startswith("<environment_context>")
-        )
-        task_brief_index = next(
-            idx
-            for idx, message in enumerate(session.messages)
-            if str(message.get("content") or "").startswith("<task_brief>")
-        )
-
-        assert "status: awaiting_substantive_repo_request" in initial_task_brief
-        assert refreshed is True
-        assert "Create timer.py here and keep the output simple." in task_brief
-        assert task_brief_index < env_index
-        assert session.pinned_prefix_len == original_pinned_prefix_len
-        assert session.pinned_prefix_len == env_index + 1
-    finally:
-        session.close()
-
-
-def test_refresh_session_task_brief_keeps_placeholder_for_plain_dir_anchored_advisory_without_task(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    monkeypatch.delenv("ALYSIS_API_KEY", raising=False)
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-
-    cfg = AppConfig(model="test-model")
-    session = create_session(
-        cfg=cfg,
-        root=tmp_path,
-        mode="review",
-        yes=False,
-        max_steps=1,
-        no_log=True,
-        api_key_override="override-key",
-    )
-    try:
-        original_task_brief = next(
-            str(message.get("content") or "")
-            for message in session.messages
-            if str(message.get("content") or "").startswith("<task_brief>")
-        )
-
-        refreshed = agent_loop_mod.refresh_session_task_brief_message(
-            session,
-            pending_instruction="Can you explain `asyncio.gather` more?",
-            turn_semantics=_workspace_turn_semantics(
-                outcome=TurnOutcome.ANSWER,
-                relation=TurnRelation.NEW,
-            ),
-            route="general",
-        )
-        task_brief = next(
-            str(message.get("content") or "")
-            for message in session.messages
-            if str(message.get("content") or "").startswith("<task_brief>")
-        )
-
-        assert refreshed is False
-        assert task_brief == original_task_brief
-        assert "status: awaiting_substantive_repo_request" in task_brief
     finally:
         session.close()
 
@@ -2010,7 +1275,10 @@ def test_run_uses_infrastructure_exit_code_after_transient_llm_retries_exhaust(
     )
 
     assert result.exit_code == INFRASTRUCTURE_FAILURE_EXIT_CODE
-    assert "Infrastructure error after retries" in result.output
+    # Raised straight from run_agent, so no retry loop recorded any counts;
+    # the label must not claim that retries happened.
+    assert "Infrastructure error:" in result.output
+    assert "after retries" not in result.output
 
 
 def test_run_keeps_permanent_provider_rejections_as_real_failures(
@@ -2785,7 +2053,9 @@ def test_chat_image_command_queues_for_next_turn(tmp_path: Path, monkeypatch) ->
     class _DummySession:
         store = _DummyStore()
 
-        def run_turn(self, _instruction: str, *, image_paths: list[str] | None = None) -> int:
+        def run_turn(
+            self, _instruction: str, *, image_paths: list[str] | None = None, **_kwargs: object
+        ) -> int:
             captured["image_paths"] = image_paths
             return 0
 
@@ -2822,7 +2092,9 @@ def test_chat_image_command_without_path_pastes_clipboard(tmp_path: Path, monkey
     class _DummySession:
         store = _DummyStore()
 
-        def run_turn(self, _instruction: str, *, image_paths: list[str] | None = None) -> int:
+        def run_turn(
+            self, _instruction: str, *, image_paths: list[str] | None = None, **_kwargs: object
+        ) -> int:
             captured["image_paths"] = image_paths
             return 0
 
@@ -2867,7 +2139,9 @@ def test_chat_paste_image_command_queues_for_next_turn(tmp_path: Path, monkeypat
     class _DummySession:
         store = _DummyStore()
 
-        def run_turn(self, _instruction: str, *, image_paths: list[str] | None = None) -> int:
+        def run_turn(
+            self, _instruction: str, *, image_paths: list[str] | None = None, **_kwargs: object
+        ) -> int:
             captured["image_paths"] = image_paths
             return 0
 
@@ -2929,7 +2203,9 @@ def test_chat_trace_command_updates_reasoning_level_for_following_turn(
         stream = True
         mode = "review"
 
-        def run_turn(self, _instruction: str, *, image_paths: list[str] | None = None) -> int:
+        def run_turn(
+            self, _instruction: str, *, image_paths: list[str] | None = None, **_kwargs: object
+        ) -> int:
             captured["trace"] = self.surface.trace_level
             return 0
 
@@ -3007,7 +2283,9 @@ def test_chat_trace_command_without_arg_uses_picker_selection(tmp_path: Path, mo
         stream = False
         mode = "review"
 
-        def run_turn(self, _instruction: str, *, image_paths: list[str] | None = None) -> int:
+        def run_turn(
+            self, _instruction: str, *, image_paths: list[str] | None = None, **_kwargs: object
+        ) -> int:
             captured["trace"] = self.surface.trace_level
             return 0
 
@@ -3059,7 +2337,9 @@ def test_chat_model_command_updates_model_for_following_turn(tmp_path: Path, mon
         stream = False
         mode = "review"
 
-        def run_turn(self, _instruction: str, *, image_paths: list[str] | None = None) -> int:
+        def run_turn(
+            self, _instruction: str, *, image_paths: list[str] | None = None, **_kwargs: object
+        ) -> int:
             captured["model"] = self.client.model
             return 0
 
@@ -3107,7 +2387,9 @@ def test_chat_mode_command_updates_mode_for_following_turn(tmp_path: Path, monke
         stream = False
         mode = "review"
 
-        def run_turn(self, _instruction: str, *, image_paths: list[str] | None = None) -> int:
+        def run_turn(
+            self, _instruction: str, *, image_paths: list[str] | None = None, **_kwargs: object
+        ) -> int:
             captured["mode"] = self.mode
             return 0
 
@@ -3136,7 +2418,7 @@ def test_chat_mode_command_updates_mode_for_following_turn(tmp_path: Path, monke
     result = runner.invoke(
         alysis_app,
         ["chat", "--model", "test-model", "--api-key", "k", "--no-log"],
-        input="/mode auto\nhello\nexit\n",
+        input="/permissions auto\nhello\nexit\n",
         env=env,
     )
     assert result.exit_code == 0
@@ -3204,7 +2486,9 @@ def test_chat_mode_command_refreshes_environment_context_message(
             {"role": "user", "content": "<other_pin>\nkeep me\n</other_pin>\n"},
         ]
 
-        def run_turn(self, _instruction: str, *, image_paths: list[str] | None = None) -> int:
+        def run_turn(
+            self, _instruction: str, *, image_paths: list[str] | None = None, **_kwargs: object
+        ) -> int:
             _ = image_paths
             return 0
 
@@ -3235,7 +2519,7 @@ def test_chat_mode_command_refreshes_environment_context_message(
     result = runner.invoke(
         alysis_app,
         ["chat", "--model", "test-model", "--api-key", "k", "--no-log"],
-        input="/mode auto\nhello\nexit\n",
+        input="/permissions auto\nhello\nexit\n",
         env=env,
     )
     assert result.exit_code == 0
@@ -3246,10 +2530,12 @@ def test_chat_mode_command_refreshes_environment_context_message(
     )
 
 
-def test_plan_mode_commands_refresh_environment_context_message(
+def test_persona_clamp_and_restore_refresh_environment_context_message(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
+    # The ask persona clamps the session to readonly and code restores the
+    # base mode; both transitions must refresh the pinned environment context.
     runner = CliRunner()
     refreshed_messages: list[str] = []
 
@@ -3306,7 +2592,9 @@ def test_plan_mode_commands_refresh_environment_context_message(
         ]
 
         @staticmethod
-        def run_turn(_instruction: str, *, image_paths: list[str] | None = None) -> int:
+        def run_turn(
+            _instruction: str, *, image_paths: list[str] | None = None, **_kwargs: object
+        ) -> int:
             _ = image_paths
             return 0
 
@@ -3333,10 +2621,12 @@ def test_plan_mode_commands_refresh_environment_context_message(
     result = runner.invoke(
         alysis_app,
         ["chat", "--model", "test-model", "--api-key", "k", "--no-log"],
-        input="/plan on\n/plan off\nexit\n",
+        input="/persona ask\n/persona code\nexit\n",
         env=env,
     )
     assert result.exit_code == 0
+    assert "Persona set for this session: ask" in result.output
+    assert "Persona set for this session: code" in result.output
     assert len(refreshed_messages) == 2
     assert "mode: readonly" in refreshed_messages[0]
     assert "mode: review" in refreshed_messages[1]
@@ -3359,7 +2649,9 @@ def test_chat_mode_command_accepts_friendly_alias(tmp_path: Path, monkeypatch) -
         stream = False
         mode = "review"
 
-        def run_turn(self, _instruction: str, *, image_paths: list[str] | None = None) -> int:
+        def run_turn(
+            self, _instruction: str, *, image_paths: list[str] | None = None, **_kwargs: object
+        ) -> int:
             captured["mode"] = self.mode
             return 0
 
@@ -3388,7 +2680,7 @@ def test_chat_mode_command_accepts_friendly_alias(tmp_path: Path, monkeypatch) -
     result = runner.invoke(
         alysis_app,
         ["chat", "--model", "test-model", "--api-key", "k", "--no-log"],
-        input="/mode fast\nhello\nexit\n",
+        input="/permissions fast\nhello\nexit\n",
         env=env,
     )
     assert result.exit_code == 0
@@ -3413,7 +2705,9 @@ def test_chat_mode_command_without_arg_uses_picker_selection(tmp_path: Path, mon
         stream = False
         mode = "review"
 
-        def run_turn(self, _instruction: str, *, image_paths: list[str] | None = None) -> int:
+        def run_turn(
+            self, _instruction: str, *, image_paths: list[str] | None = None, **_kwargs: object
+        ) -> int:
             captured["mode"] = self.mode
             return 0
 
@@ -3447,7 +2741,7 @@ def test_chat_mode_command_without_arg_uses_picker_selection(tmp_path: Path, mon
     result = runner.invoke(
         alysis_app,
         ["chat", "--model", "test-model", "--api-key", "k", "--no-log"],
-        input="/mode\nhello\nexit\n",
+        input="/permissions\nhello\nexit\n",
         env=env,
     )
     assert result.exit_code == 0
@@ -3472,7 +2766,9 @@ def test_chat_mode_command_without_arg_falls_back_to_panel(tmp_path: Path, monke
         stream = False
         mode = "review"
 
-        def run_turn(self, _instruction: str, *, image_paths: list[str] | None = None) -> int:
+        def run_turn(
+            self, _instruction: str, *, image_paths: list[str] | None = None, **_kwargs: object
+        ) -> int:
             captured["mode"] = self.mode
             return 0
 
@@ -3506,11 +2802,11 @@ def test_chat_mode_command_without_arg_falls_back_to_panel(tmp_path: Path, monke
     result = runner.invoke(
         alysis_app,
         ["chat", "--model", "test-model", "--api-key", "k", "--no-log"],
-        input="/mode\nhello\nexit\n",
+        input="/permissions\nhello\nexit\n",
         env=env,
     )
     assert result.exit_code == 0
-    assert "Mode Options" in result.output
+    assert "Permissions (current:" in result.output
     assert "mode" not in rebuilt
     assert captured["mode"] == "review"
 
@@ -3527,7 +2823,9 @@ def test_removed_onboarding_commands_are_unknown(tmp_path: Path, monkeypatch) ->
         stream = False
         mode = "review"
 
-        def run_turn(self, instruction: str, *, image_paths: list[str] | None = None) -> int:
+        def run_turn(
+            self, instruction: str, *, image_paths: list[str] | None = None, **_kwargs: object
+        ) -> int:
             captured["instruction"] = instruction
             return 0
 
@@ -3618,7 +2916,9 @@ def test_chat_usage_and_context_commands_are_handled(tmp_path: Path, monkeypatch
         def context_left(self) -> _DummyContext:
             return _DummyContext()
 
-        def run_turn(self, instruction: str, *, image_paths: list[str] | None = None) -> int:
+        def run_turn(
+            self, instruction: str, *, image_paths: list[str] | None = None, **_kwargs: object
+        ) -> int:
             captured["instruction"] = instruction
             return 0
 
@@ -3682,6 +2982,7 @@ def test_chat_turn_usage_line_formats_compact_totals_and_context_warning() -> No
         None,
     )
     assert cli_mod._chat_turn_usage_style(session) == "dim"
+    assert cli_mod._chat_context_hud_value(session) == "99.4%"
 
     session._hud_context_cache = SimpleNamespace(
         percent_left=72.2,
@@ -3690,10 +2991,11 @@ def test_chat_turn_usage_line_formats_compact_totals_and_context_warning() -> No
     )
     assert cli_mod._chat_turn_usage_line(session) == (
         "153.8k [dim]tokens[/dim]   [dim]↓[/dim] 150.3k   "
-        "[dim]↑[/dim] 3,422   [dim]context left:[/dim] 8.5%",
+        "[dim]↑[/dim] 3,422   [dim]context left:[/dim] 93.3%",
         "\u26a0\ufe0e  Critical input budget — run /compact to reduce context",
     )
     assert cli_mod._chat_turn_usage_style(session) == "bold red"
+    assert cli_mod._chat_context_hud_value(session) == "93.3% !!"
 
     session._hud_context_cache = SimpleNamespace(
         percent_left=55.0,
@@ -3704,10 +3006,11 @@ def test_chat_turn_usage_line_formats_compact_totals_and_context_warning() -> No
         "153.8k [dim]tokens[/dim]   "
         "[dim]↓[/dim] 150.3k   "
         "[dim]↑[/dim] 3,422   "
-        "[dim]context left:[/dim] 15.0%",
+        "[dim]context left:[/dim] 44.0%",
         "\u26a0\ufe0e  Low input budget — run /compact to reduce context",
     )
     assert cli_mod._chat_turn_usage_style(session) == "yellow"
+    assert cli_mod._chat_context_hud_value(session) == "44.0% !"
 
     session._hud_context_cache = SimpleNamespace(percent_left=None)
     assert cli_mod._chat_turn_usage_line(session) == (
@@ -3771,6 +3074,7 @@ def test_chat_compact_command_forces_compaction(tmp_path: Path, monkeypatch) -> 
             main_model: str,
             cache_policy: dict[str, Any] | None = None,
             focus: str | None = None,
+            request_messages_builder: Any = None,
         ) -> tuple[list[dict[str, Any]], bool]:
             captured["focus"] = focus
             captured["main_model"] = main_model
@@ -3812,7 +3116,9 @@ def test_chat_compact_command_forces_compaction(tmp_path: Path, monkeypatch) -> 
         def context_left(self) -> _DummyContext:
             return _DummyContext()
 
-        def run_turn(self, _instruction: str, *, image_paths: list[str] | None = None) -> int:
+        def run_turn(
+            self, _instruction: str, *, image_paths: list[str] | None = None, **_kwargs: object
+        ) -> int:
             captured["run_turn_called"] = True
             _ = image_paths
             return 0
@@ -4068,8 +3374,9 @@ def test_chat_compact_nothing_to_compact_prints_message(tmp_path: Path, monkeypa
             main_model: str,
             cache_policy: dict[str, Any] | None = None,
             focus: str | None = None,
+            request_messages_builder: Any = None,
         ) -> tuple[list[dict[str, Any]], bool]:
-            _ = tool_list, main_model, cache_policy, focus
+            _ = tool_list, main_model, cache_policy, focus, request_messages_builder
             return messages, False
 
     class _DummyContext:
@@ -4170,7 +3477,9 @@ def test_chat_usage_hud_off_keeps_usage_tracking(tmp_path: Path, monkeypatch) ->
         def context_left(self) -> _DummyContext:
             return _DummyContext()
 
-        def run_turn(self, _instruction: str, *, image_paths: list[str] | None = None) -> int:
+        def run_turn(
+            self, _instruction: str, *, image_paths: list[str] | None = None, **_kwargs: object
+        ) -> int:
             _ = image_paths
             return 0
 
@@ -4214,7 +3523,9 @@ def test_chat_usage_hud_subcommand_without_arg_uses_picker_selection(
         stream = False
         mode = "review"
 
-        def run_turn(self, _instruction: str, *, image_paths: list[str] | None = None) -> int:
+        def run_turn(
+            self, _instruction: str, *, image_paths: list[str] | None = None, **_kwargs: object
+        ) -> int:
             captured["usage_hud_enabled"] = bool(getattr(self, "_usage_hud_enabled", True))
             return 0
 
@@ -4257,7 +3568,9 @@ def test_chat_removed_usage_hud_command_suggests_usage(tmp_path: Path, monkeypat
         stream = False
         mode = "review"
 
-        def run_turn(self, _instruction: str, *, image_paths: list[str] | None = None) -> int:
+        def run_turn(
+            self, _instruction: str, *, image_paths: list[str] | None = None, **_kwargs: object
+        ) -> int:
             _ = image_paths
             return 0
 
@@ -4299,7 +3612,9 @@ def test_chat_toolbar_command_shows_updates_and_resets_session_items(
         stream = False
         mode = "review"
 
-        def run_turn(self, _instruction: str, *, image_paths: list[str] | None = None) -> int:
+        def run_turn(
+            self, _instruction: str, *, image_paths: list[str] | None = None, **_kwargs: object
+        ) -> int:
             captured["toolbar_items"] = list(self.cfg.toolbar_items)
             return 0
 
@@ -4749,11 +4064,11 @@ def test_chat_unknown_command_suggests_closest_match(tmp_path: Path, monkeypatch
     result = runner.invoke(
         alysis_app,
         ["chat", "--model", "test-model", "--api-key", "k", "--no-log"],
-        input="/mod\nexit\n",
+        input="/permissons\nexit\n",
         env=env,
     )
     assert result.exit_code == 0
-    assert "Did you mean /mode?" in result.output
+    assert "Did you mean /permissions?" in result.output
 
 
 def test_chat_removed_help_aliases_and_colon_picker_fall_through(
@@ -4768,7 +4083,9 @@ def test_chat_removed_help_aliases_and_colon_picker_fall_through(
     class _DummySession:
         store = _DummyStore()
 
-        def run_turn(self, instruction: str, *, image_paths: list[str] | None = None) -> int:
+        def run_turn(
+            self, instruction: str, *, image_paths: list[str] | None = None, **_kwargs: object
+        ) -> int:
             captured["instruction"] = instruction
             return 0
 
@@ -4814,7 +4131,9 @@ def test_chat_mode_command_accepts_numeric_shortcut(tmp_path: Path, monkeypatch)
         stream = False
         mode = "review"
 
-        def run_turn(self, _instruction: str, *, image_paths: list[str] | None = None) -> int:
+        def run_turn(
+            self, _instruction: str, *, image_paths: list[str] | None = None, **_kwargs: object
+        ) -> int:
             captured["mode"] = self.mode
             return 0
 
@@ -4843,7 +4162,7 @@ def test_chat_mode_command_accepts_numeric_shortcut(tmp_path: Path, monkeypatch)
     result = runner.invoke(
         alysis_app,
         ["chat", "--model", "test-model", "--api-key", "k", "--no-log"],
-        input="/mode 2\nhello\nexit\n",
+        input="/permissions 2\nhello\nexit\n",
         env=env,
     )
     assert result.exit_code == 0
@@ -4869,7 +4188,9 @@ def test_chat_mode_command_accepts_fullaccess_numeric_alias(tmp_path: Path, monk
         stream = False
         mode = "review"
 
-        def run_turn(self, _instruction: str, *, image_paths: list[str] | None = None) -> int:
+        def run_turn(
+            self, _instruction: str, *, image_paths: list[str] | None = None, **_kwargs: object
+        ) -> int:
             captured["mode"] = self.mode
             return 0
 
@@ -4898,7 +4219,7 @@ def test_chat_mode_command_accepts_fullaccess_numeric_alias(tmp_path: Path, monk
     result = runner.invoke(
         alysis_app,
         ["chat", "--model", "test-model", "--api-key", "k", "--no-log"],
-        input="/mode 4\nhello\nexit\n",
+        input="/permissions 4\nhello\nexit\n",
         env=env,
     )
     assert result.exit_code == 0
@@ -4919,7 +4240,9 @@ def test_chat_turn_keyboard_interrupt_is_handled(tmp_path: Path, monkeypatch) ->
         stream = False
         mode = "review"
 
-        def run_turn(self, _instruction: str, *, image_paths: list[str] | None = None) -> int:
+        def run_turn(
+            self, _instruction: str, *, image_paths: list[str] | None = None, **_kwargs: object
+        ) -> int:
             calls["run_turn"] += 1
             raise KeyboardInterrupt
 
@@ -4976,7 +4299,9 @@ def test_chat_turn_keyboard_interrupt_finishes_surface_activity(
         mode = "review"
         surface = _DummySurface()
 
-        def run_turn(self, instruction: str, *, image_paths: list[str] | None = None) -> int:
+        def run_turn(
+            self, instruction: str, *, image_paths: list[str] | None = None, **_kwargs: object
+        ) -> int:
             _ = image_paths
             self.surface.on_user_message(instruction)
             self.surface.on_progress_update("Understanding your request.")
@@ -5021,7 +4346,9 @@ def test_chat_llm_error_is_recoverable_without_traceback(tmp_path: Path, monkeyp
                 show_status_line=False,
             )
 
-        def run_turn(self, _instruction: str, *, image_paths: list[str] | None = None) -> int:
+        def run_turn(
+            self, _instruction: str, *, image_paths: list[str] | None = None, **_kwargs: object
+        ) -> int:
             _ = image_paths
             calls["run_turn"] += 1
             raise LLMError("LLM request failed: connection timed out")
@@ -5083,7 +4410,9 @@ def test_chat_llm_error_reports_tool_transcript_problems_without_network_hint(
                 show_status_line=False,
             )
 
-        def run_turn(self, _instruction: str, *, image_paths: list[str] | None = None) -> int:
+        def run_turn(
+            self, _instruction: str, *, image_paths: list[str] | None = None, **_kwargs: object
+        ) -> int:
             _ = image_paths
             calls["run_turn"] += 1
             raise LLMError(broken_tool_error)
@@ -5330,17 +4659,89 @@ def test_chat_turn_interrupt_monitor_keeps_escape_interrupt_behavior(monkeypatch
     monkeypatch.setattr(
         cli_mod.os, "read", lambda fd, size: read_calls.append((fd, size)) or b"\x1b"
     )
-    monkeypatch.setattr(cli_mod.os, "kill", lambda pid, sig: kill_calls.append((pid, sig)))
+    token = InteractiveCancellationToken()
+
+    def _record_kill(pid: int, sig: int) -> None:
+        assert token.is_cancelled is True
+        kill_calls.append((pid, sig))
+
+    monkeypatch.setattr(cli_mod.os, "kill", _record_kill)
     monkeypatch.setitem(sys.modules, "select", SimpleNamespace(select=fake_select))
     monkeypatch.setitem(sys.modules, "termios", fake_termios)
     monkeypatch.setitem(sys.modules, "tty", fake_tty)
 
-    with cli_mod._chat_turn_interrupt_monitor():
+    with cli_mod._chat_turn_interrupt_monitor(cancellation_token=token):
         time.sleep(0.12)
 
+    assert token.is_cancelled is True
     assert read_calls == [(9, 1)]
     assert len(kill_calls) == 1
     assert select_calls
+
+
+def test_classic_chat_uses_a_fresh_cancellation_token_for_each_turn(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    runner = CliRunner()
+    tokens: list[InteractiveCancellationToken] = []
+
+    class _DummyStore:
+        session_id = "sid"
+
+    class _DummySession:
+        store = _DummyStore()
+        stream = False
+        mode = "review"
+
+        def run_turn(
+            self,
+            _instruction: str,
+            *,
+            image_paths: list[str] | None = None,
+            cancellation_token: InteractiveCancellationToken | None = None,
+        ) -> int:
+            _ = image_paths
+            assert cancellation_token is not None
+            tokens.append(cancellation_token)
+            if len(tokens) == 1:
+                raise KeyboardInterrupt
+            assert cancellation_token.is_cancelled is False
+            return 0
+
+        def close(self) -> None:
+            return None
+
+    class _FakePromptSession:
+        def __init__(self) -> None:
+            self._responses = iter(["first", "second", "exit"])
+
+        def prompt(self, *_args: object, **_kwargs: object) -> str:
+            return next(self._responses)
+
+    monkeypatch.setattr(cli_mod, "create_session", lambda **_kwargs: _DummySession())
+    monkeypatch.setattr(
+        cli_mod,
+        "_maybe_make_chat_prompt_session",
+        lambda **_kwargs: _FakePromptSession(),
+    )
+
+    result = runner.invoke(
+        alysis_app,
+        ["chat", "--model", "test-model", "--api-key", "k", "--no-log"],
+        input="",
+        env={
+            "ALYSIS_CONFIG_DIR": os.fspath(tmp_path),
+            "ALYSIS_DATA_DIR": os.fspath(tmp_path),
+            "ALYSIS_TUI": "0",
+        },
+    )
+
+    assert result.exit_code == 0
+    assert len(tokens) == 2
+    assert tokens[0] is not tokens[1]
+    assert tokens[0].is_cancelled is True
+    assert tokens[1].is_cancelled is False
 
 
 def test_chat_prompt_session_does_not_pass_erase_when_done_kwarg(
@@ -5357,7 +4758,14 @@ def test_chat_prompt_session_does_not_pass_erase_when_done_kwarg(
         stream = False
         mode = "review"
 
-        def run_turn(self, instruction: str, *, image_paths: list[str] | None = None) -> int:
+        def run_turn(
+            self,
+            instruction: str,
+            *,
+            image_paths: list[str] | None = None,
+            cancellation_token: InteractiveCancellationToken | None = None,
+        ) -> int:
+            assert cancellation_token is not None
             captured["run_turn_calls"].append((instruction, image_paths))
             return 0
 
@@ -5553,7 +4961,14 @@ def test_chat_prompt_session_never_passes_erase_when_done_kwarg(
         stream = False
         mode = "review"
 
-        def run_turn(self, instruction: str, *, image_paths: list[str] | None = None) -> int:
+        def run_turn(
+            self,
+            instruction: str,
+            *,
+            image_paths: list[str] | None = None,
+            cancellation_token: InteractiveCancellationToken | None = None,
+        ) -> int:
+            assert cancellation_token is not None
             captured["run_turn_calls"].append((instruction, image_paths))
             return 0
 

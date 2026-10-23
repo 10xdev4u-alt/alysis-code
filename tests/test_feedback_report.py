@@ -1644,8 +1644,8 @@ def test_chat_report_command_creates_bundle_host_side(monkeypatch, tmp_path: Pat
     def fake_create_feedback_github_issue_draft(**kwargs: Any) -> FeedbackGithubIssueResult:
         issue_calls.append(dict(kwargs))
         return FeedbackGithubIssueResult(
-            repo="AlysisAi/alysis-code",
-            issue_url="https://github.com/AlysisAi/alysis-code/issues/new?title=x",
+            repo="AlysisAi/AlysisCode",
+            issue_url="https://github.com/AlysisAi/AlysisCode/issues/new?title=x",
             opened=False,
             open_attempted=False,
         )
@@ -1672,7 +1672,6 @@ def test_chat_report_command_creates_bundle_host_side(monkeypatch, tmp_path: Pat
         pending_images=["queued.png"],
         console=console,
         forge_state=cli_mod._ForgeChatState(),
-        plan_mode_state=cli_mod._ChatPlanModeState(),
     )
 
     assert result == "handled"
@@ -1734,7 +1733,6 @@ def test_chat_report_still_reports_bundle_when_github_draft_fails(
         pending_images=[],
         console=Console(file=stream, force_terminal=False),
         forge_state=cli_mod._ForgeChatState(),
-        plan_mode_state=cli_mod._ChatPlanModeState(),
     )
 
     rendered = stream.getvalue()
@@ -1766,8 +1764,8 @@ def test_chat_report_command_in_forge_includes_active_run_paths(
     def fake_create_feedback_github_issue_draft(**kwargs: Any) -> FeedbackGithubIssueResult:
         issue_calls.append(dict(kwargs))
         return FeedbackGithubIssueResult(
-            repo="AlysisAi/alysis-code",
-            issue_url="https://github.com/AlysisAi/alysis-code/issues/new?title=x",
+            repo="AlysisAi/AlysisCode",
+            issue_url="https://github.com/AlysisAi/AlysisCode/issues/new?title=x",
             opened=True,
             open_attempted=True,
         )
@@ -1795,7 +1793,6 @@ def test_chat_report_command_in_forge_includes_active_run_paths(
         pending_images=[],
         console=console,
         forge_state=forge_state,
-        plan_mode_state=cli_mod._ChatPlanModeState(),
     )
 
     assert result == "handled"
@@ -1822,7 +1819,7 @@ def test_chat_feedback_alias_uses_report_flow(monkeypatch, tmp_path: Path) -> No
 
     def fake_create_feedback_github_issue_draft(**_kwargs: Any) -> FeedbackGithubIssueResult:
         return FeedbackGithubIssueResult(
-            repo="AlysisAi/alysis-code",
+            repo="AlysisAi/AlysisCode",
             issue_url=None,
             opened=False,
             open_attempted=False,
@@ -1848,7 +1845,6 @@ def test_chat_feedback_alias_uses_report_flow(monkeypatch, tmp_path: Path) -> No
         pending_images=[],
         console=Console(file=io.StringIO(), force_terminal=False),
         forge_state=cli_mod._ForgeChatState(),
-        plan_mode_state=cli_mod._ChatPlanModeState(),
     )
 
     assert result == "handled"
@@ -1892,8 +1888,8 @@ def test_report_create_command_defaults_to_url_only_and_open_flag_opts_in(
     def fake_create_feedback_github_issue_draft(**kwargs: Any) -> FeedbackGithubIssueResult:
         open_values.append(kwargs.get("open_browser"))
         return FeedbackGithubIssueResult(
-            repo="AlysisAi/alysis-code",
-            issue_url="https://github.com/AlysisAi/alysis-code/issues/new?title=x",
+            repo="AlysisAi/AlysisCode",
+            issue_url="https://github.com/AlysisAi/AlysisCode/issues/new?title=x",
             opened=bool(kwargs.get("open_browser")),
             open_attempted=bool(kwargs.get("open_browser")),
         )

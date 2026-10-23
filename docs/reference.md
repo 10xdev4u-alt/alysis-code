@@ -50,6 +50,19 @@ alysis run --api-key-stdin "Hello"
 alysis run --api-key-env OTHER_API_KEY --base-url "https://example.com/v1" --model "your-model" "Hello"
 ```
 
+Official builds include the public hosted API URL, so `alysis login`, billing
+status, and online feedback work without cloud environment variables. No project
+or server keys are bundled. For a custom deployment, set
+`ALYSIS_CLOUD_API_URL` to its API base
+to which `/device-code`, `/device-token`, `/account-status`, and `/feedback` are
+appended. The gateway defaults to that base plus `/llm/v1`; set
+`ALYSIS_GATEWAY_URL` when it uses a separate OpenAI-compatible base URL.
+Deployments that require a public routing key can supply
+`ALYSIS_CLOUD_PUBLIC_KEY` at runtime. Never use a server or service-role key in
+the client. These values belong in the local environment, outside the repository.
+The legacy `ALYSIS_SUPABASE_URL` override remains supported when
+`ALYSIS_CLOUD_API_URL` is unset. Blank overrides use the hosted default.
+
 Auth state for a supervising application (one JSON object on stdout; exit code 0
 means the command ran, and the payload carries `authenticated`):
 
@@ -65,7 +78,7 @@ See [Account Runtimes](account-runtimes.md) for the payload contract.
 Forge:
 
 ```bash
-alysis forge plan --path .
+alysis forge plan --path . --goal "Build the scoped feature" --intent build
 alysis forge show --path .
 alysis forge status --path .
 alysis forge run --path . --mode auto --verify strict
@@ -74,6 +87,11 @@ alysis forge swarm --path . --parallel 3 --mode auto --verify warn
 alysis forge resume --path .
 alysis forge unlock --path .
 ```
+
+`forge plan` accepts `build`, `fix`, `refactor`, `audit`, `test`, or `document`
+as its intent. It prompts for a missing goal; machine callers should pass both
+`--goal` and `--intent`. Use `--planning-profile deep` for a fuller impact review.
+`forge run` reviews the saved plan and requests approval before execution.
 
 ## Execution Modes
 
@@ -135,49 +153,152 @@ Common interactive commands:
 - `/help`: show chat commands
 - `/status`: show mode, model, workspace, and runtime state
 - `/pwd`: show workspace and active workdir
-- `/mode`: inspect or change execution mode
+- `/permissions`: inspect or select execution permissions for the next message
+- `/persona`: select Code, Architect, Ask, Debug, or a custom persona
 - `/config`: open the configuration menu
 - `/usage`: show token and cost usage
 - `/stream`: open the live-output picker (On by default)
 - `/stream on|off|status`: control or inspect live answer and reasoning output for this session
 - `/trace off|compact|full`: control reasoning/tool progress detail
-- `/image <path>`: attach an image to the next turn
+- `/image [path]`: attach an image or file to the next turn; with no path it takes the picture on the clipboard
 - `/subagents`: open the active-subagent picker and select a run for the live pane
 - `/skill`: list discovered skills
 - `$<skill> [task]`: at an idle prompt, show skill info or attach it for one turn
-- `/plan <task>`: draft a plan for review and approval
 - `/forge [resume]`: enter or resume Forge for the workspace
 - `/report [text]`: create a local feedback bundle
 - `/exit`: quit chat
 
+Trace controls presentation, independently of reasoning effort. In normal turns and
+`/chat`, `compact` and `full` show reasoning text or summaries returned by the selected
+provider/model. The TUI labels both as **thinking**: compact collapses completed
+blocks to a preview; full keeps their text expanded. Buffered requests show reasoning
+when the response arrives. `off` hides reasoning and does not request optional
+summaries; it does not change reasoning effort or discard required continuation data.
+
+| Provider / connection | Trace source |
+| --- | --- |
+| OpenAI Responses, including ChatGPT subscription | Reasoning summaries when returned |
+| Anthropic native, Gemini native | Returned thinking / thought summaries |
+| DeepSeek, Qwen/DashScope, Kimi/Moonshot, GLM/Z.ai, NVIDIA NIM | `reasoning_content` on models that return it |
+| Mistral | Text inside structured `thinking` content chunks |
+| OpenRouter | Structured summaries/reasoning text, or a supported reasoning string field |
+
+Provider-specific adapters normalize these formats into the same trace events.
+Encrypted state, signatures, and redacted blocks are never displayed. Required
+continuation data is preserved separately in its provider format. When no supported
+text is returned, the trace shows tool progress without inventing a thinking block.
+Text embedded in an ordinary answer (for example `<think>` tags) is not guessed to
+be a separate reasoning channel.
+
+Custom OpenAI-compatible profiles can choose a known `reasoning_trace_adapter`, such
+as `deepseek_reasoning`, `openrouter_reasoning`, `mistral_thinking`, or `glm_reasoning`.
+Unknown endpoints stay passive by default. A profile's `reasoning_trace_adapter =
+"none"` disables reasoning trace requests and callbacks across all provider protocols.
+Use `/trace off` to hide trace while retaining the selected adapter's replay behavior.
+
+In the full-screen TUI, `/trace full` also displays commands, bounded tool output,
+and line-numbered diffs with addition/deletion counts for `fs_edit`, `fs_write`,
+and `git_apply_patch`. Applied-change cards appear after a successful write;
+denied approvals and stale-file failures do not count as applied changes.
+Trace colors mark active steps in blue, success and additions in green, commands
+in cyan, warnings and previews in amber, and failures and deletions in red.
+File reads are labeled **view only** and their output says **VIEWING ONLY — no
+file changes**. Saved edits show counts in words and mark each code row **ADDED**,
+**REMOVED**, or **UNCHANGED** (context). Unsaved previews say **PROPOSED CHANGES**
+and use **ADD**/**REMOVE** labels. A replacement appears as the old code removed
+and the new code added; reading a file does not produce change rows.
+Output is grouped under a vertical rail, with quieter timestamps and line numbers.
+The palette adapts to light and dark terminals; icons and labels retain the meaning
+when colors are unavailable.
+`compact` keeps the change summary and hides the diff body and tool output;
+`off` suppresses new trace details. Nested-agent diffs in full trace identify the
+agent and whether its workspace is shared or isolated. Text is redacted and
+long output is marked as truncated. This display uses shared tool events across
+providers, independently of model reasoning support. `/diff` or `Ctrl+P` opens the
+current Git working-tree changes in a collapsed view, including while the agent
+is working. These include edits made through shell commands and may include
+changes made before the current turn. Press Enter to expand a file, `r` to refresh,
+or Esc to return to your draft without interrupting the agent. `Alt+p` edits pasted
+text in the composer. The diff viewer is read-only and does not submit a model turn.
+
 While an agent turn is running, press Enter to send the current text as a
-mid-turn message. Alysis Code delivers it at the next safe step boundary and
-keeps it in conversation history. Press Ctrl+Q instead to queue the text as a
-separate follow-up turn. Esc interrupts the active turn and discards pending
-mid-turn messages, queued follow-ups, and staged commands.
+mid-turn message. Already-issued tool calls finish normally; Alysis Code then
+delivers the message at the next safe step boundary before the model chooses
+more tools, and keeps it in conversation history. Press Ctrl+Q instead to queue
+the text as a separate follow-up turn. With an empty input, Shift+Left recalls
+only the newest queued follow-up for editing; it never retracts a submitted
+mid-turn message. Enter returns the edited follow-up to the queue. Esc interrupts
+the active turn and preserves undelivered messages as ordered follow-up turns.
+Staged operations survive the interrupt and apply when the session becomes idle.
 
 Read-only commands remain available during a running turn: `/help` (and `/`),
 `/status`, `/subagents`, `/pwd`, `/context` or `/ctx`, `/usage`, `/model-info`, `/trace`,
 `/toolbar`, `/images`, `/image`, `/paste-image`, `/clear-images`, `/terminals`,
-and bare `/skill`. `/mode`, `/persona`, `/model`, and typed `/config` commands
-are accepted and staged; they run when the active turn finishes and before a
-queued follow-up starts. They never alter the running turn. In particular, a
-staged model change does not retroactively switch the model handling that turn.
+and bare `/skill`.
 
-Bare `/config` opens its overlay immediately so settings
+State-changing commands use two staged tiers. `/stream` is resolved when submitted and applies
+on the worker at the agent's next step, before steering messages reach the model.
+`/permissions`, `/model`, `/persona`, typed `/config`, `/cd`, and chat `/plan`
+apply after the active turn and before the next message starts. Repeated Permissions selections
+are latest-wins, and Shift+Tab uses the same pending selection; intermediate choices never rebuild
+the current turn's tool surface.
+A staged model change therefore never switches the model handling the current
+turn. The status row distinguishes operations "applying next step" from those
+waiting "at next message", and `/status` lists their labels in application order.
+
+Bare `/config` open their overlays immediately so settings
 can be browsed and saved while output continues. A save reaches disk at once,
 but the live session reload waits until the running turn finishes. Other
-state-changing commands and unknown commands remain blocked while a turn is in
-flight; the mid-turn allowlist fails closed.
+commands that replace history or start another session remain blocked while a
+turn is in flight; the mid-turn allowlist fails closed. Forge-session-only verbs
+are unknown outside Forge rather than appearing as chat commands.
 
 Forge mode has its own command surface for goal, task, plan, review, and
 execution actions. See [Forge](forge.md).
+
+The former chat `/plan` commands have been removed. Use `/persona architect`
+for planning in chat; inside Forge, `/plan tasks|markdown|edit` remains available.
 
 Interactive chat opens in the full-screen TUI. The transcript owns mouse-wheel
 scrolling and shows a persistent scrollbar while the input and footer remain
 pinned. It scrolls three rows per wheel event by default. Set
 `ALYSIS_SCROLL_SPEED` to an integer from `1` through `20` to tune the distance
 for a high-resolution trackpad or a physical mouse wheel.
+
+Enter submits a message; **Ctrl+J** inserts a new line. Pasted multiline text
+keeps its line breaks. A long message wraps between words, and its continuation
+rows line up under the text after the `> ` prompt. **Up** and **Down** move
+the cursor between wrapped rows, keeping its column. The welcome screen also
+fits smaller windows: its hint lines break between phrases, and the owl is
+left out when it doesn't fit.
+
+Dropping a file on the terminal, or pasting its path, attaches it instead of
+spilling the path into the message: the composer shows a chip (`[Image #1]`,
+`[File #1]`, `[Folder #1]`) and the line under the input names the file and its
+size. **Ctrl+V** attaches the picture on the clipboard, and `/image [path]` does
+either from the keyboard. One Backspace over a chip removes the whole chip and
+detaches the file. Images ride the turn as real images; a file or folder chip
+expands to its absolute path so the agent's own tools can read it. A paste that
+mixes prose with a path stays an ordinary paste.
+
+Drops work from inside WSL too: Explorer hands the terminal a Windows path
+(`C:\Users\me\shot.png`) whatever is running in it, so that form is also tried
+against the distro's drive mount (`/mnt/c/...`, or whatever `automount.root` in
+`/etc/wsl.conf` says), and `\\wsl$\<distro>\...` resolves back to the plain distro
+path. Terminals that type a dropped path in instead of sending it as a bracketed
+paste are handled as well, as long as the path arrives quoted or as a `file://`
+URI - the two shapes a terminal produces and a person writing a message does not.
+
+The context footer shows remaining conversation capacity after startup prompts
+and tools, starting at 100% when that space is unused. It uses provider token
+measurements when valid, or calibrated local estimates otherwise. Startup
+overhead is estimated with the same calibration; request wrappers still count
+against available capacity. `/context` shows the full budget breakdown.
+
+While the agent works, a muted tip above the input explains commands, keyboard
+shortcuts, and ways to give useful instructions. Tips rotate every 15 seconds,
+hide when the turn stops or a dialog opens, and stay out of conversation history.
+Linked tips are underlined; click the text or URL to open it in your browser.
 
 Dragging across transcript text selects it inside the TUI and leaves the
 clipboard unchanged. While text is selected, the status line displays
@@ -186,6 +307,15 @@ Without a selection, Ctrl+C keeps its normal interrupt/exit behavior. Copied tex
 omits Alysis Code's visual message and reasoning markers. When stdin is redirected
 on WSL or another POSIX host, the TUI reads interaction from the controlling
 terminal so wheel events are not lost in the pipe.
+
+Links in the transcript are underlined and clickable: click a URL, or the text of
+a markdown link, to open it in your browser. From WSL it opens in the Windows
+browser. This covers web addresses in replies, sources, tool lines and code
+blocks, plus local dev-server addresses such as `localhost:5173`. A server
+announced on `0.0.0.0` opens as `localhost` on the same port. Dragging across a
+link still selects its text. Only `http` and `https` addresses open, and a URL
+cut short with `…` is left unlinked. If no browser can be started, for example
+over SSH, the address is copied to the clipboard instead.
 
 When subagents are running, the TUI can show a short live-tail pane above the
 input without covering the transcript. Press Ctrl+N to move forward and Ctrl+B
@@ -261,6 +391,7 @@ limits.
 - `role_models.router`
 - `subagents_enabled`
 - `custom_tools_enabled`
+- `web_fetch_trusted_domains`
 - `web_search_policy`
 - `web_search_mode`
 - `web_search_adapter`
@@ -295,11 +426,16 @@ without the router, for example `reply_language = "Greek"`. When set, the host
 injects a reply-language directive and keys the final-summary language rewrite
 to it; when empty, the model answers in the user's language naturally.
 
-Two chat commands accompany the unified turn path. `/ask <question>` runs one
+`/ask <question>` runs one
 read-only turn: the session switches to the readonly execution mode for
 exactly that turn and the previous mode is restored afterwards, even on
 errors. `/chat <message>` produces one bounded conversational reply from the
 main model with a minimal prompt, no tools, and no workspace context.
+
+Each turn uses the current request and conversation history. Compaction and
+resume retain normal conversation context; there is no separately managed objective
+or amendment state. `/clear` resets the conversation and its workspace verification
+baseline.
 
 Useful environment overrides:
 
@@ -402,15 +538,46 @@ Useful commands:
 alysis profile presets
 alysis profile preset <provider-preset>
 alysis profile set-key <profile> --stdin
+alysis profile check <profile> --json
 alysis profile use <profile>
 alysis profile list
 ```
 
 OpenAI, Anthropic, and Gemini profiles can use their native API protocols.
-Other provider and gateway profiles use the OpenAI-compatible protocol.
+Custom profiles start with the OpenAI-compatible protocol; a gateway may require
+a different supported protocol for a particular model.
 
 Presets are convenience templates, not hard constraints. Custom profiles can
 point at model provider endpoints.
+
+For Anthropic Messages, factory-created clients default to the resolved model
+output limit without a universal 32,000-token cap. Unknown output capacity uses
+the shared 32,000-token fallback, including context reservation. Catalog values
+and explicit metadata overrides take precedence; existing shared-window
+adjustments still apply. The allowance may include reasoning as well as the
+visible answer, depending on the provider. An explicit per-request limit takes
+precedence. A larger allowance is a ceiling, not a request to use all those tokens.
+
+### OpenCode Go
+
+Use `https://opencode.ai/zen/go/v1` as the base URL. In `/config`, add the custom
+profile, enter its key in **API Key**, and choose the exact provider model ID in
+**Default Model**. Custom profiles load the provider's live model list when
+available; a failed lookup leaves manual model entry available. Discovery does
+not prove that every listed model uses the selected protocol.
+
+Alysis sends OpenCode's required `x-opencode-session` header automatically, using
+a stable conversation identity across requests and settings refreshes. Children
+use their own session identities. Standalone auxiliary clients retain an identity
+for their lifetime. An explicitly configured session header remains an override;
+normally leave extra headers empty so each conversation is identified separately.
+
+The provider uses different protocols behind the same base URL. For example,
+`deepseek-v4.1-flash` uses `openai_compat`, Qwen and MiniMax use
+`anthropic_messages`, and GPT Luna uses `openai_responses`. Select the protocol
+the provider documents; the model picker does not infer it from a model name.
+See the [official Go endpoint table](https://opencode.ai/docs/go/#endpoints) for
+current IDs and protocol requirements.
 
 ## Built-In Tools
 
@@ -477,16 +644,29 @@ provider-hosted adapter and model coverage matrix.
 
 `web_fetch` requires provenance before it retrieves a URL. Accepted provenance
 classes are an explicit user-provided URL, a URL returned by `web_search`, an
-observed canonical redirect from either source, and a bounded same-origin or
-search-mediated recovery URL. URLs found inside trusted fetched pages, trusted
-local file reads, and registered tool or shell output are recorded with their
-source event and parent URL when applicable, then treated as source-linked
-derived provenance rather than broad domain permission. URL comparison
-canonicalizes scheme, host, default ports, fragments, and harmless
-trailing-slash variants. Recovery still runs through the same SSRF, credential,
-scheme, redirect, and byte-cap checks as a normal fetch. In deadline
-finalization, missing provenance returns a structured recovery message instead
-of starting optional web search.
+observed canonical redirect from either source, a bounded same-origin or
+search-mediated recovery URL, and a URL on the configured trusted-domain
+allowlist. URLs found inside trusted fetched pages, trusted local file reads,
+and registered tool or shell output are recorded with their source event and
+parent URL when applicable, then treated as source-linked derived provenance
+rather than broad domain permission. URL comparison canonicalizes scheme, host,
+default ports, fragments, and harmless trailing-slash variants. Recovery still
+runs through the same SSRF, credential, scheme, redirect, and byte-cap checks
+as a normal fetch. In deadline finalization, missing provenance returns a
+structured recovery message instead of starting optional web search.
+
+`web_fetch_trusted_domains` lists hosts fetchable without prior session
+provenance, matched exactly or as a dot-suffix (so entries cover their
+subdomains). It defaults to major public package registries —
+`registry.npmjs.org`, `pypi.org`, `crates.io`, `rubygems.org`, Maven Central,
+the Go module proxy, `hex.pm`, `packagist.org`, and `api.nuget.org` among them —
+because registry JSON endpoints are not indexed by search engines, which made
+them unreachable through search-mediated recovery (a fresh subagent checking
+dependency versions dead-ended on every fetch). The allowlist bypasses only the
+provenance gate; every fetch still passes the full safe-HTTP validation.
+Setting the field to `[]` restores strict provenance-only fetching, and
+`ALYSIS_WEB_FETCH_TRUSTED_DOMAINS` overrides the field (comma-separated hosts;
+`none` disables the allowlist).
 
 ## Verification
 
@@ -659,7 +839,11 @@ readiness probe.
 `alysis run --deadline-seconds N` sets an invocation-wide monotonic deadline
 for one-shot execution. It is distinct from `llm_timeout_s`: the run deadline
 has a soft finalization window plus a hard exhaustion point, while
-`llm_timeout_s` bounds a single model request. During normal work, operation
+`llm_timeout_s` controls HTTP operation timeouts, including the wait for more
+response data. It is not a total request-duration limit: a stream that keeps
+delivering data can run longer. The separate meaningful-progress watchdog on
+Responses and OpenAI-compatible streams does not extend this socket timeout.
+During normal work, operation
 launches are checked against hard remaining time and the reserved finalization
 window. During finalization, Alysis Code blocks new routing, compaction,
 subagents, background work, broad exploration, provider retry sleeps, and
@@ -836,8 +1020,9 @@ If an unchanged episode repeats beyond the bounded nudge policy, the run exits
 non-zero as completion-gate stagnation. Actual completion-gate repair
 step-budget exhaustion instead reports `TERMINATE_BUDGET_EXHAUSTED`, and
 forced-summary wording distinguishes that budget case from gate stagnation.
-Release maintainers should keep the focused regression matrix in
-[Release checklist](release_checklist.md) green when changing this behavior.
+Release maintainers should keep the focused regression matrix in the
+[release checklist](release_checklist.md) green and follow the
+[release process](RELEASING.md) when changing this behavior.
 
 ## Forge
 
@@ -882,6 +1067,11 @@ alysis report create "expected X, got Y" --path . --latest
 
 Alysis Code prepares local artifacts for review. It does not submit GitHub issues
 or upload archives automatically.
+
+Bundles sanitize structured credential fields, including JSON encoded inside tool
+arguments and file contents. Data that exceeds the safe redaction depth and
+non-UTF-8 diagnostic artifacts are omitted. Failed or cancelled exports remove
+their partial output while preserving existing bundles.
 
 For crash-resilient minimal diagnostics, pass `--diagnostic-log PATH` or set
 `crash_diagnostic_log_path` / `ALYSIS_CRASH_DIAGNOSTIC_LOG_PATH`. This
@@ -935,6 +1125,11 @@ running it.
   schema internals.
 - If shell commands cannot run, check the selected execution mode and sandbox
   setup.
+- If native Git inspection reports `git_content_filter_required` or
+  `git_submodule_review_required`, the requested worktree comparison requires
+  repository programs. Run `git status` or `git diff` through an approved shell
+  command. Staged diffs and paths unaffected by these settings remain available
+  through the native Git tool.
 - If a one-shot run stops with `deadline_exhausted`, increase
   `--deadline-seconds` or remove `ALYSIS_RUN_DEADLINE_SECONDS`; this is
   separate from step-budget exhaustion and from `ALYSIS_LLM_TIMEOUT_S`.
@@ -967,3 +1162,25 @@ running it.
 - [Plugins](plugins.md): trusted extension bundles.
 - [Custom tools](custom_tools.md): trusted Python tool authoring.
 - [Lifecycle hooks](hooks.md): command-based policy and automation.
+
+
+## Optional document tools
+
+Install `alysis-code[documents]` to enable PDF, Word (`.docx`), spreadsheet
+(`.xlsx`), and presentation (`.pptx`) tools. With uv, use
+`uv tool install --upgrade 'alysis-code[documents]'`. Existing source documents
+and requested output paths have separate acceptance roles, so reading an input
+is not treated as producing the requested deliverable.
+
+## Release 0.15 compatibility
+
+Use `alysis` or `alysis-code` and canonical `ALYSIS_` environment variables.
+The legacy `sylliptor` command, environment aliases, and manifest names are
+retired. Existing `.alysis` history remains supported. Back up legacy data and
+move it to the canonical locations before upgrading; migration is explicit.
+`/objective` is removed. State the task in the conversation and use steering to
+update a running turn.
+
+For a corporate certificate authority, set `ALYSIS_EXTRA_CA_CERTS` to a PEM
+certificate bundle before starting the CLI. Provider setup and network clients
+then use the additional trust configuration.

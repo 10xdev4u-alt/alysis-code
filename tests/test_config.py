@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
+import alysis_code.atomic_io as atomic_io_mod
 from alysis_code.config import (
     DEFAULT_SUBAGENT_TIMEOUT_S,
     DEFAULT_VERIFY_COMMANDS,
@@ -14,6 +17,7 @@ from alysis_code.config import (
     clear_persisted_api_key,
     clone_cfg,
     config_path,
+    config_transaction,
     credentials_path,
     get_api_key,
     is_generic_configured_verify_preset,
@@ -411,8 +415,8 @@ def test_set_known_base_url_switches_provider_profile_and_default_model(
     assert profile.name == "deepseek"
     assert profile.api_key_env == "DEEPSEEK_API_KEY"
     assert cfg.base_url == "https://api.deepseek.com"
-    assert cfg.model == "deepseek-v4-pro"
-    assert profile.default_model == "deepseek-v4-pro"
+    assert cfg.model == "deepseek-flash"
+    assert profile.default_model == "deepseek-flash"
 
 
 def test_set_base_url_rejects_malformed_url(
@@ -456,10 +460,10 @@ def test_load_config_syncs_active_profile_over_stale_top_level_base_url(
     cfg = load_config()
 
     assert cfg.base_url == "https://api.deepseek.com"
-    assert cfg.model == "deepseek-v4-flash"
+    assert cfg.model == "deepseek-flash"
     profile = get_active_profile(cfg)
     assert profile.base_url == "https://api.deepseek.com"
-    assert profile.default_model == "deepseek-v4-flash"
+    assert profile.default_model == "deepseek-flash"
 
 
 def test_load_config_repairs_known_model_provider_mismatch(
@@ -517,9 +521,7 @@ def test_load_config_keeps_explicit_custom_profile_with_preset_model(
                 "profiles": {
                     "alysis": {
                         "protocol": "openai_compat",
-                        "base_url": (
-                            "https://vzigujbcjjmpntxhmyvr.supabase.co/functions/v1/llm/v1"
-                        ),
+                        "base_url": ("https://api.alysiscode.com/v1"),
                         "extra_headers": {},
                         "default_model": "mimo-v2.5-pro",
                         "web_search_adapter": "openrouter",
@@ -679,6 +681,128 @@ def test_config_round_trip(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> N
     assert config_path().name == "config.json"
 
 
+def test_save_config_replace_failure_preserves_previous_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ALYSIS_CONFIG_DIR", os.fspath(tmp_path))
+    save_config(AppConfig(model="before"))
+    path = config_path()
+    previous = path.read_bytes()
+
+    def fail_replace(_source: Path, _target: Path) -> None:
+        raise OSError("replace failed")
+
+    monkeypatch.setattr(atomic_io_mod.os, "replace", fail_replace)
+
+    with pytest.raises(OSError, match="replace failed"):
+        save_config(AppConfig(model="after"))
+
+    assert path.read_bytes() == previous
+    assert list(tmp_path.glob(f".{path.name}.*.tmp")) == []
+
+
+def test_config_transaction_saves_once_only_after_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ALYSIS_CONFIG_DIR", os.fspath(tmp_path))
+    loaded = AppConfig(model="before")
+    saved: list[AppConfig] = []
+
+    with config_transaction(
+        loader=lambda: loaded.model_copy(deep=True),
+        saver=lambda cfg: saved.append(cfg.model_copy(deep=True)),
+    ) as cfg:
+        assert saved == []
+        cfg.model = "after"
+
+    assert [cfg.model for cfg in saved] == ["after"]
+
+
+def test_nested_config_transaction_fails_fast(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ALYSIS_CONFIG_DIR", os.fspath(tmp_path))
+    save_config(AppConfig(model="before"))
+
+    with config_transaction() as cfg:
+        cfg.extra_fields["outer_update"] = "kept"
+        with pytest.raises(ConfigError, match="Nested config transactions"):
+            with config_transaction():
+                pytest.fail("nested transaction unexpectedly entered")
+
+    assert load_config().extra_fields["outer_update"] == "kept"
+
+
+def test_config_transaction_exception_leaves_previous_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ALYSIS_CONFIG_DIR", os.fspath(tmp_path))
+    save_config(AppConfig(model="before"))
+    path = config_path()
+    previous = path.read_bytes()
+
+    with pytest.raises(RuntimeError, match="mutation failed"):
+        with config_transaction() as cfg:
+            cfg.model = "after"
+            raise RuntimeError("mutation failed")
+
+    assert path.read_bytes() == previous
+
+
+def test_config_transaction_serializes_fresh_reads_across_processes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ALYSIS_CONFIG_DIR", os.fspath(tmp_path))
+    save_config(AppConfig(model="before"))
+    entered_path = tmp_path / "child-entered"
+    source_root = Path(__file__).resolve().parents[1] / "src"
+    env = os.environ.copy()
+    env["PYTHONPATH"] = os.pathsep.join(
+        value for value in (os.fspath(source_root), env.get("PYTHONPATH")) if value
+    )
+    env["CONFIG_TRANSACTION_ENTERED_PATH"] = os.fspath(entered_path)
+    script = """
+import os
+from pathlib import Path
+
+from alysis_code.config import config_transaction
+
+print("ready", flush=True)
+with config_transaction() as cfg:
+    Path(os.environ["CONFIG_TRANSACTION_ENTERED_PATH"]).write_text("entered", encoding="utf-8")
+    cfg.extra_fields["child_update"] = "kept"
+print("done", flush=True)
+"""
+    process: subprocess.Popen[str] | None = None
+    try:
+        with config_transaction() as cfg:
+            cfg.extra_fields["parent_update"] = "kept"
+            process = subprocess.Popen(
+                [sys.executable, "-c", script],
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            assert process.stdout is not None
+            assert process.stdout.readline().strip() == "ready"
+            with pytest.raises(subprocess.TimeoutExpired):
+                process.wait(timeout=0.2)
+            assert entered_path.exists() is False
+
+        stdout, stderr = process.communicate(timeout=10)
+        assert process.returncode == 0, stderr
+        assert stdout.strip() == "done"
+    finally:
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.communicate()
+
+    persisted = load_config()
+    assert persisted.extra_fields["parent_update"] == "kept"
+    assert persisted.extra_fields["child_update"] == "kept"
+
+
 def test_app_config_uses_shared_step_budget_defaults() -> None:
     cfg = AppConfig()
 
@@ -686,15 +810,16 @@ def test_app_config_uses_shared_step_budget_defaults() -> None:
     assert cfg.max_steps == DEFAULT_CHAT_MAX_STEPS
     assert cfg.task_max_steps == DEFAULT_TASK_MAX_STEPS
     assert cfg.subagent_max_steps == DEFAULT_SUBAGENT_MAX_STEPS
-    assert cfg.subagent_timeout_s == DEFAULT_SUBAGENT_TIMEOUT_S
+    assert DEFAULT_SUBAGENT_TIMEOUT_S is None
+    assert cfg.subagent_timeout_s is None
     assert cfg.subagent_orchestration.max_background_children == 3
     assert cfg.subagent_orchestration.turn_end_policy == "wait"
     assert cfg.subagent_orchestration.workspace_isolation_enabled is True
     assert cfg.subagent_orchestration.parallel_nonwriting_shared is False
     assert cfg.subagent_orchestration.helpers_enabled is True
     assert cfg.subagent_orchestration.helper_max_total_per_child == 2
-    assert cfg.subagent_orchestration.helper_timeout_s == 120.0
-    assert cfg.subagent_orchestration.helper_max_steps == 20
+    assert cfg.subagent_orchestration.helper_timeout_s is None
+    assert cfg.subagent_orchestration.helper_max_steps is None
     assert cfg.subagent_orchestration.repetition_signal_threshold == 3
     assert cfg.subagent_orchestration.repetition_nudge_occurrence_threshold == 2
     assert cfg.subagent_orchestration.repetition_occurrence_threshold == 5
@@ -720,6 +845,15 @@ def test_set_subagent_timeout_value_validation() -> None:
     for value in ("0", "-1", "nan", "inf", "-inf", "not-a-number"):
         with pytest.raises(ConfigError):
             set_config_value(cfg, "subagent_timeout_s", value)
+
+
+@pytest.mark.parametrize("value", ["off", "unlimited", "none", "never"])
+def test_set_subagent_timeout_accepts_unlimited_spellings(value: str) -> None:
+    cfg = AppConfig(subagent_timeout_s=123.0)
+
+    set_config_value(cfg, "subagent_timeout_s", value)
+
+    assert cfg.subagent_timeout_s is None
 
 
 @pytest.mark.parametrize("value", [0, -1])
@@ -829,6 +963,22 @@ def test_set_subagent_orchestration_values() -> None:
         )
     with pytest.raises(ConfigError):
         set_config_value(cfg, "subagent_orchestration.repetition_backstop_threshold", "4")
+
+
+@pytest.mark.parametrize("value", ["off", "unlimited", "none", "never"])
+def test_set_helper_limits_accept_unlimited_spellings(value: str) -> None:
+    cfg = AppConfig(
+        subagent_orchestration={
+            "helper_timeout_s": 45.0,
+            "helper_max_steps": 12,
+        }
+    )
+
+    set_config_value(cfg, "subagent_orchestration.helper_timeout_s", value)
+    set_config_value(cfg, "subagent_orchestration.helper_max_steps", value)
+
+    assert cfg.subagent_orchestration.helper_timeout_s is None
+    assert cfg.subagent_orchestration.helper_max_steps is None
 
 
 @pytest.mark.parametrize(
@@ -1089,6 +1239,44 @@ def test_set_web_search_mode_validation_and_deprecated_alias() -> None:
         set_config_value(cfg, "web_search_mode", "maybe")
     with pytest.raises(ConfigError):
         set_config_value(cfg, "web_search_enabled", "maybe")
+
+
+def test_web_fetch_trusted_domains_defaults_and_set_and_env() -> None:
+    from alysis_code.config import (
+        DEFAULT_WEB_FETCH_TRUSTED_DOMAINS,
+        resolve_web_fetch_trusted_domains,
+    )
+
+    cfg = AppConfig()
+    # Curated registry defaults are on by default.
+    assert "registry.npmjs.org" in cfg.web_fetch_trusted_domains
+    assert resolve_web_fetch_trusted_domains(cfg) == tuple(cfg.web_fetch_trusted_domains)
+    assert resolve_web_fetch_trusted_domains(None) == tuple(DEFAULT_WEB_FETCH_TRUSTED_DOMAINS)
+
+    cfg = set_config_value(cfg, "web_fetch_trusted_domains", "internal.example.com, pypi.org")
+    assert cfg.web_fetch_trusted_domains == ["internal.example.com", "pypi.org"]
+    cfg = set_config_value(cfg, "web_fetch_trusted_domains", "none")
+    assert cfg.web_fetch_trusted_domains == []
+    assert resolve_web_fetch_trusted_domains(cfg) == ()
+    cfg = set_config_value(cfg, "web_fetch_trusted_domains", "default")
+    assert cfg.web_fetch_trusted_domains == list(DEFAULT_WEB_FETCH_TRUSTED_DOMAINS)
+
+    with pytest.raises(ConfigError, match="web_fetch_trusted_domains"):
+        set_config_value(cfg, "web_fetch_trusted_domains", "not a host, pypi.org")
+
+
+def test_resolve_web_fetch_trusted_domains_env_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from alysis_code.config import resolve_web_fetch_trusted_domains
+
+    cfg = AppConfig()
+    monkeypatch.setenv("ALYSIS_WEB_FETCH_TRUSTED_DOMAINS", "a.example, b.example")
+    assert resolve_web_fetch_trusted_domains(cfg) == ("a.example", "b.example")
+    monkeypatch.setenv("ALYSIS_WEB_FETCH_TRUSTED_DOMAINS", "none")
+    assert resolve_web_fetch_trusted_domains(cfg) == ()
+    monkeypatch.delenv("ALYSIS_WEB_FETCH_TRUSTED_DOMAINS")
+    assert resolve_web_fetch_trusted_domains(cfg) == tuple(cfg.web_fetch_trusted_domains)
 
 
 def test_set_web_search_timeout_validation() -> None:

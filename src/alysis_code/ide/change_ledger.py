@@ -28,6 +28,7 @@ _MAX_DIFF_BYTES = 2 * 1024 * 1024
 _DEFAULT_MAX_FILE_BYTES = 25 * 1024 * 1024
 _DEFAULT_MAX_SNAPSHOT_BYTES = 256 * 1024 * 1024
 _ZERO_OID = "0" * 40
+_SESSION_REF_PREFIX = "refs/heads/sessions/"
 _METADATA_PREFIX = "Alysis Code-Checkpoint-Metadata: "
 _PENDING_OPERATION_VERSION = 1
 _CHECKPOINT_METADATA_VERSION = 2
@@ -58,6 +59,27 @@ class ChangeLedgerError(RuntimeError):
 
 class StaleWorkspaceError(ChangeLedgerError):
     """The workspace no longer matches the state being reversed."""
+
+
+def _checkpoint_storage_directory(workspace_root: Path, storage_root: Path | None = None) -> Path:
+    workspace = workspace_root.expanduser().resolve(strict=True)
+    workspace_key = hashlib.sha256(
+        os.path.normcase(os.fspath(workspace)).encode("utf-8")
+    ).hexdigest()[:24]
+    override = str(env_get("ALYSIS_DATA_DIR") or "").strip()
+    default_data_dir = Path(override).expanduser() if override else canonical_user_data_dir()
+    base = (storage_root or default_data_dir / "checkpoints").expanduser().resolve()
+    try:
+        base.relative_to(workspace)
+    except ValueError:
+        return base / workspace_key
+    raise ChangeLedgerError("Checkpoint storage must be outside the workspace.")
+
+
+def checkpoint_storage_exists(workspace_root: Path) -> bool:
+    """Check for durable checkpoint state without initializing storage or launching Git."""
+    storage = _checkpoint_storage_directory(workspace_root)
+    return (storage / "ledger.sqlite3").exists() or (storage / "objects.git").exists()
 
 
 @dataclass(frozen=True)
@@ -119,19 +141,7 @@ class ChangeLedger:
         self.workspace_root = workspace_root.expanduser().resolve(strict=True)
         if not self.workspace_root.is_dir():
             raise ChangeLedgerError("Checkpoint workspace must be a directory.")
-        workspace_key = hashlib.sha256(
-            os.path.normcase(os.fspath(self.workspace_root)).encode("utf-8")
-        ).hexdigest()[:24]
-        override = str(env_get("ALYSIS_DATA_DIR") or "").strip()
-        default_data_dir = Path(override).expanduser() if override else canonical_user_data_dir()
-        base = (storage_root or default_data_dir / "checkpoints").expanduser().resolve()
-        try:
-            base.relative_to(self.workspace_root)
-        except ValueError:
-            pass
-        else:
-            raise ChangeLedgerError("Checkpoint storage must be outside the workspace.")
-        self.storage_dir = base / workspace_key
+        self.storage_dir = _checkpoint_storage_directory(self.workspace_root, storage_root)
         self.git_dir = self.storage_dir / "objects.git"
         self.index_dir = self.storage_dir / "indexes"
         self.database_path = self.storage_dir / "ledger.sqlite3"
@@ -377,7 +387,7 @@ class ChangeLedger:
             self.pending_operation_path.unlink(missing_ok=True)
             return result
 
-    def redo(self, session_id: str) -> Checkpoint:
+    def redo(self, session_id: str, *, expected_checkpoint_id: str | None = None) -> Checkpoint:
         session = _validate_session_id(session_id)
         with self._lock:
             self._reconcile_storage(session_id=session)
@@ -387,6 +397,8 @@ class ChangeLedger:
             head = self._head_locked(db, owner)
             if head is None or head.kind != "revert" or not head.reverts_id:
                 raise ChangeLedgerError("The current checkpoint is not redoable.")
+            if expected_checkpoint_id is not None and head.checkpoint_id != expected_checkpoint_id:
+                raise ChangeLedgerError("The reviewed checkpoint is no longer current.")
             original = self._checkpoint_locked(db, head.reverts_id)
             paths = _record_paths(original.changes)
             self._require_paths_revertible(paths, original, head)
@@ -434,15 +446,25 @@ class ChangeLedger:
         self.storage_dir.mkdir(parents=True, exist_ok=True)
         self.index_dir.mkdir(parents=True, exist_ok=True)
         if not self.git_dir.exists():
-            result = subprocess.run(
-                ["git", "init", "--bare", "--quiet", os.fspath(self.git_dir)],
-                capture_output=True,
-                timeout=self.git_timeout_seconds,
-                check=False,
-                env=build_git_process_env(),
-            )
+            try:
+                result = subprocess.run(
+                    ["git", "init", "--bare", "--quiet", os.fspath(self.git_dir)],
+                    capture_output=True,
+                    timeout=self.git_timeout_seconds,
+                    check=False,
+                    env=build_git_process_env(),
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                raise ChangeLedgerError(
+                    "Checkpoint storage could not start Git. Install Git and check that it can run."
+                ) from None
             if result.returncode != 0:
                 raise ChangeLedgerError("Unable to initialize external checkpoint storage.")
+        self._object_hash_name = (
+            self._git(["rev-parse", "--show-object-format"], check=True).stdout.decode().strip()
+        )
+        if self._object_hash_name not in {"sha1", "sha256"}:
+            raise ChangeLedgerError("Unsupported checkpoint Git object format.")
         info_dir = self.git_dir / "info"
         info_dir.mkdir(parents=True, exist_ok=True)
         exclude_path = info_dir / "exclude"
@@ -604,8 +626,10 @@ class ChangeLedger:
                 str(row["session_id"])
                 for row in db.execute("SELECT DISTINCT session_id FROM checkpoints").fetchall()
             )
+            # Read inside the write transaction: refs move only under it, as SQLite does.
+            ref_oids = self._session_ref_oids()
             for session in sorted(sessions):
-                self._reconcile_session_ref_locked(db, session)
+                self._reconcile_session_ref_locked(db, session, ref_oids)
             if pending is not None:
                 clear_pending = self._reconcile_pending_restore_locked(db, pending)
             db.commit()
@@ -616,10 +640,14 @@ class ChangeLedger:
         self,
         db: sqlite3.Connection,
         session_id: str,
+        ref_oids: dict[str, str],
     ) -> None:
         head = self._head_locked(db, session_id)
-        ref = f"refs/heads/sessions/{_session_key(session_id)}"
-        ref_oid = self._ref_oid(ref)
+        ref = f"{_SESSION_REF_PREFIX}{_session_key(session_id)}"
+        ref_oid = ref_oids.get(ref)
+        if ref_oid is None and head is not None:
+            # A head without its ref is repaired below; read that one ref as before first.
+            ref_oid = self._ref_oid(ref)
         if head is None and ref_oid is None:
             return
         if head is not None and ref_oid == head.commit_oid:
@@ -895,6 +923,25 @@ class ChangeLedger:
             return None
         return result.stdout.decode("ascii", errors="strict").strip()
 
+    def _session_ref_oids(self) -> dict[str, str]:
+        """Every session ref and the commit it names, read with one Git process.
+
+        Reconciling looks at every session the ledger has held, on every ledger
+        operation. One ``rev-parse`` per session cost a process start each: on
+        Windows 60-100 ms, so 25 sessions in a project made a resumed chat wait
+        about 3.5 s, and the wait grew with each new session.
+        """
+        output = self._git(
+            ["for-each-ref", "--format=%(objectname) %(refname)", _SESSION_REF_PREFIX],
+            check=True,
+        ).stdout
+        refs: dict[str, str] = {}
+        for line in output.decode("utf-8", errors="replace").splitlines():
+            oid, _, name = line.partition(" ")
+            if oid and name:
+                refs[name] = oid
+        return refs
+
     def _revision_list(self, revision: str) -> tuple[str, ...]:
         output = self._git(["rev-list", "--reverse", revision], check=True).stdout
         return tuple(line for line in output.decode("ascii").splitlines() if line)
@@ -1010,7 +1057,7 @@ class ChangeLedger:
             .stdout.decode()
             .strip()
         )
-        ref = f"refs/heads/sessions/{_session_key(session_id)}"
+        ref = f"{_SESSION_REF_PREFIX}{_session_key(session_id)}"
         update_args = ["update-ref", ref, commit_oid, parent_oid or _ZERO_OID]
         self._git(update_args, check=True)
         changes = self._changes_between(parent_oid, commit_oid)
@@ -1397,6 +1444,16 @@ class ChangeLedger:
         path = _safe_workspace_path(self.workspace_root, rel_path)
         return self._path_identity(path)
 
+    def _blob_oid(self, data: bytes) -> str:
+        # Equivalent to `git hash-object --stdin` (no path or filters). Baseline
+        # capture checks every file twice; spawning Git for each hash adds
+        # thousands of process launches in a normal repository, especially costly
+        # on Windows. Keep the existing before/after stat and content checks.
+        digest = hashlib.new(self._object_hash_name, usedforsecurity=False)
+        digest.update(f"blob {len(data)}\0".encode("ascii"))
+        digest.update(data)
+        return digest.hexdigest()
+
     def _path_identity(self, path: Path) -> tuple[str, str] | None:
         if not os.path.lexists(path):
             return None
@@ -1406,12 +1463,7 @@ class ChangeLedger:
             after = path.lstat()
             if _stat_fingerprint(before) != _stat_fingerprint(after):
                 return "unstable", "unstable"
-            oid = (
-                self._git(["hash-object", "--stdin"], input_bytes=data, check=True)
-                .stdout.decode()
-                .strip()
-            )
-            return "120000", oid
+            return "120000", self._blob_oid(data)
         if not path.is_file():
             return "040000", "directory"
         try:
@@ -1423,13 +1475,8 @@ class ChangeLedger:
             return "unstable", "unstable"
         if _stat_fingerprint(before) != _stat_fingerprint(after):
             return "unstable", "unstable"
-        oid = (
-            self._git(["hash-object", "--stdin"], input_bytes=data, check=True)
-            .stdout.decode()
-            .strip()
-        )
         executable = bool(after.st_mode & stat.S_IXUSR) and os.name != "nt"
-        return ("100755" if executable else "100644"), oid
+        return ("100755" if executable else "100644"), self._blob_oid(data)
 
     def _session_git_env(self, session_id: str) -> dict[str, str]:
         env = build_git_process_env()

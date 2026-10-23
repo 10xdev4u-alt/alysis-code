@@ -10,16 +10,44 @@ from typing import Any
 from rich.console import Console
 
 from alysis_code import cli as cli_mod
+from alysis_code.cli_impl.commands.chat_resume_helpers import _is_chat_resume_context_message
 from alysis_code.config import AppConfig
+from alysis_code.internal_artifacts import (
+    INTERNAL_ARTIFACT_MESSAGE_KEY,
+    INTERNAL_FALLBACK_TERMINAL_CONTENT,
+    mark_message_internal,
+    provider_history_messages,
+)
 from alysis_code.llm.metadata import (
     PROVIDER_METADATA_KEY,
     build_provider_route_identity,
     endpoint_descriptor,
     stamp_provider_metadata_for_route,
+    strip_provider_metadata_from_messages,
 )
 from alysis_code.runtime_kind import RuntimeKind
 from alysis_code.session_store import SessionInfo, SessionStore
 from alysis_code.web_research import build_web_research_artifact_from_events
+
+
+def test_visible_resume_recognizes_marked_and_legacy_host_context_only() -> None:
+    legacy = (
+        "<resume_context>\nsource_session_id: retained\n"
+        "source: host_summarized_prior_session_log\ntrust: historical_context_only\n"
+        "historical content\n</resume_context>"
+    )
+    assert _is_chat_resume_context_message({"role": "user", "content": legacy})
+    assert _is_chat_resume_context_message(
+        {"role": "user", "content": "future host format", "_alysis_resume_context": True}
+    )
+    assert not _is_chat_resume_context_message(
+        {"role": "user", "content": "Explain the <resume_context> tag"}
+    )
+    assert not _is_chat_resume_context_message(
+        {"role": "user", "content": "<resume_context>\nThis is a user example."}
+    )
+    assert not _is_chat_resume_context_message({"role": "assistant", "content": legacy})
+    assert not _is_chat_resume_context_message({"role": "user", "content": None})
 
 
 def test_load_chat_resume_messages_reads_user_and_assistant_events(tmp_path: Path) -> None:
@@ -38,6 +66,157 @@ def test_load_chat_resume_messages_reads_user_and_assistant_events(tmp_path: Pat
         {"role": "user", "content": "Hello"},
         {"role": "assistant", "content": "Hi there"},
     ]
+
+
+def test_load_chat_resume_messages_replays_steering_where_it_was_delivered(
+    tmp_path: Path,
+) -> None:
+    log_path = tmp_path / "resume-steered.jsonl"
+    events = [
+        {"type": "user_message", "payload": {"content": "Write the parser"}},
+        {"type": "assistant_message", "payload": {"content": "Reading the grammar"}},
+        {
+            "type": "steer_message_delivered",
+            "payload": {"step": 2, "count": 1, "chars": 40, "messages": ["Use tabs, not spaces"]},
+        },
+        {"type": "final", "payload": {"content": "Done, with tabs"}},
+        # Older logs carried only the count; they replay as before.
+        {"type": "steer_message_delivered", "payload": {"step": 3, "count": 1, "chars": 9}},
+    ]
+    log_path.write_text("\n".join(json.dumps(ev) for ev in events) + "\n", encoding="utf-8")
+
+    loaded = cli_mod._load_chat_resume_messages(log_path)
+    assert loaded == [
+        {"role": "user", "content": "Write the parser"},
+        {"role": "assistant", "content": "Reading the grammar"},
+        {"role": "user", "content": "[Mid-turn message from the user] Use tabs, not spaces"},
+        {"role": "assistant", "content": "Done, with tabs"},
+    ]
+
+
+def test_load_chat_resume_messages_honors_conversation_clear_boundary(tmp_path: Path) -> None:
+    log_path = tmp_path / "resume-after-clear.jsonl"
+    events = [
+        {"type": "user_message", "payload": {"content": "old request"}},
+        {"type": "assistant_message", "payload": {"content": "old answer"}},
+        {
+            "type": "assistant_message",
+            "payload": {
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "old_call",
+                            "type": "function",
+                            "function": {"name": "fs_read", "arguments": "{}"},
+                        }
+                    ],
+                }
+            },
+        },
+        {"type": "conversation_cleared", "payload": {"trigger": "user_command"}},
+        {
+            "type": "tool_result",
+            "payload": {"tool_call_id": "old_call", "content": "stale result"},
+        },
+        {"type": "user_message", "payload": {"content": "new request"}},
+        {"type": "assistant_message", "payload": {"content": "new answer"}},
+    ]
+    log_path.write_text("\n".join(json.dumps(ev) for ev in events) + "\n", encoding="utf-8")
+
+    loaded = cli_mod._load_chat_resume_messages(log_path)
+
+    assert loaded == [
+        {"role": "user", "content": "new request"},
+        {"role": "assistant", "content": "new answer"},
+    ]
+
+
+def test_load_chat_resume_messages_retains_marked_fallback_for_audit(tmp_path: Path) -> None:
+    log_path = tmp_path / "resume-fallback.jsonl"
+    fallback = "Unfinished runtime report with imperative recovery steps."
+    marked = mark_message_internal(
+        {"role": "assistant", "content": fallback},
+        kind="execution_guard_stagnation",
+    )
+    events = [
+        {"type": "user_message", "payload": {"content": "old request"}},
+        {
+            "type": "assistant_message",
+            "payload": {
+                "content": fallback,
+                "message": marked,
+                "internal_fallback": True,
+                "internal_fallback_kind": "execution_guard_stagnation",
+            },
+        },
+        {
+            "type": "final",
+            "payload": {
+                "content": fallback,
+                "internal_fallback": True,
+                "internal_fallback_kind": "execution_guard_stagnation",
+            },
+        },
+    ]
+    log_path.write_text("\n".join(json.dumps(ev) for ev in events) + "\n", encoding="utf-8")
+
+    loaded = cli_mod._load_chat_resume_messages(log_path)
+
+    assert loaded[-1]["content"] == fallback
+    assert loaded[-1][INTERNAL_ARTIFACT_MESSAGE_KEY] == "execution_guard_stagnation"
+    assert provider_history_messages(loaded)[-1] == {
+        "role": "assistant",
+        "content": INTERNAL_FALLBACK_TERMINAL_CONTENT,
+    }
+
+
+def test_load_chat_resume_messages_upgrades_legacy_fallback_by_final_metadata(
+    tmp_path: Path,
+) -> None:
+    log_path = tmp_path / "resume-legacy-fallback.jsonl"
+    fallback = "Arbitrary localized fallback: συνέχισε την παλιά εργασία."
+    events = [
+        {"type": "user_message", "payload": {"content": "old request"}},
+        {"type": "assistant_message", "payload": {"content": fallback}},
+        {
+            "type": "final",
+            "payload": {
+                "content": fallback,
+                "internal_fallback": True,
+                "internal_fallback_kind": "execution_guard_stagnation",
+            },
+        },
+    ]
+    log_path.write_text("\n".join(json.dumps(ev) for ev in events) + "\n", encoding="utf-8")
+
+    loaded = cli_mod._load_chat_resume_messages(log_path)
+
+    assert loaded == [
+        {"role": "user", "content": "old request"},
+        {
+            "role": "assistant",
+            "content": fallback,
+            INTERNAL_ARTIFACT_MESSAGE_KEY: "execution_guard_stagnation",
+        },
+    ]
+    assert fallback not in str(provider_history_messages(loaded))
+
+
+def test_resume_metadata_sanitization_can_preserve_internal_artifact_marker() -> None:
+    marked = mark_message_internal(
+        {"role": "assistant", "content": "runtime fallback"},
+        kind="execution_guard_stagnation",
+    )
+
+    preserved = strip_provider_metadata_from_messages(
+        [marked],
+        preserve_internal_artifacts=True,
+    )
+
+    assert preserved[0][INTERNAL_ARTIFACT_MESSAGE_KEY] == "execution_guard_stagnation"
+    assert INTERNAL_ARTIFACT_MESSAGE_KEY not in strip_provider_metadata_from_messages([marked])[0]
 
 
 def test_load_chat_resume_runtime_settings_uses_latest_valid_event(tmp_path: Path) -> None:
@@ -393,10 +572,9 @@ def test_load_chat_resume_messages_prefers_user_display_content(tmp_path: Path) 
         {
             "type": "user_message",
             "payload": {
-                "content": (
-                    "Fix the bug.\n\nApproved plan:\n1. Inspect code\n\n"
-                    "Now execute this task in the repository and follow the approved plan."
-                ),
+                # Older logs may carry a host-expanded instruction alongside the
+                # text the user actually typed; the resume view prefers the latter.
+                "content": "Fix the bug.\n\n<host_context>\nfocus: src/app.py\n</host_context>",
                 "display_content": "Fix the bug.",
             },
         },
@@ -464,8 +642,7 @@ def test_first_user_message_preview_prefers_user_display_content(tmp_path: Path)
             "type": "user_message",
             "payload": {
                 "content": (
-                    "Implement the feature.\n\nApproved plan:\n1. Edit src/app.py\n\n"
-                    "Now execute this task in the repository and follow the approved plan."
+                    "Implement the feature.\n\n<host_context>\nfocus: src/app.py\n</host_context>"
                 ),
                 "display_content": "Implement the feature.",
             },
@@ -1161,6 +1338,77 @@ def test_build_chat_resume_context_message_summarizes_tools_and_redacts_secrets(
     assert "[REDACTED]" in context
 
 
+def test_build_chat_resume_context_message_honors_conversation_clear_boundary(
+    tmp_path: Path,
+) -> None:
+    log_path = tmp_path / "resume-context-after-clear.jsonl"
+    events = [
+        {
+            "type": "session_start",
+            "payload": {
+                "mode": "auto",
+                "model": "test-model",
+                "workspace_root": "/workspace/project",
+            },
+        },
+        {"type": "user_message", "payload": {"content": "OLD_REQUEST_SENTINEL"}},
+        {
+            "type": "tool_call",
+            "payload": {
+                "name": "shell_run",
+                "arguments": {
+                    "cmd": "old-command-sentinel",
+                    "path": "old/path/sentinel.py",
+                },
+                "step": 1,
+            },
+        },
+        {
+            "type": "tool_result",
+            "payload": {
+                "name": "shell_run",
+                "result": {"exit_code": 1, "stderr": "OLD_FAILURE_SENTINEL"},
+                "step": 1,
+            },
+        },
+        {
+            "type": "verify_run",
+            "payload": {"commands": ["old-verify-sentinel"], "all_passed": False},
+        },
+        {"type": "warning", "payload": {"warning": "OLD_WARNING_SENTINEL"}},
+        {"type": "malformed_before_clear", "payload": "not-an-object"},
+        {"type": "conversation_cleared", "payload": {"trigger": "user_command"}},
+        {"type": "user_message", "payload": {"content": "NEW_REQUEST_SENTINEL"}},
+        {
+            "type": "tool_call",
+            "payload": {
+                "name": "fs_read",
+                "arguments": {"path": "new/path/sentinel.py"},
+                "step": 1,
+            },
+        },
+        {"type": "assistant_message", "payload": {"content": "NEW_ANSWER_SENTINEL"}},
+    ]
+    log_path.write_text("\n".join(json.dumps(ev) for ev in events) + "\n", encoding="utf-8")
+
+    context = cli_mod._build_chat_resume_context_message(log_path)
+
+    assert context is not None
+    assert "NEW_REQUEST_SENTINEL" in context
+    assert "NEW_ANSWER_SENTINEL" in context
+    assert "new/path/sentinel.py" in context
+    assert "- conversation_cleared: 1" in context
+    assert "- user_message: 1" in context
+    assert "- tool_call: 1" in context
+    assert "OLD_REQUEST_SENTINEL" not in context
+    assert "old-command-sentinel" not in context
+    assert "old/path/sentinel.py" not in context
+    assert "OLD_FAILURE_SENTINEL" not in context
+    assert "old-verify-sentinel" not in context
+    assert "OLD_WARNING_SENTINEL" not in context
+    assert "skipped_malformed_events" not in context
+
+
 def test_build_chat_resume_context_message_keeps_recent_tool_activity_bounded(
     tmp_path: Path,
 ) -> None:
@@ -1724,6 +1972,34 @@ def test_resume_chat_session_replaces_current_session_state(tmp_path: Path, monk
     )
 
     old_closed = {"value": False}
+    applied_operations: list[object] = []
+
+    def apply_staged_operation(operation: object) -> None:
+        applied_operations.append(operation)
+
+    def pending_operation_labels() -> list[str]:
+        return ["permissions: fast"]
+
+    scheduler_replacements: list[str] = []
+
+    def on_child_scheduler_replaced(reason: str) -> None:
+        scheduler_replacements.append(reason)
+
+    lifecycle_events: list[dict[str, Any]] = []
+
+    def lifecycle_listener(payload: dict[str, Any]) -> None:
+        lifecycle_events.append(payload)
+
+    class _Scheduler:
+        def __init__(self, listener=None) -> None:  # type: ignore[no-untyped-def]
+            self._listener = listener
+
+        @property
+        def lifecycle_listener(self):  # type: ignore[no-untyped-def]
+            return self._listener
+
+        def set_lifecycle_listener(self, listener) -> None:  # type: ignore[no-untyped-def]
+            self._listener = listener
 
     current = _FakeSession()
     current.cfg = AppConfig(
@@ -1745,6 +2021,11 @@ def test_resume_chat_session_replaces_current_session_state(tmp_path: Path, monk
     current.tool_output_offloader = None
     current.conversation_compactor = None
     current.messages = [{"role": "system", "content": "seed-old"}]
+    current._alysis_tui_interactive = True
+    current.apply_staged_operation = apply_staged_operation
+    current.pending_operation_labels = pending_operation_labels
+    current.on_child_scheduler_replaced = on_child_scheduler_replaced
+    current.child_scheduler = _Scheduler(lifecycle_listener)
 
     def _close_old() -> None:
         old_closed["value"] = True
@@ -1799,6 +2080,7 @@ def test_resume_chat_session_replaces_current_session_state(tmp_path: Path, monk
         new_session.tool_output_offloader = object()
         new_session.conversation_compactor = None
         new_session.messages = [{"role": "system", "content": "seed-new"}]
+        new_session.child_scheduler = _Scheduler()
         return new_session
 
     monkeypatch.setattr(cli_mod, "create_session", fake_create_session)
@@ -1812,6 +2094,17 @@ def test_resume_chat_session_replaces_current_session_state(tmp_path: Path, monk
     assert "Resumed session:" in message
     assert old_closed["value"] is True
     assert current.store.session_id == target_id
+    assert current._alysis_tui_interactive is True
+    assert current.apply_staged_operation is apply_staged_operation
+    assert current.pending_operation_labels is pending_operation_labels
+    assert current.on_child_scheduler_replaced is on_child_scheduler_replaced
+    assert current.child_scheduler.lifecycle_listener is lifecycle_listener
+    staged = object()
+    current.apply_staged_operation(staged)
+    assert applied_operations == [staged]
+    assert current.pending_operation_labels() == ["permissions: fast"]
+    assert scheduler_replacements == []
+    assert lifecycle_events == []
     assert loaded_history == [
         {"role": "user", "content": "previous question"},
         {
@@ -2440,7 +2733,17 @@ def test_classic_resume_explicit_id_survives_fully_filtered_candidates(
 
     def fake_resume(*, session: Any, target_session_id: str) -> tuple[bool, str, list]:
         captured["target"] = target_session_id
+        # Resume first restores the historical base grant. The persona overlay
+        # is reapplied separately below.
+        session.mode = "review"
+        session.pending_permissions_mode = None
         return True, "Resumed.", []
+
+    def fake_reapply_persona(*, session: Any, console: Any) -> None:
+        del console
+        captured["persona_reapplied"] = True
+        session.mode = "readonly"
+        session.persona_restore_mode = "review"
 
     chat_impl_mod._sync_cli_globals(cli_mod)
     # Prime the facade-to-command dependency sync exactly as an earlier classic
@@ -2449,9 +2752,17 @@ def test_classic_resume_explicit_id_survives_fully_filtered_candidates(
     chat_commands_mod._sync_command_globals(chat_impl_mod.__dict__)
     monkeypatch.setattr(cli_mod, "_resume_chat_session", fake_resume, raising=False)
     monkeypatch.setattr(chat_commands_mod, "_resume_chat_session", fake_resume, raising=False)
+    monkeypatch.setattr(
+        chat_commands_mod,
+        "_reapply_resumed_persona",
+        fake_reapply_persona,
+        raising=False,
+    )
 
     session = SimpleNamespace(
         cfg=AppConfig(model="test-model"),
+        mode="auto",
+        pending_permissions_mode="review",
         store=SimpleNamespace(
             sessions_dir=sessions_dir,
             session_id="current",
@@ -2467,9 +2778,12 @@ def test_classic_resume_explicit_id_survives_fully_filtered_candidates(
         pending_images=[],
         console=Console(file=out, force_terminal=False),
         forge_state=cli_mod._ForgeChatState(),
-        plan_mode_state=cli_mod._ChatPlanModeState(),
     )
 
     assert result == "handled"
     assert captured.get("target") == foreign_id
+    assert captured.get("persona_reapplied") is True
+    assert session.mode == "readonly"
+    assert session.persona_restore_mode == "review"
+    assert session.pending_permissions_mode == "review"
     assert "No previous sessions" not in out.getvalue()

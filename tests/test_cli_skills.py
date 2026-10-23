@@ -119,7 +119,8 @@ def test_skill_list_and_info_mark_bundled_skills(tmp_path: Path) -> None:
     assert "code-review (bundled)" in listed.output
     assert info.exit_code == 0
     assert "source_scope: bundled" in info.output
-    assert "skills/bundled/code-review" in info.output
+    # Rich wraps long checkout paths; this checks the source, not terminal layout.
+    assert "skills/bundled/code-review" in "".join(info.output.replace("\\", "/").split())
 
 
 def test_chat_skill_command_lists_discovered_skills_and_info(tmp_path: Path) -> None:
@@ -152,11 +153,10 @@ def test_chat_skill_command_lists_discovered_skills_and_info(tmp_path: Path) -> 
         pending_images=[],
         console=console,
         forge_state=forge_state,
-        plan_mode_state=cli_mod._ChatPlanModeState(),
     )
 
     assert result == "handled"
-    assert "Skills (9)" in stream.getvalue()
+    assert f"Skills ({len(discovered.ordered)})" in stream.getvalue()
     assert "python" in stream.getvalue()
 
     stream = io.StringIO()
@@ -168,7 +168,6 @@ def test_chat_skill_command_lists_discovered_skills_and_info(tmp_path: Path) -> 
         pending_images=[],
         console=console,
         forge_state=forge_state,
-        plan_mode_state=cli_mod._ChatPlanModeState(),
     )
 
     assert result == "handled"
@@ -184,7 +183,6 @@ def test_chat_skill_command_lists_discovered_skills_and_info(tmp_path: Path) -> 
         pending_images=[],
         console=console,
         forge_state=forge_state,
-        plan_mode_state=cli_mod._ChatPlanModeState(),
     )
 
     assert result == "handled"
@@ -215,7 +213,6 @@ def test_chat_skill_list_marks_bundled_skills(tmp_path: Path) -> None:
         pending_images=[],
         console=Console(file=stream, force_terminal=False),
         forge_state=cli_mod._ForgeChatState(),
-        plan_mode_state=cli_mod._ChatPlanModeState(),
     )
 
     assert result == "handled"
@@ -249,7 +246,6 @@ def test_chat_skill_command_returns_one_turn_execution_request(tmp_path: Path) -
         pending_images=[],
         console=console,
         forge_state=cli_mod._ForgeChatState(),
-        plan_mode_state=cli_mod._ChatPlanModeState(),
     )
 
     assert isinstance(result, cli_mod._ChatExecutionRequest)
@@ -293,7 +289,6 @@ def test_idle_dollar_skill_task_returns_one_turn_execution_request(tmp_path: Pat
         pending_images=[],
         console=Console(file=io.StringIO(), force_terminal=False),
         forge_state=cli_mod._ForgeChatState(),
-        plan_mode_state=cli_mod._ChatPlanModeState(),
     )
     handler = getattr(chat_commands, "_handle_idle_skill_invocation", None)
 
@@ -306,7 +301,6 @@ def test_idle_dollar_skill_task_returns_one_turn_execution_request(tmp_path: Pat
         pending_images=[],
         console=Console(file=io.StringIO(), force_terminal=False),
         forge_state=cli_mod._ForgeChatState(),
-        plan_mode_state=cli_mod._ChatPlanModeState(),
     )
 
     assert isinstance(result, cli_mod._ChatExecutionRequest)
@@ -408,7 +402,6 @@ def test_idle_bare_dollar_skill_shows_info(tmp_path: Path) -> None:
         pending_images=[],
         console=Console(file=stream, force_terminal=False),
         forge_state=cli_mod._ForgeChatState(),
-        plan_mode_state=cli_mod._ChatPlanModeState(),
     )
 
     assert result == "handled"
@@ -447,7 +440,6 @@ def test_idle_unknown_dollar_token_remains_user_message(
         pending_images=[],
         console=Console(file=stream, force_terminal=False),
         forge_state=cli_mod._ForgeChatState(),
-        plan_mode_state=cli_mod._ChatPlanModeState(),
     )
 
     assert result is None
@@ -460,7 +452,6 @@ def test_idle_unknown_dollar_token_remains_user_message(
             pending_images=[],
             console=Console(file=io.StringIO(), force_terminal=False),
             forge_state=cli_mod._ForgeChatState(),
-            plan_mode_state=cli_mod._ChatPlanModeState(),
         )
         == "send"
     )
@@ -492,7 +483,6 @@ def test_idle_dollar_token_does_not_resolve_hidden_skill_alias(tmp_path: Path) -
         pending_images=[],
         console=Console(file=stream, force_terminal=False),
         forge_state=cli_mod._ForgeChatState(),
-        plan_mode_state=cli_mod._ChatPlanModeState(),
     )
 
     assert result is None
@@ -510,7 +500,6 @@ def test_chat_help_documents_dollar_skill_syntax(tmp_path: Path) -> None:
         pending_images=[],
         console=Console(file=stream, force_terminal=False, width=120),
         forge_state=cli_mod._ForgeChatState(),
-        plan_mode_state=cli_mod._ChatPlanModeState(),
     )
 
     assert result == "handled"
@@ -546,7 +535,6 @@ def test_chat_skill_command_rejects_when_skills_are_disabled(tmp_path: Path) -> 
         pending_images=[],
         console=console,
         forge_state=cli_mod._ForgeChatState(),
-        plan_mode_state=cli_mod._ChatPlanModeState(),
     )
 
     assert result == "handled"

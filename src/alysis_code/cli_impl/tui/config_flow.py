@@ -22,7 +22,6 @@ from __future__ import annotations
 import os
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
 
 from ...config import (
     ConfigError,
@@ -40,11 +39,13 @@ from ...profile_presets import (
     canonical_model_alias_for_preset,
     find_preset_for_profile,
     make_profile_from_preset,
+    model_display_name,
     preset_selection_label,
 )
 from ...profiles import ProfileSpec, validate_base_url
 from ...provider_auth import ProviderAccountStatus, ProviderAuthError, create_provider_auth
 from ...provider_diagnostics import provider_diagnostic_warning_lines
+from ...provider_url import display_endpoint, display_host
 from ...reasoning_contracts import (
     ALWAYS_ON,
     OFF_SWAPS_MODEL,
@@ -183,8 +184,7 @@ def _short_preset_description(preset: Any) -> str:
     short = _NATIVE_PROTOCOL_SHORT.get(preset.protocol)
     if short:
         return short
-    host = urlparse(preset.base_url).netloc
-    return host or "any OpenAI-compatible base URL"
+    return display_host(preset.base_url) or "any OpenAI-compatible base URL"
 
 
 def _profile_identity(raw: Any) -> tuple[str, str, str]:
@@ -229,6 +229,10 @@ def _profile_row_descriptions(profiles: dict[str, Any], *, active: str | None) -
     profile — which model it pins, which endpoint it hits, whether that model
     id has been retired (the catalog will remap it, but the profile should be
     updated), and whether it duplicates another profile.
+
+    The endpoint is :func:`display_endpoint`, not the raw ``netloc``: that
+    keeps any ``user:token@`` credentials out of the list, and names the hosted
+    gateway instead of printing its Supabase project host.
     """
     identities: dict[tuple[str, str, str], list[str]] = {}
     for name in sorted(profiles):
@@ -239,7 +243,7 @@ def _profile_row_descriptions(profiles: dict[str, Any], *, active: str | None) -
         raw = profiles[name]
         profile = raw if isinstance(raw, dict) else {}
         model = str(profile.get("default_model") or "").strip()
-        host = urlparse(str(profile.get("base_url") or "").strip()).netloc
+        host = display_endpoint(str(profile.get("base_url") or ""))
         parts: list[str] = []
         if name == active:
             parts.append("active")
@@ -279,7 +283,7 @@ _STAGE_MODE: dict[str, Mode] = {
     "custom_model": "input",
     "model_base_url": "input",
     "model_thinking": "list",
-    "model_timeout": "input",
+    "request_timeout": "input",
     "web_search_policy": "list",
     "web_search_mode": "list",
     "cache_mode": "list",
@@ -326,7 +330,7 @@ _PREV: dict[str, str] = {
     "custom_model": "model",
     "model_base_url": "model",
     "model_thinking": "model_base_url",
-    "model_timeout": "model_thinking",
+    "request_timeout": "advanced",
     "web_search_policy": "menu",
     "web_search_mode": "web_search_policy",
     "cache_mode": "menu",
@@ -372,7 +376,7 @@ _BREADCRUMB: dict[str, str] = {
     "custom_model": "default model",
     "model_base_url": "default model",
     "model_thinking": "default model",
-    "model_timeout": "default model",
+    "request_timeout": "advanced",
     "web_search_policy": "web search",
     "web_search_mode": "web search",
     "cache_mode": "context & cache",
@@ -402,9 +406,9 @@ _THINKING_DESCRIPTIONS = {
     "auto": "let the provider decide",
 }
 _CACHE_MODE_DESCRIPTIONS = {
-    "auto": "derive provider-aware cache settings when supported",
+    "auto": "use supported provider caching; default for Alysis hosted models",
     "manual": "use the manual key/retention below when supported",
-    "off": "disable prompt caching",
+    "off": "disable optional client cache controls",
 }
 _CACHE_TTL_DESCRIPTIONS = {
     "5m": "lower lifetime; safest default",
@@ -501,6 +505,7 @@ class ConfigFlow:
         self._subscription_provider_id = ""
         self._subscription_account_status: ProviderAccountStatus | None = None
         self._subscription_switch_account = False
+        self._subscription_save_pending = False
         self._subscription_action_outcome: tuple[str, ProviderAccountStatus | None, str] | None = (
             None
         )
@@ -714,7 +719,7 @@ class ConfigFlow:
     def _short_model(self, delegated: bool) -> tuple[str, str]:
         model = self.state.fields.get("model", "").strip()
         if model:
-            return model, ""
+            return model_display_name(model), ""
         return ("not configured", "") if delegated else ("missing — required", "warn")
 
     def _short_api_key(self, delegated: bool, direct_sub: bool) -> tuple[str, str]:
@@ -748,7 +753,7 @@ class ConfigFlow:
         sub = self._subagent_override_summary()
         forge = _override_summary_text(self.state.forge_role_models)
         if sub == "none" and forge == "none":
-            return "no overrides"
+            return "model overrides · request timeout"
         return f"subagents {sub} · forge {forge}"
 
     def _screen_execution_backend(self) -> Screen:
@@ -865,6 +870,14 @@ class ConfigFlow:
                     value="chat",
                 )
             )
+        elif status.connected:
+            rows.append(
+                Row(
+                    label="Save & start chatting",
+                    description="Choose a model if needed, save changes, and return to chat.",
+                    value=_SAVE,
+                )
+            )
         rows.append(Row(label="Back", description="Return to configuration.", value="back"))
         detail = str(status.detail or "").strip()
         subtitle = f"Account: {account}"
@@ -933,6 +946,11 @@ class ConfigFlow:
     def _screen_advanced(self) -> Screen:
         rows = [
             Row(
+                label="Request timeout",
+                description=f"{self.state.fields['llm_timeout_s']} seconds",
+                value="request_timeout",
+            ),
+            Row(
                 label="Subagent model overrides",
                 description=self._subagent_override_summary(),
                 value="subagents",
@@ -948,7 +966,7 @@ class ConfigFlow:
             stage="advanced",
             mode="list",
             title="Advanced",
-            subtitle="Per-role model overrides — leave empty to inherit the default model.",
+            subtitle="Optional request settings and per-role model overrides.",
             rows=rows,
             hint="",
         )
@@ -1297,11 +1315,11 @@ class ConfigFlow:
             hint="",
         )
 
-    def _screen_model_timeout(self) -> Screen:
+    def _screen_request_timeout(self) -> Screen:
         return Screen(
-            stage="model_timeout",
+            stage="request_timeout",
             mode="input",
-            title="Default model",
+            title="Request timeout",
             subtitle="How long to wait for a model response.",
             input_label="Request timeout (seconds)",
             input_default=str(self.state.fields.get("llm_timeout_s", "")),
@@ -1838,6 +1856,10 @@ class ConfigFlow:
         if self.stage == "menu":
             self.request_cancel()
             return
+        if self.stage == "model" and self._subscription_save_pending:
+            self._subscription_save_pending = False
+            self._goto("subscription_account")
+            return
         if self.stage == "subagent_field":
             self.state.role_models = dict(self._sub_model_snapshot)
             self.state.role_temperatures = dict(self._sub_temp_snapshot)
@@ -1967,6 +1989,22 @@ class ConfigFlow:
         self._goto("subscription_account")
 
     def _choose_subscription_account(self, value: str) -> None:
+        if value == _SAVE:
+            status = (
+                self._subscription_account_status or self._refresh_subscription_account_status()
+            )
+            if not status.connected:
+                return
+            if self.state.subscription_selection_required and (
+                not self.state.fields.get("model", "").strip()
+                or not self.state.thinking_label_explicitly_set
+            ):
+                self._subscription_save_pending = True
+                self.open_default_model()
+                self._set_status("Choose a model and reasoning effort to save and start chatting.")
+            else:
+                self._goto("saving")
+            return
         if value == "chat":
             # Alysis Code connect already persisted everything (self.saved is
             # set), so finishing here closes the overlay, reloads the live
@@ -1995,6 +2033,8 @@ class ConfigFlow:
             self._goto("subagent_roles")
         elif value == "forge":
             self._goto("forge_roles")
+        elif value == "request_timeout":
+            self._goto("request_timeout")
 
     def _choose_subagent_roles(self, value: str) -> None:
         if value == "back":
@@ -2156,22 +2196,27 @@ class ConfigFlow:
 
     def _choose_thinking(self, value: str) -> None:
         self.state.set_thinking_label(value)
+        if self._subscription_save_pending:
+            self._subscription_save_pending = False
+            self._goto("saving")
+            return
         if self._preset_setup_chain:
             self._complete_preset_setup_chain(
                 model=str(self.state.fields.get("model", "") or "").strip()
             )
             return
-        self._goto("model_timeout")
+        self._goto("menu")
+        self._set_status("Default model updated. Save to apply.", "ok")
 
-    def _submit_model_timeout(self, text: str) -> None:
+    def _submit_request_timeout(self, text: str) -> None:
         value = text.strip() or str(self.state.fields.get("llm_timeout_s", ""))
         number = _finite_float(value, fallback=None)
         if number is None or number <= 0:
             self._set_status("Request timeout must be a positive number.", "err")
             return
         self.state.set_field("llm_timeout_s", _format_number(number))
-        self._goto("menu")
-        self._set_status("Default model updated. Save to apply.", "ok")
+        self._goto("advanced")
+        self._set_status("Request timeout updated. Save to apply.", "ok")
 
     # --------------------------------------------------------------- web search
 
@@ -2287,7 +2332,7 @@ class ConfigFlow:
     def _finish_preset_chain_if_active(self, *, model: str) -> bool:
         """End the add-provider chain after the model is chosen.
 
-        Selecting a model normally advances to base URL / thinking / timeout. When
+        Selecting a model normally advances to base URL / thinking. When
         we arrived here via "Add provider preset" we skip fields already carried by
         the profile. NVIDIA remains on the chain for one more step because reasoning
         controls differ between models hosted behind the same endpoint.
@@ -2734,7 +2779,7 @@ class ConfigFlow:
         self._goto("subscription_account")
         if kind == "connected":
             self._set_status(
-                "Subscription connected. Save model access, then review Default Model.",
+                "Subscription connected. Press s or choose Save & start chatting.",
                 "ok",
             )
         else:

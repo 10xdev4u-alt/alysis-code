@@ -12,8 +12,8 @@
 
 <p align="center">
   <a href="https://alysiscode.com/">Website</a> ·
-  <a href="https://github.com/AlysisAi/alysis-code/tree/main/docs">Docs</a> ·
-  <a href="https://github.com/AlysisAi/alysis-code/blob/main/docs/CHANGELOG.md">Changelog</a>
+  <a href="https://github.com/AlysisAi/AlysisCode/tree/main/docs">Docs</a> ·
+  <a href="https://github.com/AlysisAi/AlysisCode/blob/main/docs/CHANGELOG.md">Changelog</a>
 </p>
 
 <p align="center">
@@ -21,10 +21,10 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/AlysisAi/alysis-code/actions/workflows/ci.yml"><img src="https://github.com/AlysisAi/alysis-code/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/AlysisAi/AlysisCode/actions/workflows/ci.yml"><img src="https://github.com/AlysisAi/AlysisCode/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://pypi.org/project/alysis-code/"><img src="https://img.shields.io/pypi/v/alysis-code.svg" alt="PyPI version"></a>
   <a href="https://pypi.org/project/alysis-code/"><img src="https://img.shields.io/pypi/pyversions/alysis-code.svg" alt="Python versions"></a>
-  <a href="https://github.com/AlysisAi/alysis-code/blob/main/LICENSE"><img src="https://img.shields.io/pypi/l/alysis-code.svg" alt="License"></a>
+  <a href="https://github.com/AlysisAi/AlysisCode/blob/main/LICENSE"><img src="https://img.shields.io/pypi/l/alysis-code.svg" alt="License"></a>
 </p>
 
 ---
@@ -35,11 +35,33 @@ Alysis Code requires **Python 3.11+** and runs on macOS, Linux, and Windows.
 
 **1 — Install**
 
-```bash
-pipx install alysis-code
+On Windows, paste this into **PowerShell**:
+
+```powershell
+irm https://raw.githubusercontent.com/AlysisAi/AlysisCode/main/scripts/install.ps1 | iex
 ```
 
-**2 — Launch in your project**
+On Linux, macOS, or inside a **WSL/Ubuntu terminal**:
+
+```sh
+curl -LsSf https://raw.githubusercontent.com/AlysisAi/AlysisCode/main/scripts/install.sh | sh
+```
+
+The installers provision uv and Python 3.12 when needed. No existing Python or pipx is required.
+PowerShell can use `alysis` immediately; after the shell installer, follow its PATH instructions
+or open a new terminal. If you already use pipx, `pipx install alysis-code` also works;
+run `pipx ensurepath` and restart your terminal if the command is missing.
+
+**2 — Connect your account**
+
+```sh
+alysis login
+```
+
+Approve the code in your browser to use your Alysis credits. No cloud environment variables
+are needed. Existing 0.15.1 users should upgrade first with `alysis update`.
+
+**3 — Launch in your project**
 
 ```bash
 cd your-project
@@ -50,7 +72,7 @@ The first run opens a guided setup wizard: choose **Use an API key** or **Use an
 connect a provider, and pick your default model. Re-run it anytime with `alysis-code setup`.
 (`alysis` works too, as a short alias.)
 
-**3 — Start building**
+**Start building**
 
 ```bash
 alysis-code chat                            # interactive coding session
@@ -89,16 +111,18 @@ Shell and verification commands default to strict sandboxing. Verification can r
 sandbox only when explicitly configured with `verify_sandbox.mode="off"` or
 `ALYSIS_VERIFY_SANDBOX_MODE=off`.
 
-## Modes & Personas
+## Permissions & Personas
 
 Two layers control what the agent may do — one enforces, one focuses.
 
-**Execution modes** are the enforcement layer. Choose one per command with `--mode`, switch in chat
-with `/mode`, or set a default with `alysis-code config set default_mode <mode>`:
+**Permissions** are the enforcement layer. Choose one per command with `--mode`, select the next
+message's level in chat with `/permissions` or **Shift+Tab**, or set a default with
+`alysis-code config set default_mode <mode>`. A selection takes effect when the next user message
+starts; it does not change a turn already running:
 
 | Mode | Behavior |
 | --- | --- |
-| `readonly` | Inspection only — no file writes, shell, MCP, or subagent delegation. |
+| `readonly` | Inspection plus top-level read-only delegation — no file writes, shell, MCP, candidate apply/discard, or nested delegation. |
 | `review` | The safe default — previews and asks before every write and shell command. |
 | `auto` | Applies routine edits with fewer prompts; dangerous operations stay blocked. |
 | `fullaccess` | No mode-level prompts for trusted workspaces — the denylist and audit log stay active. |
@@ -117,6 +141,10 @@ A persona is a convention, never a permission: it can keep or lower your executi
 never raise it. Define your own in `.alysis_personas/*.md`.
 [Learn more](https://alysiscode.com/docs/concepts/personas)
 
+Use `/persona architect` for planning in chat, or `/forge` for a plan-driven execution workflow.
+The former chat `/plan` commands have been removed; Forge retains its plan views and editor.
+Persona changes made during a running turn apply after that turn finishes.
+
 ## Project Links
 
 - [Website](https://alysiscode.com/)
@@ -129,6 +157,8 @@ never raise it. Define your own in `.alysis_personas/*.md`.
 
 Apache-2.0. You're free to use, modify, and distribute this code, including commercially, as long as
 you keep the attribution and license notices. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
+The shared editor sidebar includes MIT-licensed adaptations from Kilo Code/OpenCode; retain its
+[third-party notices](extensions/shared-ui/THIRD_PARTY_NOTICES.txt).
 
 ## FAQ
 
@@ -150,4 +180,12 @@ More questions? See the [full FAQ](https://alysiscode.com/docs/faq).
 
 ---
 
-**Join the community** — [X](https://x.com/alysiscode) | [GitHub Issues](../../issues)
+**Join the community** — [X](https://x.com/alysiscode) | [GitHub Issues](https://github.com/AlysisAi/AlysisCode/issues)
+
+
+## Editor integrations
+
+[VS Code](extensions/vscode-alysis/README.md) uses the shared Alysis sidebar and Python IDE bridge.
+[JetBrains](extensions/jetbrains-alysis/README.md) is a development preview with a smaller feature set.
+The VS Code Marketplace pre-release is pending production signing and acceptance; see the
+[IDE release status](docs/vscode-marketplace-launch.md) before installing component packages.

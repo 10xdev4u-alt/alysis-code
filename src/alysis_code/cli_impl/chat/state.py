@@ -5,19 +5,15 @@ from typing import Any
 
 from ...config import AppConfig
 from ...forge import RunPaths
-from ...plan_repair import ClarificationLoopTracker
+from ...forge_planner_engine import ForgePlannerState
 
 
 @dataclass
-class _ForgePlannerSessionState:
-    transcript: list[dict[str, str]] = field(default_factory=list)
-    cfg: AppConfig | None = None
-    workspace_context: dict[str, Any] | None = None
-    awaiting_clarification: bool = False
-    pending_questions: list[str] = field(default_factory=list)
+class _ForgePlannerSessionState(ForgePlannerState):
+    """Legacy CLI spelling for the UI-neutral planner state."""
+
     # Consecutive clarification-only planner turns for the current goal. Past the
     # policy cap the planner is made to draft a plan instead of asking again.
-    clarification_loop: ClarificationLoopTracker = field(default_factory=ClarificationLoopTracker)
 
 
 @dataclass(frozen=True)
@@ -101,23 +97,17 @@ class _ForgeChatState:
         self.planner_session.pending_questions = list(value)
 
 
-@dataclass
-class _ChatPlanModeState:
-    enabled: bool = False
-    restore_mode: str | None = None
-    latest_task: str | None = None
-    latest_draft: str | None = None
-
-
 @dataclass(frozen=True)
 class _ChatExecutionRequest:
     instruction: str
     routing_mode_override: str | None = None
     ephemeral_system_messages: tuple[str, ...] = ()
     ephemeral_user_messages: tuple[str, ...] = ()
+    # One-turn execution-mode override (``/ask``): the chat loop applies
+    # ``mode_override`` before the turn and restores ``restore_mode_after``
+    # afterwards, exception-safe.
     mode_override: str | None = None
     restore_mode_after: str | None = None
-    plan_mode_capture_task: str | None = None
     chat_only: bool = False
 
 

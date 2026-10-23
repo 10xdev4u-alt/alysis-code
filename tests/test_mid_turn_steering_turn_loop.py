@@ -62,9 +62,11 @@ class _ScriptedClient:
         tools: list[dict[str, Any]] | None = None,
         stream: bool = False,
         on_text_delta=None,  # type: ignore[no-untyped-def]
+        on_reasoning_delta=None,  # type: ignore[no-untyped-def]
         temperature: float | None = None,
+        cancellation_token: Any | None = None,
     ) -> LLMResponse:
-        _ = stream, on_text_delta, temperature
+        _ = stream, on_text_delta, on_reasoning_delta, temperature, cancellation_token
         self.calls.append({"messages": list(messages), "tools": tools})
         response = self._responses[self._index]
         self._index += 1
@@ -179,6 +181,7 @@ def test_steering_delivery_is_recorded(tmp_path: Path) -> None:
     assert payload["count"] == 1
     assert payload["step"] >= 2
     assert payload["chars"] >= len(STEER_TEXT)
+    assert payload["messages"] == [STEER_TEXT]
 
 
 def test_turn_without_steering_keeps_normal_behavior(tmp_path: Path) -> None:
@@ -314,6 +317,10 @@ def test_rollback_after_llm_error_returns_the_note_to_the_inbox(tmp_path: Path) 
 
     client = FailingClient([])
     session = _make_session(tmp_path, client)
+    restored_notifications: list[list[str]] = []
+    session.surface.on_steer_messages_restored = lambda messages: restored_notifications.append(
+        list(messages)
+    )
     inbox = steer_inbox_for(session, create=True)
     assert inbox is not None
     inbox.send(STEER_TEXT)
@@ -325,6 +332,7 @@ def test_rollback_after_llm_error_returns_the_note_to_the_inbox(tmp_path: Path) 
         session.close()
 
     assert recovered == [STEER_TEXT]
+    assert restored_notifications == [[STEER_TEXT]]
     assert not any(
         STEER_MARKER in str(message.get("content") or "") for message in session.messages
     )

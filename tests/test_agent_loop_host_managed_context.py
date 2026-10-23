@@ -3,7 +3,6 @@ from __future__ import annotations
 import pytest
 
 from alysis_code import agent_loop as agent_loop_mod
-from alysis_code.agent.turn_contract import TurnEffect, TurnOutcome, TurnSemantics
 
 
 @pytest.mark.parametrize(
@@ -21,32 +20,6 @@ def test_is_host_managed_user_context_message_recognizes_wrappers_and_legacy_mar
     text: str,
 ) -> None:
     assert agent_loop_mod._is_host_managed_user_context_message(text) is True
-
-
-@pytest.mark.parametrize(
-    "text",
-    [
-        "<skill_context>\nsource: discovered skill bundles\n</skill_context>\n",
-        "<matched_skill_context>\nsource: host lexical matcher\n</matched_skill_context>\n",
-        "<explicit_skill_context>\nsource: user-selected skill for this turn only\n</explicit_skill_context>\n",
-        "<repo_conventions>\nsource: repo-authored conventions files\n</repo_conventions>\n",
-    ],
-)
-def test_task_brief_candidate_ignores_host_managed_skill_and_convention_wrappers(
-    text: str,
-) -> None:
-    assert (
-        agent_loop_mod._build_repo_task_brief_message(
-            existing_content=agent_loop_mod._empty_task_brief_message(),
-            pending_instruction=text,
-            turn_semantics=TurnSemantics(
-                outcome=TurnOutcome.CHANGE,
-                requested_effects=(TurnEffect.WRITE_WORKSPACE,),
-            ),
-            route="repo",
-        )
-        is None
-    )
 
 
 def test_recent_visible_non_repo_history_excludes_host_managed_skill_and_convention_wrappers() -> (
