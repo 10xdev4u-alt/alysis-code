@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 from .cli_common import *
 from .update import _cached_update_notice
+from ...command_text import command_text
 
 
 def _is_narrow_terminal() -> bool:
@@ -402,7 +403,7 @@ def _current_branch_label(root: Path) -> str:
         ["git", "-C", os.fspath(root), "rev-parse", "--abbrev-ref", "HEAD"],
         check=False,
         capture_output=True,
-        text=True,
+        **command_text(),
     )
     if proc.returncode != 0:
         return "-"
@@ -417,7 +418,7 @@ def _is_git_dirty(root: Path) -> bool:
         ["git", "-C", os.fspath(root), "status", "--porcelain"],
         check=False,
         capture_output=True,
-        text=True,
+        **command_text(),
     )
     if proc.returncode != 0:
         return False
@@ -540,9 +541,12 @@ def _chat_context_hud_value(session: Any) -> str:
     if value is None:
         return "n/a"
     label = f"{value:.1f}%"
-    if value < 10.0:
+    warning_percent = _chat_effective_budget_percent_value(session)
+    if warning_percent is None:
+        warning_percent = value
+    if warning_percent < 10.0:
         return f"{label} !!"
-    if value < 25.0:
+    if warning_percent < 25.0:
         return f"{label} !"
     return label
 
@@ -596,11 +600,12 @@ def _chat_context_percent_value(session: Any) -> float | None:
     ctx = getattr(session, "_hud_context_cache", None)
     if ctx is None:
         return None
-    # The primary HUD must describe provider-usable capacity. The former
-    # baseline-subtracted conversation percentage always started at 100%, even
-    # when bootstrap prompts and tool schemas already occupied a substantial
-    # part of the model window.
-    percent = getattr(ctx, "effective_percent_left", None)
+    # Show the conversation space remaining after startup prompts and tools,
+    # so a fresh session starts at 100%. Capacity warnings still use the full
+    # request through _chat_effective_budget_percent_value.
+    percent = getattr(ctx, "dynamic_context_percent_left", None)
+    if percent is None:
+        percent = getattr(ctx, "effective_percent_left", None)
     if percent is None:
         percent = getattr(ctx, "context_window_percent_left", None)
     if percent is None:
@@ -846,12 +851,12 @@ def _set_chat_trace_level(*, session: Any, level: str) -> str:
     return applied
 
 
-def _emit_plan_mode_trace(
+def _emit_forge_planner_trace(
     *,
     session: Any,
     message: str,
     full_only: bool = False,
-    source: str = "plan_mode",
+    source: str = "forge_planner",
 ) -> None:
     clean = message.strip()
     if not clean:
@@ -879,20 +884,6 @@ def _emit_plan_mode_trace(
             return
 
 
-def _emit_forge_planner_trace(
-    *,
-    session: Any,
-    message: str,
-    full_only: bool = False,
-) -> None:
-    _emit_plan_mode_trace(
-        session=session,
-        message=message,
-        full_only=full_only,
-        source="forge_planner",
-    )
-
-
 def _make_forge_swarm_trace_sink(
     *,
     session: Any,
@@ -911,7 +902,7 @@ def _make_forge_swarm_trace_sink(
     )
 
 
-def _make_plan_mode_delta_trace_callback(*, session: Any) -> Callable[[str], None] | None:
+def _make_forge_planner_delta_trace_callback(*, session: Any) -> Callable[[str], None] | None:
     trace_level = _chat_trace_level(session)
     if trace_level == "off":
         return None
@@ -926,7 +917,7 @@ def _make_plan_mode_delta_trace_callback(*, session: Any) -> Callable[[str], Non
             return
         seen_chars += len(delta)
         if not started:
-            _emit_plan_mode_trace(session=session, message="Receiving planner output...")
+            _emit_forge_planner_trace(session=session, message="Receiving planner output...")
             started = True
         if trace_level != "full":
             return
@@ -934,7 +925,7 @@ def _make_plan_mode_delta_trace_callback(*, session: Any) -> Callable[[str], Non
         if bucket <= last_full_bucket:
             return
         last_full_bucket = bucket
-        _emit_plan_mode_trace(
+        _emit_forge_planner_trace(
             session=session,
             message=f"Planner draft progress: ~{seen_chars} chars captured.",
             full_only=True,

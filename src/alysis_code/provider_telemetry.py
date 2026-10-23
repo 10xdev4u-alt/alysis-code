@@ -16,7 +16,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from .failure_category import is_provider_throttling_error, is_provider_unavailable_error
-from .llm.types import LLMResponse, LLMUsage
+from .llm.types import LLMResponse, LLMStreamNoProgressError, LLMUsage
 from .logging_redaction import redact_log_text
 from .run_provenance import (
     extract_system_fingerprint,
@@ -95,6 +95,12 @@ _HIDDEN_PAYLOAD_KEYS = {
     "tool_calls",
     "tools",
 }
+_ATTEMPT_TIMESTAMP_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z")
+_ATTEMPT_USAGE_SOURCES = frozenset({"provider", "estimated", "none"})
+# Attempt terminal reasons that name the call-level failure category directly.
+# A budget abort keeps the category it always had ("deadline"); timeouts keep
+# "no_progress" only when the stream watchdog raised them, as before.
+_ATTEMPT_REASON_FAILURE_CATEGORIES = {"cancelled": "cancelled", "budget_abort": "deadline"}
 _SECRET_VALUE_RE = re.compile(
     r"(?i)\b(?:sk|tvly|ghp|github_pat|xoxb|xapp|ya29|AIza|key|token)[-_A-Za-z0-9]{10,}\b"
 )
@@ -316,11 +322,94 @@ class ProviderCallTelemetryRecorder:
         self._first_reasoning_delta_ms: float | None = None
         self._reasoning_delta_count = 0
         self._retry_count = 0
+        # Set only by clients that report when an attempt really begins; see
+        # note_attempt_started.
+        self._retries_started: int | None = None
         self._retry_reasons: list[str] = []
         # Captured from the live HTTP response, so it survives into the error
         # payload too: the request id on a 429 is often the only handle a
         # provider will accept when asked what happened.
         self._response_headers: dict[str, str] = {}
+        self._attempts: list[dict[str, Any]] = []
+        self._attempt_count = 0
+        self._attempt_usage_totals = _usage_payload(None)
+        self._attempt_usage_missing_counts = dict.fromkeys(self._attempt_usage_totals, 0)
+        self._attempt_usage_missing_count = 0
+        self._last_attempt_reason: str | None = None
+
+    def record_attempt(self, attempt: Mapping[str, Any]) -> None:
+        """Keep bounded, derived HTTP-attempt evidence, never response content.
+
+        Attempts are nested within the logical call, not additional usage records.
+        Byte counts describe decoded HTTP body bytes, not network/billing usage.
+        """
+        self._attempt_count += 1
+        safe: dict[str, Any] = {"attempt": self._attempt_count}
+        for key in (
+            "status_code",
+            "latency_ms",
+            "first_byte_ms",
+            "first_event_ms",
+            "body_bytes_received",
+            "byte_chunk_count",
+            "line_count",
+            "data_line_count",
+            "event_count",
+            "text_delta_count",
+            "reasoning_delta_count",
+            "tool_delta_count",
+        ):
+            value = attempt.get(key)
+            safe[key] = max(0, value) if type(value) is int else None
+        for key in ("stream", "done_received", "usage_observed", "finish_reason_observed"):
+            safe[key] = attempt.get(key) is True
+        started_at = attempt.get("request_started_at")
+        safe["request_started_at"] = (
+            started_at
+            if isinstance(started_at, str) and _ATTEMPT_TIMESTAMP_RE.fullmatch(started_at)
+            else None
+        )
+        retry_index = attempt.get("retry_index")
+        safe["retry_index"] = retry_index if type(retry_index) is int and retry_index >= 0 else None
+        usage_source = attempt.get("usage_source")
+        safe["usage_source"] = usage_source if usage_source in _ATTEMPT_USAGE_SOURCES else None
+        reason = attempt.get("terminal_reason")
+        safe["terminal_reason"] = (
+            reason
+            if reason
+            in {
+                "done",
+                "response",
+                "stream_truncated",
+                "http_error",
+                "transport_error",
+                "timeout_first_event",
+                "timeout_stall",
+                "budget_abort",
+                "cancelled",
+                "malformed_event",
+                "callback_error",
+                "client_error",
+                "invalid_response",
+                "provider_error",
+            }
+            else "unknown"
+        )
+        self._last_attempt_reason = safe["terminal_reason"]
+        usage = attempt.get("usage")
+        safe["usage"] = _usage_payload(usage if isinstance(usage, LLMUsage) else None)
+        for key, value in list(safe["usage"].items()):
+            if type(value) is int and value >= 0:
+                self._attempt_usage_totals[key] = (self._attempt_usage_totals[key] or 0) + value
+            else:
+                safe["usage"][key] = None
+                self._attempt_usage_missing_counts[key] += 1
+        if any(
+            safe["usage"][key] is None for key in ("input_tokens_uncached", "completion_tokens")
+        ):
+            self._attempt_usage_missing_count += 1
+        if len(self._attempts) < 64:
+            self._attempts.append(safe)
 
     def wrap_text_delta(
         self,
@@ -379,6 +468,19 @@ class ProviderCallTelemetryRecorder:
         except Exception:  # noqa: BLE001 - provenance must not break a call
             self._response_headers = {}
 
+    def note_attempt_started(self, *, retry_index: int) -> None:
+        """Record that a provider-level attempt really began.
+
+        ``on_retry`` fires when a retry is scheduled, before its backoff; a
+        retry cancelled during that backoff never ran. For clients that call
+        this, ``retry_count`` counts only retries that started.
+        """
+        try:
+            index = max(0, int(retry_index))
+        except (TypeError, ValueError):
+            return
+        self._retries_started = max(self._retries_started or 0, index)
+
     def on_retry(self, attempt: int, reason: str, _wait_seconds: float) -> None:
         try:
             self._retry_count = max(self._retry_count, int(attempt))
@@ -391,7 +493,7 @@ class ProviderCallTelemetryRecorder:
     def run(self, call: Callable[[], LLMResponse]) -> LLMResponse:
         try:
             response = call()
-        except Exception as exc:
+        except (Exception, KeyboardInterrupt) as exc:
             self.record_error(exc)
             raise
         self.record_success(response)
@@ -420,9 +522,21 @@ class ProviderCallTelemetryRecorder:
         payload["web_search"].update(_provider_metadata_web_search_counts(response))
         record_provider_call(payload)
 
-    def record_error(self, exc: Exception) -> None:
+    def record_error(self, exc: BaseException) -> None:
         latency_ms = _duration_ms(self._started_ms)
         failure_category = _status_category(exc)
+        if self._last_attempt_reason:
+            terminal_reason = self._last_attempt_reason
+            if terminal_reason in {"client_error", "callback_error"}:
+                failure_category = "client_error"
+            elif terminal_reason == "malformed_event":
+                failure_category = "invalid_response"
+            elif terminal_reason in _ATTEMPT_REASON_FAILURE_CATEGORIES:
+                failure_category = _ATTEMPT_REASON_FAILURE_CATEGORIES[terminal_reason]
+            elif terminal_reason in {"timeout_first_event", "timeout_stall"} and isinstance(
+                exc, LLMStreamNoProgressError
+            ):
+                failure_category = "no_progress"
         payload = self._base_payload(
             latency_ms=latency_ms,
             status_category=("failed" if self.operation == "cache_keepalive" else failure_category),
@@ -473,8 +587,17 @@ class ProviderCallTelemetryRecorder:
                 self.token_reconciliation,
                 None,
             ),
-            "retry_count": self._retry_count,
+            "retry_count": (
+                self._retry_count if self._retries_started is None else self._retries_started
+            ),
             "retry_reasons": list(self._retry_reasons),
+            "attempts": copy.deepcopy(self._attempts),
+            "attempt_count": self._attempt_count,
+            "attempts_omitted": self._attempt_count - len(self._attempts),
+            "attempt_usage_totals": dict(self._attempt_usage_totals),
+            "attempt_usage_missing_count": self._attempt_usage_missing_count,
+            "attempt_usage_missing_counts": dict(self._attempt_usage_missing_counts),
+            "attempt_usage_scope": "latest_observed_per_http_attempt",
             "status_category": status_category,
             "latency_ms": latency_ms,
             "sampling": copy.deepcopy(self.sampling),
@@ -711,6 +834,10 @@ def _empty_cache_diagnostics_bucket() -> dict[str, Any]:
         "cache_field_emitted_call_count": 0,
         "cache_read_call_count": 0,
         "cache_write_call_count": 0,
+        "cache_read_usage_sample_count": 0,
+        "cache_read_usage_missing_call_count": 0,
+        "cache_write_usage_sample_count": 0,
+        "cache_write_usage_missing_call_count": 0,
         "cache_fallback_call_count": 0,
         "provider_rejection_or_downgrade_call_count": 0,
         "strategy_counts": {},
@@ -776,10 +903,16 @@ def _accumulate_cache_diagnostics(bucket: dict[str, Any], call: Mapping[str, Any
 
     if _cache_field_emitted(cache_policy, request_shape):
         bucket["cache_field_emitted_call_count"] += 1
-    if _effective_cache_read_tokens(usage) > 0:
-        bucket["cache_read_call_count"] += 1
-    if _effective_cache_write_tokens(usage) > 0:
-        bucket["cache_write_call_count"] += 1
+    for kind, observed in (
+        ("read", _observed_cache_read_tokens(usage)),
+        ("write", _observed_cache_write_tokens(usage)),
+    ):
+        if observed is None:
+            bucket[f"cache_{kind}_usage_missing_call_count"] += 1
+        else:
+            bucket[f"cache_{kind}_usage_sample_count"] += 1
+            if observed > 0:
+                bucket[f"cache_{kind}_call_count"] += 1
 
     if isinstance(request_shape, Mapping):
         for reason in _safe_label_list(request_shape.get("risk_reasons")):
@@ -840,8 +973,11 @@ def _finalize_cache_diagnostics_bucket(bucket: dict[str, Any]) -> dict[str, Any]
         finalized.get("cache_field_emitted_call_count"),
         provider_calls,
     )
-    finalized["cache_read_rate"] = _rate(finalized.get("cache_read_call_count"), provider_calls)
-    finalized["cache_write_rate"] = _rate(finalized.get("cache_write_call_count"), provider_calls)
+    for kind in ("read", "write"):
+        finalized[f"cache_{kind}_rate"] = _rate(
+            finalized.get(f"cache_{kind}_call_count"),
+            finalized.get(f"cache_{kind}_usage_sample_count"),
+        )
     finalized["cache_fallback_rate"] = _rate(
         finalized.get("cache_fallback_call_count"),
         provider_calls,
@@ -1014,6 +1150,13 @@ def _empty_cache_effectiveness_bucket() -> dict[str, Any]:
         "cache_used_call_count": 0,
         "cache_read_call_count": 0,
         "cache_write_call_count": 0,
+        "cache_read_usage_sample_count": 0,
+        "cache_read_usage_missing_call_count": 0,
+        "cache_write_usage_sample_count": 0,
+        "cache_write_usage_missing_call_count": 0,
+        "cache_read_ratio_sample_count": 0,
+        "cache_read_ratio_prompt_tokens": 0,
+        "cache_read_ratio_cached_tokens": 0,
         "cache_fallback_call_count": 0,
         "cache_miss_call_count": 0,
         "strategy_counts": {},
@@ -1032,8 +1175,22 @@ def _accumulate_cache_effectiveness(bucket: dict[str, Any], call: Mapping[str, A
     bucket["provider_call_count"] += 1
     cache_policy = call.get("cache_policy")
     usage = call.get("usage") if isinstance(call.get("usage"), Mapping) else {}
-    effective_read = _effective_cache_read_tokens(usage)
-    effective_write = _effective_cache_write_tokens(usage)
+    observed_read = _observed_cache_read_tokens(usage)
+    observed_write = _observed_cache_write_tokens(usage)
+    effective_read = observed_read or 0
+    effective_write = observed_write or 0
+    for kind, observed in (("read", observed_read), ("write", observed_write)):
+        if observed is None:
+            bucket[f"cache_{kind}_usage_missing_call_count"] += 1
+        else:
+            bucket[f"cache_{kind}_usage_sample_count"] += 1
+    prompt = _observed_cache_token_count(usage.get("prompt_tokens"))
+    if prompt is not None and observed_read is not None and observed_read <= prompt:
+        # Only compare counts reported for the same calls. Otherwise missing
+        # cache counters would dilute the ratio as if they were reported zero.
+        bucket["cache_read_ratio_sample_count"] += 1
+        bucket["cache_read_ratio_prompt_tokens"] += prompt
+        bucket["cache_read_ratio_cached_tokens"] += observed_read
 
     if isinstance(cache_policy, Mapping):
         bucket["cache_policy_call_count"] += 1
@@ -1056,7 +1213,7 @@ def _accumulate_cache_effectiveness(bucket: dict[str, Any], call: Mapping[str, A
             _increment_count(bucket["strategy_counts"], strategy)
         if status:
             _increment_count(bucket["status_counts"], status)
-        if enabled and not used and effective_read == 0 and effective_write == 0:
+        if enabled and not used and observed_read == 0 and effective_write == 0:
             bucket["cache_miss_call_count"] += 1
 
     if effective_read > 0:
@@ -1073,35 +1230,41 @@ def _accumulate_cache_effectiveness(bucket: dict[str, Any], call: Mapping[str, A
 
 def _finalize_cache_effectiveness_bucket(bucket: dict[str, Any]) -> dict[str, Any]:
     finalized = copy.deepcopy(bucket)
-    token_totals = finalized.get("token_totals")
-    if isinstance(token_totals, Mapping):
-        prompt_tokens = _non_negative_int_value(token_totals.get("prompt_tokens"))
-        cached_tokens = _non_negative_int_value(
-            token_totals.get("effective_cache_read_input_tokens")
-        )
-        finalized["cache_read_ratio"] = (
-            round(cached_tokens / prompt_tokens, 4) if prompt_tokens > 0 else None
-        )
+    prompt_tokens = finalized["cache_read_ratio_prompt_tokens"]
+    cached_tokens = finalized["cache_read_ratio_cached_tokens"]
+    finalized["cache_read_ratio"] = (
+        round(cached_tokens / prompt_tokens, 4) if prompt_tokens > 0 else None
+    )
     finalized["strategy_counts"] = dict(sorted(finalized["strategy_counts"].items()))
     finalized["status_counts"] = dict(sorted(finalized["status_counts"].items()))
     finalized["fallback_counts"] = dict(sorted(finalized["fallback_counts"].items()))
     return finalized
 
 
-def _effective_cache_read_tokens(usage: Mapping[str, Any]) -> int:
-    cache_read = usage.get("cache_read_input_tokens")
-    if cache_read is not None:
-        return _non_negative_int_value(cache_read)
-    return _non_negative_int_value(usage.get("cached_prompt_tokens"))
+def _observed_cache_token_count(value: Any) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
 
 
-def _effective_cache_write_tokens(usage: Mapping[str, Any]) -> int:
-    cache_creation = usage.get("cache_creation_input_tokens")
-    if cache_creation is not None:
-        return _non_negative_int_value(cache_creation)
-    return _non_negative_int_value(usage.get("cache_creation_5m_input_tokens")) + (
-        _non_negative_int_value(usage.get("cache_creation_1h_input_tokens"))
-    )
+def _observed_cache_read_tokens(usage: Mapping[str, Any]) -> int | None:
+    for field in ("cache_read_input_tokens", "cached_prompt_tokens"):
+        value = _observed_cache_token_count(usage.get(field))
+        if value is not None:
+            return value
+    return None
+
+
+def _observed_cache_write_tokens(usage: Mapping[str, Any]) -> int | None:
+    total = _observed_cache_token_count(usage.get("cache_creation_input_tokens"))
+    if total is not None:
+        return total
+    parts = [
+        _observed_cache_token_count(usage.get(field))
+        for field in ("cache_creation_5m_input_tokens", "cache_creation_1h_input_tokens")
+    ]
+    reported = [value for value in parts if value is not None]
+    # A positive part proves a write; a zero part alone does not prove that an
+    # unreported part was also zero. Totals remain observed lower bounds.
+    return sum(reported) if len(reported) == len(parts) or any(reported) else None
 
 
 def _non_negative_int_value(value: Any) -> int:
@@ -1488,6 +1651,34 @@ def _safe_request_plan(plan: Mapping[str, Any] | None) -> dict[str, Any] | None:
     if not isinstance(plan, Mapping):
         return None
     safe: dict[str, Any] = {}
+    for key in ("wire_history_sha256", "wire_instructions_sha256", "wire_tools_sha256"):
+        value = plan.get(key)
+        if (
+            isinstance(value, str)
+            and len(value) == 64
+            and all(c in "0123456789abcdef" for c in value)
+        ):
+            safe[key] = value
+    for key in (
+        "wire_previous_history_prefix_preserved",
+        "wire_previous_instructions_unchanged",
+        "wire_previous_tools_unchanged",
+    ):
+        if type(plan.get(key)) is bool:
+            safe[key] = plan[key]
+    for key in (
+        "wire_schema_version",
+        "wire_history_bytes",
+        "wire_history_items",
+        "wire_instructions_bytes",
+        "wire_tools_bytes",
+        "wire_previous_history_items",
+        "wire_shared_prefix_items",
+        "wire_shared_prefix_bytes",
+    ):
+        value = plan.get(key)
+        if type(value) is int and value >= 0:
+            safe[key] = value
     for key in (
         "input_mode",
         "status",
@@ -1570,7 +1761,7 @@ def _usage_payload(usage: LLMUsage | None) -> dict[str, int | None]:
     }
 
 
-def _status_category(exc: Exception) -> str:
+def _status_category(exc: BaseException) -> str:
     if is_provider_throttling_error(exc):
         return "rate_limited"
     if is_provider_unavailable_error(exc):

@@ -3,24 +3,6 @@
 This checklist covers the completion-gate reliability and deadline/diagnostic
 runtime safety invariants that should stay true across releases.
 
-## Scheduled Deprecation Removals (next release after current Unreleased)
-
-The following stayed accepted-and-ignored for exactly one release and must be
-deleted in the next one so the compatibility windows do not become permanent:
-
-- The retired `/chat` command's dormant internals: `CHAT_ONLY_SYSTEM_PROMPT`,
-  the `chat_only` branch in `agent/turn/core.py`, and the
-  `_ChatExecutionRequest.chat_only` field (no producers remain).
-- The router-era config keys `routing_mode`, `route_arbitration_enabled`,
-  `semantic_turn_contract_enabled`, and `unified_turn_path_enabled`
-  (accepted-and-ignored since the router removal), plus the
-  `ALYSIS_UNIFIED_TURN_PATH` env kill switch.
-- The vestigial `ROLE_ROUTER` constant and `ALYSIS_MODEL_ROUTER` entry in
-  `model_router.py`, and the `role_models.router` key hygiene in
-  `profiles.py`.
-- The `/chat` retirement notice itself can drop to the generic retired-command
-  path once one release has carried the pointer to `/mode ask` → `/persona`.
-
 ## One-Shot Completion Gate
 
 - Safety invariant: a one-shot execute-intent run must not finalize
@@ -263,10 +245,9 @@ deleted in the next one so the compatibility windows do not become permanent:
   the full per-mode agent surface; execution posture derives from the
   execution mode, and controller code must not add keyword lists or
   language-specific regular expressions to recover intent.
-- `unified_turn_path_enabled` / `ALYSIS_UNIFIED_TURN_PATH`,
-  `routing_mode`, `route_arbitration_enabled`, and
-  `semantic_turn_contract_enabled` remain accepted-and-ignored for one release
-  and are then removed from the settable surface.
+- Legacy routing settings remain accepted for compatibility but do not restore
+  the retired pre-turn router. Verify that disabling them cannot change the
+  unified execution path.
 
 ## Tool Recovery And Web Provenance
 
@@ -276,8 +257,9 @@ deleted in the next one so the compatibility windows do not become permanent:
 - Only explicit schema-compatible compatibility aliases may execute
   automatically. Ambiguous aliases must remain non-executing guidance and still
   count toward repeated-call protection.
-- `web_fetch` must require user, `web_search`, observed redirect, or bounded
-  same-origin/search-mediated provenance before retrieval.
+- `web_fetch` must require user, `web_search`, observed redirect, bounded
+  same-origin/search-mediated provenance, or a configured trusted-domain match
+  before retrieval. The trusted-domain list bypasses only the provenance gate.
 - URLs discovered in trusted fetched pages, trusted local file reads, and
   registered tool or shell output must be recorded as bounded source-linked
   provenance, without persisting source content or granting broad same-domain
@@ -297,8 +279,8 @@ deleted in the next one so the compatibility windows do not become permanent:
 - `tests/test_acceptance_contract.py`
 - `tests/test_completion_certificate.py`
 - `tests/test_acceptance_contract_integration.py`
-- `tests/test_agent_loop_interactive_execution_posture.py`
-- `tests/test_turn_semantics.py`
+- `tests/test_unified_turn_path.py`
+- `tests/test_turn_contract_v2.py`
 - `tests/test_one_shot_prompt_contract.py`
 - `tests/test_verification_evidence.py`
 - `tests/test_mutation_classification.py`

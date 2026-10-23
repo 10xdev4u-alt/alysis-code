@@ -10,6 +10,7 @@ import pytest
 import alysis_code.llm.openai_compat as openai_compat_mod
 import alysis_code.llm.provider_limits as provider_limits_mod
 import alysis_code.model_registry as model_registry_mod
+from alysis_code.cancellation import InteractiveCancellationToken
 from alysis_code.config import AppConfig
 from alysis_code.llm.openai_compat import LLMError, OpenAICompatClient
 from alysis_code.llm.provider_limits import (
@@ -40,6 +41,136 @@ class _Provider429(RuntimeError):
 
 def _chat_ok() -> dict[str, object]:
     return {"choices": [{"message": {"content": "ok"}}]}
+
+
+def test_provider_retry_backoff_wakes_immediately_on_cancellation() -> None:
+    token = InteractiveCancellationToken()
+    retry_announced = threading.Event()
+    attempts = 0
+    outcome: list[BaseException | str] = []
+
+    def call() -> str:
+        nonlocal attempts
+        attempts += 1
+        raise _Provider429()
+
+    def run() -> None:
+        try:
+            outcome.append(
+                run_provider_limited_call(
+                    call=call,
+                    provider_key="openai",
+                    retry_settings=ProviderRetrySettings(
+                        max_retries=1,
+                        base_delay_seconds=60,
+                        max_delay_seconds=60,
+                    ),
+                    operation="cancel-during-backoff",
+                    random_fn=lambda: 0.5,
+                    on_retry=lambda *_args: retry_announced.set(),
+                    cancellation_token=token,
+                )
+            )
+        except BaseException as exc:  # noqa: BLE001 - cancellation is the assertion
+            outcome.append(exc)
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    assert retry_announced.wait(timeout=1)
+
+    token.cancel()
+    worker.join(timeout=1)
+
+    assert not worker.is_alive()
+    assert attempts == 1
+    assert len(outcome) == 1
+    assert isinstance(outcome[0], KeyboardInterrupt)
+    assert "cancelled_by_user" in str(outcome[0])
+
+
+def test_provider_cap_admission_wakes_immediately_on_cancellation() -> None:
+    class _ObservedToken(InteractiveCancellationToken):
+        def __init__(self) -> None:
+            super().__init__()
+            self.subscribed = threading.Event()
+
+        def subscribe(self, callback):
+            unsubscribe = super().subscribe(callback)
+            self.subscribed.set()
+            return unsubscribe
+
+    caps = {"openai": 1}
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    second_call_entered = threading.Event()
+    token = _ObservedToken()
+    outcome: list[BaseException | str] = []
+
+    def first_call() -> str:
+        first_entered.set()
+        release_first.wait(timeout=2)
+        return "first"
+
+    def second_call() -> str:
+        second_call_entered.set()
+        return "second"
+
+    def wait_for_admission() -> None:
+        try:
+            outcome.append(
+                run_provider_limited_call(
+                    call=second_call,
+                    provider_key="openai",
+                    provider_concurrency_caps=caps,
+                    retry_settings=ProviderRetrySettings(max_retries=0),
+                    operation="cancel-during-admission",
+                    cancellation_token=token,
+                )
+            )
+        except BaseException as exc:  # noqa: BLE001 - cancellation is the assertion
+            outcome.append(exc)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        first = pool.submit(
+            run_provider_limited_call,
+            call=first_call,
+            provider_key="openai",
+            provider_concurrency_caps=caps,
+            retry_settings=ProviderRetrySettings(max_retries=0),
+            operation="hold-admission",
+        )
+        assert first_entered.wait(timeout=1)
+        worker = threading.Thread(target=wait_for_admission, daemon=True)
+        worker.start()
+        assert token.subscribed.wait(timeout=1)
+
+        token.cancel()
+        worker.join(timeout=1)
+
+        assert not worker.is_alive()
+        assert not second_call_entered.is_set()
+        assert len(outcome) == 1
+        assert isinstance(outcome[0], KeyboardInterrupt)
+        release_first.set()
+        assert first.result(timeout=1) == "first"
+
+
+def test_provider_call_does_not_return_success_after_cancellation_wins_race() -> None:
+    token = InteractiveCancellationToken()
+
+    def call() -> str:
+        token.cancel()
+        return "late success"
+
+    with pytest.raises(KeyboardInterrupt, match="cancelled_by_user"):
+        run_provider_limited_call(
+            call=call,
+            provider_key="openai",
+            provider_concurrency_caps={},
+            retry_settings=ProviderRetrySettings(max_retries=0),
+            operation="cancel-at-return-boundary",
+            cancellation_token=token,
+        )
 
 
 def _public_resolver(_host: str, _port: int) -> list[str]:
@@ -100,7 +231,7 @@ def test_qwen_aliases_fold_to_single_canonical_key() -> None:
         ("https://api.kimi.com/coding/v1", "k3", "kimi-code"),
         # The Alysis Code hosted proxy (llm Edge Function) forwards to DeepSeek.
         (
-            "https://vzigujbcjjmpntxhmyvr.supabase.co/functions/v1/llm/v1",
+            "https://api.alysiscode.com/v1",
             "deepseek-v4-flash",
             "deepseek",
         ),
@@ -434,12 +565,28 @@ def test_provider_unavailable_retry_wall_clock_cap_blocks_backoff() -> None:
     assert sleeps == []
 
 
-def test_responses_sized_no_progress_timeout_cannot_start_a_retry_past_cap() -> None:
+def test_responses_sized_no_progress_timeout_gets_one_retry_then_the_cap_blocks() -> None:
+    """A stalled route gets one more attempt; a second stall is not retried.
+
+    What the previous version of this test protected: the 60 s cap was
+    measured from the start of the call, so once a 240 s no-progress watchdog
+    had fired no retry could start. That stopped a stalled route from costing
+    a second watchdog window. It is also exactly why a request dropped at
+    900 s never got its retry, which is the defect this change fixes.
+
+    What covers it now: the window opens at the first failure. The stalled
+    call gets one retry, which starts inside the window; when that retry
+    stalls as well, the window (60 s from the first failure) has closed and
+    no third attempt starts (asserted below). The run deadline still bounds
+    the extra attempt: ``retry_deadline_allows`` vetoes any retry the run
+    cannot afford (test_deadline_callback_prevents_unsafe_provider_retry in
+    this module).
+    """
     attempts = 0
     sleeps: list[float] = []
     # OpenAI Responses uses a 240s no-progress watchdog and a 60s retry wall
-    # clock cap. Once the first watchdog fires, another attempt must not start.
-    clock_values = iter((0.0, 240.0))
+    # clock cap. Clock reads: call start, first stall, second stall.
+    clock_values = iter((0.0, 240.0, 481.0))
 
     def call() -> str:
         nonlocal attempts
@@ -463,8 +610,8 @@ def test_responses_sized_no_progress_timeout_cannot_start_a_retry_past_cap() -> 
             clock_fn=lambda: next(clock_values),
         )
 
-    assert attempts == 1
-    assert sleeps == []
+    assert attempts == 2
+    assert sleeps == [1.0]
 
 
 def test_marked_non_retryable_error_is_not_retried_despite_retryable_message() -> None:
@@ -563,6 +710,7 @@ def test_typed_remote_protocol_truncation_is_retryable() -> None:
 
     assert result == "ok"
     assert attempts == 2
+    # Typed connection drops use the existing dedicated delay schedule.
     assert sleeps == [2.0]
 
 

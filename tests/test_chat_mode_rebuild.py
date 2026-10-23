@@ -282,7 +282,41 @@ def test_rebuild_session_tools_preserves_active_workdir_defaults(tmp_path: Path)
         session.store.close()
 
 
-def test_rebuilt_session_scheduler_tracks_deferred_failure_and_retry(
+def test_rebuild_preserves_coordinator_while_subagent_tools_are_disabled(
+    tmp_path: Path,
+) -> None:
+    session = _make_session(
+        tmp_path,
+        subagents_enabled=True,
+        subagent_registry={},
+    )
+    coordinator = None
+    try:
+        cli_mod._rebuild_session_tools_for_mode(session=session, mode="review")
+        coordinator = session.subagent_coordinator
+        scheduler = session.child_scheduler
+        assert coordinator is not None
+        assert scheduler is coordinator.scheduler
+
+        session.subagents_enabled = False
+        cli_mod._rebuild_session_tools_for_mode(session=session, mode="review")
+        assert "subagent_run" not in session.tools
+        assert session.subagent_coordinator is coordinator
+        assert session.child_scheduler is scheduler
+        assert scheduler._closed is False  # noqa: SLF001
+
+        session.subagents_enabled = True
+        cli_mod._rebuild_session_tools_for_mode(session=session, mode="review")
+        assert "subagent_run" in session.tools
+        assert session.subagent_coordinator is coordinator
+        assert session.child_scheduler is scheduler
+    finally:
+        if coordinator is not None:
+            coordinator.shutdown(cancel_pending=True)
+        session.store.close()
+
+
+def test_rebuilt_session_reuses_scheduler_and_tracks_deferred_failure_and_retry(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -401,7 +435,7 @@ def test_rebuilt_session_scheduler_tracks_deferred_failure_and_retry(
         rebuilt_launcher = session.tools["subagent_run"].run.__self__
         rebuilt_scheduler = rebuilt_launcher.child_scheduler
         assert rebuilt_scheduler is not None
-        assert rebuilt_scheduler is not initial_scheduler
+        assert rebuilt_scheduler is initial_scheduler
         assert session.child_scheduler is rebuilt_scheduler
         assert rebuilt_scheduler.lifecycle_listener is lifecycle_listener
         assert rebuilt_scheduler.parent_steer_inbox is session.steer_inbox
@@ -499,7 +533,7 @@ def test_rebuilt_session_scheduler_tracks_deferred_failure_and_retry(
         session.store.close()
 
 
-def test_runtime_tui_clears_panel_when_scheduler_is_rebuilt(
+def test_runtime_tui_preserves_panel_when_tools_are_rebuilt(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -588,12 +622,12 @@ def test_runtime_tui_clears_panel_when_scheduler_is_rebuilt(
             )
             runtime["first_run_id"] = first["run_id"]
             assert child_started[0].wait(timeout=2.0)
-            assert release_child[0].wait(timeout=3.0)
-            session.child_scheduler.collect(run_id=first["run_id"], timeout_s=2.0)
 
             cli_mod._rebuild_session_tools_for_mode(session=session, mode="auto")
             runtime["schedulers"].append(session.child_scheduler)
             runtime["rebuild_done"].set()
+            assert release_child[0].wait(timeout=3.0)
+            session.child_scheduler.collect(run_id=first["run_id"], timeout_s=2.0)
 
             second = session.tools["subagent_spawn"].run(
                 {"name": "explorer", "task": "after rebuild"}
@@ -615,16 +649,16 @@ def test_runtime_tui_clears_panel_when_scheduler_is_rebuilt(
         def _send_keys() -> None:
             pipe.send_text("go\r")
             assert child_started[0].wait(timeout=2.0)
-            pipe.send_text("\x0e")
+            pipe.send_text("\x1b[1;3C")
             time.sleep(0.05)
             panel = runtime["app"].layout.container.content.children[2]
             runtime["selected_before"] = panel.filter()
-            release_child[0].set()
             assert runtime["rebuild_done"].wait(timeout=3.0)
             time.sleep(0.05)
             runtime["selected_after"] = panel.filter()
+            release_child[0].set()
             assert child_started[1].wait(timeout=2.0)
-            pipe.send_text("\x0e")
+            pipe.send_text("\x1b[1;3C")
             time.sleep(0.05)
             runtime["selected_new"] = panel.filter()
             release_child[1].set()
@@ -645,9 +679,9 @@ def test_runtime_tui_clears_panel_when_scheduler_is_rebuilt(
 
     try:
         assert runtime["selected_before"] is True
-        assert runtime["selected_after"] is False
+        assert runtime["selected_after"] is True
         assert runtime["selected_new"] is True
-        assert transcript.count(("info", "subagent history cleared: settings applied")) == 1
+        assert transcript.count(("info", "subagent history cleared: settings applied")) == 0
         assert not any("Subagent panel refresh failed" in text for _role, text in transcript)
 
         second_run_id = runtime["second_run_id"]

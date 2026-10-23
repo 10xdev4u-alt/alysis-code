@@ -9,10 +9,12 @@ its own provider calls.
 
 from __future__ import annotations
 
+import inspect
 import re
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
+from ..internal_artifacts import provider_history_messages
 from ..language_policy import DEFAULT_REPLY_LANGUAGE, DEFAULT_REPLY_SCRIPT
 from ..llm.base import effective_tools_for_client
 from ..llm.types import LLMError
@@ -25,6 +27,8 @@ from .turn_path import (
 
 if TYPE_CHECKING:
     from .tools_assembly import ToolDef
+
+TOOL_CONTEXT_MESSAGE_KEY = "alysis_tool_context"
 
 
 def _llm_error_status_code(err: LLMError) -> int | None:
@@ -100,7 +104,10 @@ def _registered_tool_schema_list(
 ) -> list[dict[str, Any]]:
     if not tool_defs:
         return []
-    canonical_by_name = {name: tool.as_openai_tool() for name, tool in tool_defs.items()}
+    canonical_by_name = {
+        _tool_schema_function_name(schema): schema
+        for schema in (tool.as_openai_tool() for tool in tool_defs.values())
+    }
     ordered: list[dict[str, Any]] = []
     added: set[str] = set()
     for tool_schema in tool_list or []:
@@ -139,9 +146,8 @@ def _main_agent_chat(
         "on_reasoning_delta": on_reasoning_delta,
         "temperature": temperature,
     }
-    # Pass the token only when present so older/test clients keep working via the
-    # TypeError fallbacks below; clients that accept it can abort an in-flight
-    # request the instant the user interrupts (even before the first token).
+    # Pass the token only when present. Signature filtering below keeps older
+    # clients working without replaying a provider request after a TypeError.
     if cancellation_token is not None:
         kwargs["cancellation_token"] = cancellation_token
     if max_tokens is not None:
@@ -150,16 +156,30 @@ def _main_agent_chat(
         kwargs["max_tokens"] = max_tokens
     if tool_choice is not None:
         kwargs["tool_choice"] = tool_choice
-    for compatibility_arg in (
+    compatibility_args = {
         "cancellation_token",
         "on_reasoning_delta",
         "temperature",
         "tool_choice",
+    }
+    try:
+        parameters = inspect.signature(client.chat).parameters
+    except (TypeError, ValueError):
+        # Some extension callables do not expose a signature. Call exactly once
+        # with the canonical contract; an incompatibility must be declared by
+        # the adapter instead of guessed from exception text.
+        parameters = None
+    if parameters is not None and not any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
     ):
-        try:
-            return client.chat(**kwargs)
-        except TypeError:
-            kwargs.pop(compatibility_arg, None)
+        keyword_kinds = {
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        }
+        for name in compatibility_args:
+            parameter = parameters.get(name)
+            if parameter is None or parameter.kind not in keyword_kinds:
+                kwargs.pop(name, None)
     return client.chat(**kwargs)
 
 
@@ -215,22 +235,72 @@ def _safe_forced_tool_choice_for_recovery(
 # Ephemeral request-message injection
 # ---------------------------------------------------------------------------
 
-
-_VOLATILE_HOST_CONTEXT_PREFIXES = (
-    "<workspace_binding_context>",
-    "<task_brief>",
-    "<environment_context>",
-)
+# Content of a tool result the provider must see but the session never recorded: the turn
+# was stopped while the call ran, or the call never started.
+UNAVAILABLE_TOOL_RESULT_CONTENT = "[tool result unavailable: the call was stopped or did not run]"
 
 
-def _is_volatile_host_context_message(message: dict[str, Any]) -> bool:
-    if str(message.get("role") or "").strip().lower() != "user":
-        return False
-    content = message.get("content")
-    if not isinstance(content, str):
-        return False
-    stripped = content.lstrip()
-    return stripped.startswith(_VOLATILE_HOST_CONTEXT_PREFIXES)
+def _with_tool_results_after_tool_calls(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Put every assistant tool call's result directly after it, as providers require.
+
+    OpenAI-compatible providers (DeepSeek, GLM, the hosted gateway) reject a request when an
+    assistant message with ``tool_calls`` is not followed by one tool message per call
+    ("insufficient tool messages following tool_calls message"). The tool loop appends
+    controller notes right after a call's result, so in a batch of two or more calls a note
+    (seen live: ``blast_radius_scope_advisory`` after the first call) lands between the
+    results. Every later request of that session then fails, including the next turn's.
+    A turn stopped between an assistant message and its results would leave the same gap.
+
+    For the request only, this moves system and user messages that sit inside a batch to just
+    after the batch's results, and answers calls that have no result with
+    ``UNAVAILABLE_TOOL_RESULT_CONTENT``. A well-formed history comes back unchanged, so the
+    order (and the provider's prompt cache) is untouched in the normal case.
+    """
+
+    out: list[dict[str, Any]] = []
+    index = 0
+    count = len(messages)
+    while index < count:
+        message = messages[index]
+        index += 1
+        out.append(message)
+        if str(message.get("role") or "") != "assistant":
+            continue
+        raw_calls = message.get("tool_calls")
+        if not isinstance(raw_calls, list):
+            continue
+        pending = list(
+            dict.fromkeys(
+                str(call.get("id") or "").strip()
+                for call in raw_calls
+                if isinstance(call, dict) and str(call.get("id") or "").strip()
+            )
+        )
+        if not pending:
+            continue
+        results: list[dict[str, Any]] = []
+        moved: list[dict[str, Any]] = []
+        while index < count and pending:
+            following = messages[index]
+            role = str(following.get("role") or "")
+            if role == "assistant":
+                break
+            if role == "tool":
+                call_id = str(following.get("tool_call_id") or "").strip()
+                if call_id not in pending:
+                    break
+                pending.remove(call_id)
+                results.append(following)
+            else:
+                moved.append(following)
+            index += 1
+        out.extend(results)
+        out.extend(
+            {"role": "tool", "tool_call_id": call_id, "content": UNAVAILABLE_TOOL_RESULT_CONTENT}
+            for call_id in pending
+        )
+        out.extend(moved)
+    return out
 
 
 def _request_messages_with_volatile_suffix(
@@ -240,28 +310,19 @@ def _request_messages_with_volatile_suffix(
     turn_user_contexts: list[str] | tuple[str, ...] | None = None,
     step_system_prompts: list[str] | tuple[str, ...] | None = None,
 ) -> list[dict[str, Any]]:
-    """Keep every call-varying host message after reusable transcript history.
-
-    Prompt caches match byte prefixes. Never place a replaceable host context or
-    an ephemeral turn/step message ahead of stable conversation content. This is
-    a request-local reorder: persistent history and the information sent to the
-    model are unchanged.
-    """
-
-    stable_messages: list[dict[str, Any]] = []
-    volatile_messages: list[dict[str, Any]] = []
-    for message in messages:
-        target = (
-            volatile_messages if _is_volatile_host_context_message(message) else stable_messages
-        )
-        target.append(message)
+    """Preserve transcript order and append transient context for this request."""
 
     cleaned_turn_system = [str(prompt or "").strip() for prompt in (turn_system_prompts or [])]
     cleaned_turn_user = [str(content or "").strip() for content in (turn_user_contexts or [])]
     cleaned_step_system = [str(prompt or "").strip() for prompt in (step_system_prompts or [])]
+    history: list[dict[str, Any]] = []
+    for message in provider_history_messages(messages):
+        projected = dict(message)
+        projected.pop(TOOL_CONTEXT_MESSAGE_KEY, None)
+        history.append(projected)
+    history = _with_tool_results_after_tool_calls(history)
     return [
-        *stable_messages,
-        *volatile_messages,
+        *history,
         *({"role": "system", "content": prompt} for prompt in cleaned_turn_system if prompt),
         *({"role": "user", "content": content} for content in cleaned_turn_user if content),
         *({"role": "system", "content": prompt} for prompt in cleaned_step_system if prompt),
@@ -361,6 +422,66 @@ def _non_repo_chat(
         return client.chat(**base, temperature=temperature)
     except TypeError:
         return client.chat(**base)
+
+
+_ZERO_ACTIVITY_DISPOSITION_SYSTEM_PROMPT = (
+    "You classify one assistant reply from a coding-agent session. The assistant "
+    "made no tool calls this turn: it did not read, edit, run, or verify anything. "
+    "Classify the reply text that follows as exactly one of these tokens:\n"
+    "ANSWER - a direct answer, explanation, analysis, or a question back to the user.\n"
+    "REFUSAL - it declines the request or reports being unable or blocked.\n"
+    "WORK_CLAIM - it asserts that changes were made, a task was completed, or that "
+    "tests or verification passed on this turn.\n"
+    "The reply may be in any language; classify its meaning, not its wording.\n"
+    "Reply with exactly one token: ANSWER, REFUSAL, or WORK_CLAIM."
+)
+
+_ZERO_ACTIVITY_DISPOSITION_TEXT_LIMIT = 6000
+
+
+def _classify_zero_activity_disposition(
+    *,
+    client: Any,
+    final_text: str,
+    temperature: float = 0.0,
+) -> tuple[str, str, Any, list[dict[str, Any]]]:
+    """Classify a zero-tool-call candidate reply for the completion gate.
+
+    Returns ``(disposition, source, response, messages)`` where disposition is
+    ``answer`` | ``refusal`` | ``work_claim`` and source records how it was
+    obtained (``llm``, ``fail_open_error``, ``fail_open_unparsed``).
+
+    Model-based so the judgment holds in every reply language; deterministic
+    English pattern matching is exactly what this check replaces. Failures fail
+    open to ``answer``: in interactive chat a destroyed answer costs more than a
+    rare unverified claim, and the append-only finalization invariant keeps even
+    a misjudged claim non-destructive.
+    """
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": _ZERO_ACTIVITY_DISPOSITION_SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": str(final_text or "")[:_ZERO_ACTIVITY_DISPOSITION_TEXT_LIMIT],
+        },
+    ]
+    try:
+        response = _non_repo_chat(
+            client=client,
+            messages=messages,
+            temperature=temperature,
+            tools=None,
+            stream=False,
+        )
+    except Exception:  # noqa: BLE001 - disposition check must never crash the turn
+        return "answer", "fail_open_error", None, messages
+    text = str(getattr(response, "content", "") or "").upper()
+    if "WORK_CLAIM" in text:
+        return "work_claim", "llm", response, messages
+    if "REFUSAL" in text:
+        return "refusal", "llm", response, messages
+    if "ANSWER" in text:
+        return "answer", "llm", response, messages
+    return "answer", "fail_open_unparsed", response, messages
 
 
 def _extract_rewrite_protected_fragments(text: str) -> list[str]:

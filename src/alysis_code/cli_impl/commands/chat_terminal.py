@@ -58,35 +58,6 @@ def _forge_picker_row_renderables(*, label: str, desc: str, selected: bool) -> l
     return renderables
 
 
-def _plan_mode_picker_row_renderables(*, label: str, desc: str, selected: bool) -> list[Any]:
-    from rich.text import Text
-
-    label_style, desc_style = _picker_row_styles(selected=selected)
-    renderables: list[Any] = [
-        Text.assemble(
-            ("  ", "bright_black"),
-            (_picker_label_text(label, selected=selected), label_style),
-        )
-    ]
-    if str(desc or "").strip():
-        renderables.append(
-            Text.assemble(
-                ("    ", "bright_black"),
-                (str(desc), desc_style),
-            )
-        )
-    return renderables
-
-
-def _plan_mode_picker_hint_renderable() -> Any:
-    from rich.text import Text
-
-    return Text.assemble(
-        ("    ", "bright_black"),
-        (_picker_hint_text(), "dim"),
-    )
-
-
 def _selectable_options_panel(
     *,
     title: str,
@@ -570,18 +541,27 @@ def _resolve_startup_workspace_binding(
 
 def _chat_mode_rows() -> list[tuple[str, str, str]]:
     return [
-        ("review", "1) safe (review)", "Asks before file writes and shell commands."),
+        (
+            "review",
+            "1) safe (review)",
+            "Ask for approval: asks before file writes and commands; read-only commands run.",
+        ),
         (
             "auto",
             "2) fast (auto)",
-            "Auto-runs normal operations; approval-gated sensitive actions still ask.",
+            "Approve for me: runs normal work; a reviewer model decides sensitive actions "
+            "and asks you when unsure.",
         ),
         (
             "readonly",
             "3) read (readonly)",
             "Read-only analysis with inspection-only tools; no writes, shell, or verification.",
         ),
-        ("fullaccess", "4) full (fullaccess)", "No write/shell safety guards or prompts."),
+        (
+            "fullaccess",
+            "4) full (fullaccess)",
+            "No sandbox or prompts; still asks before deleting the project or home folder.",
+        ),
     ]
 
 
@@ -693,7 +673,7 @@ def _chat_mode_panel(
     interactive: bool = False,
 ) -> Panel:
     current = current_mode.strip().lower()
-    title = f"Mode Options (current: {_chat_mode_display(current)})"
+    title = f"Permissions (current: {_chat_mode_display(current)})"
     return _selectable_options_panel(
         title=title,
         rows=_chat_mode_rows(),

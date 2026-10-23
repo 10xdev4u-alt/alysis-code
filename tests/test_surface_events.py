@@ -9,6 +9,7 @@ from rich.console import Console
 from alysis_code.surface.events import (
     EVENT_REGISTRY,
     MAX_ARGUMENTS_PREVIEW_CHARS,
+    ApprovalReviewed,
     ConfigFormRequest,
     ErrorRaised,
     Event,
@@ -67,6 +68,13 @@ def _sample_events() -> list[Event]:
         SwarmWorkerStateChanged(worker_id="w1", state="running", role="coder"),
         VerifyGateResult(command="pytest -q", success=True, summary="passed"),
         ReviewGateDecision(decision="approved", summary="looks good"),
+        ApprovalReviewed(
+            outcome="allow",
+            subject="npm install",
+            reason="Installs the project's dependencies.",
+            risk="low",
+            approval_kind="shell_run",
+        ),
         ErrorRaised(code="config_error", message="missing model", recoverable=True),
         WarningEmitted(message="validation warning"),
         InfoEmitted(message="planner ready"),
@@ -134,6 +142,15 @@ def _call_all_emit_methods(surface: object) -> None:
     surface.emit_review_gate_decision(  # type: ignore[attr-defined]
         "approved",
         "looks good",
+        worker_id="w1",
+        role="coder",
+    )
+    surface.emit_approval_reviewed(  # type: ignore[attr-defined]
+        "deny",
+        "git push --force",
+        "The user did not ask to rewrite remote history.",
+        risk="high",
+        approval_kind="shell_run",
         worker_id="w1",
         role="coder",
     )
@@ -244,7 +261,7 @@ def test_rich_surface_mode_changed_renders_dedicated_trace_line() -> None:
 
     surface.emit_mode_changed("auto")
 
-    assert "Mode: auto" in buffer.getvalue()
+    assert "Permissions: auto" in buffer.getvalue()
 
 
 def test_rich_surface_status_and_mode_suppressed_when_trace_off() -> None:

@@ -9,6 +9,12 @@ import sys
 from pathlib import Path
 from typing import Any
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from scripts.release.vscode_approval_policy import SINGLE_MAINTAINER_ID  # noqa: E402
+
 
 class EnvironmentPolicyError(ValueError):
     """Raised when a secret-bearing release environment is under-protected."""
@@ -46,8 +52,6 @@ def validate_environment_policy(
     if len(reviewer_rules) != 1:
         raise EnvironmentPolicyError("environment must have exactly one required_reviewers rule")
     reviewer_rule = reviewer_rules[0]
-    if reviewer_rule.get("prevent_self_review") is not True:
-        raise EnvironmentPolicyError("environment must prevent self review")
     reviewers = reviewer_rule.get("reviewers")
     if not isinstance(reviewers, list) or not reviewers:
         raise EnvironmentPolicyError("environment must configure at least one required reviewer")
@@ -62,6 +66,14 @@ def validate_environment_policy(
         reviewer_ids.add((entry["type"], reviewer_id))
     if len(reviewer_ids) != len(reviewers):
         raise EnvironmentPolicyError("environment reviewer list contains duplicates")
+    if reviewer_rule.get("prevent_self_review") is not True:
+        if reviewer_rule.get("prevent_self_review") is not False or reviewer_ids != {
+            ("User", SINGLE_MAINTAINER_ID)
+        }:
+            raise EnvironmentPolicyError(
+                "environment must prevent self review unless its sole reviewer is "
+                "the source-pinned single maintainer"
+            )
     deployment = environment.get("deployment_branch_policy")
     if deployment != {"protected_branches": False, "custom_branch_policies": True}:
         raise EnvironmentPolicyError("environment must use explicit custom deployment tag policies")
@@ -85,12 +97,13 @@ def validate_environment_policy(
     policy_id = policy.get("id")
     if (
         policy.get("name") != required_pattern
+        or policy.get("type") != "tag"
         or not isinstance(policy_id, int)
         or isinstance(policy_id, bool)
         or policy_id <= 0
     ):
         raise EnvironmentPolicyError(
-            f"environment deployment policy must contain only {required_pattern!r}"
+            f"environment deployment policy must contain only {required_pattern!r} as a tag rule"
         )
 
 

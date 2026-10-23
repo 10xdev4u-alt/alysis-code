@@ -7,6 +7,7 @@ from alysis_code.reasoning_contracts import (
     _CONTRACTS,
     ALWAYS_ON,
     NONE,
+    OFF_BETWEEN_TOOLS,
     OFF_EXPLICIT,
     OFF_IMPOSSIBLE,
     OFF_OMIT,
@@ -23,7 +24,14 @@ from alysis_code.reasoning_contracts import (
 )
 
 _VALID_MODES = {ALWAYS_ON, OPTIONAL, NONE, UNKNOWN}
-_VALID_OFF = {OFF_OMIT, OFF_EXPLICIT, OFF_IMPOSSIBLE, OFF_SWAPS_MODEL, OFF_UNKNOWN}
+_VALID_OFF = {
+    OFF_OMIT,
+    OFF_EXPLICIT,
+    OFF_BETWEEN_TOOLS,
+    OFF_IMPOSSIBLE,
+    OFF_SWAPS_MODEL,
+    OFF_UNKNOWN,
+}
 
 
 def test_table_integrity() -> None:
@@ -80,6 +88,13 @@ def test_openai_codex_cannot_disable() -> None:
     assert astra.values == ("low", "medium", "high", "xhigh", "max")
     assert not astra.allows_value("none")
     assert not reasoning_off_is_safe("openai", "gpt-6-astra")
+    for model in ("gpt-6-sol", "gpt-6-luna"):
+        contract = reasoning_contract_for("openai", model)
+        assert contract.mode == OPTIONAL
+        assert contract.off == OFF_EXPLICIT
+        assert contract.default == "medium"
+        assert contract.values == ("none", "low", "medium", "high", "xhigh", "max")
+        assert reasoning_off_is_safe("openai", model)
     terra = reasoning_contract_for("openai", "gpt-5.6-terra")
     assert terra.allows_value("none") and terra.default == "medium"
     assert not terra.allows_value("minimal")  # dead on the 5.x families
@@ -103,6 +118,16 @@ def test_anthropic_fable_5_1_forbids_forced_tool_choice() -> None:
     assert fable51.default == "high"
     assert fable51.accepts_tool_choice_while_reasoning is False
     assert fable5.accepts_tool_choice_while_reasoning is True
+
+
+def test_sonnet_55_reduced_thinking_is_not_literal_off() -> None:
+    for provider in ("anthropic", "alysis"):
+        contract = reasoning_contract_for(provider, "claude-sonnet-5-5")
+        assert contract.off == OFF_BETWEEN_TOOLS
+        assert not contract.toggleable
+        assert not contract.accepts_tool_choice_while_reasoning
+        assert not reasoning_off_is_safe(provider, "claude-sonnet-5-5")
+        assert "up-front" in reasoning_off_hazard(provider, "claude-sonnet-5-5")
 
 
 def test_gemini_3_8_flash_matches_3_7_contract() -> None:
@@ -207,7 +232,7 @@ def test_qwen38_and_deepseek_use_their_exact_documented_effort_values() -> None:
     qwen37 = reasoning_contract_for("qwen", "qwen3.7-plus")
     deepseek = reasoning_contract_for("deepseek", "deepseek-v4-pro")
     deepseek_vision = reasoning_contract_for("deepseek", "deepseek-v4-flash-vision-exp")
-    deepseek_v41_beta = reasoning_contract_for("deepseek", "deepseek-v4.1-flash-expires-on-0910")
+    deepseek_v41 = reasoning_contract_for("deepseek", "deepseek-flash")
 
     assert qwen.wire == "reasoning_effort"
     assert qwen.values == ("low", "medium", "xhigh")
@@ -224,7 +249,7 @@ def test_qwen38_and_deepseek_use_their_exact_documented_effort_values() -> None:
     assert deepseek.allows_value("low")
     assert not deepseek.allows_value("medium")
     assert deepseek_vision is deepseek
-    assert deepseek_v41_beta is deepseek
+    assert deepseek_v41 is deepseek
 
 
 def test_dated_deepseek_gateway_routes_use_surface_specific_contracts() -> None:
@@ -268,7 +293,7 @@ def test_flat_reasoning_effort_emission_requires_explicit_transport_verification
     assert reasoning_contract_for(
         "cohere", "command-a-reasoning-08-2025"
     ).emits_flat_reasoning_effort
-    assert not reasoning_contract_for("xai", "grok-4.6").emits_flat_reasoning_effort
+    assert reasoning_contract_for("xai", "grok-4.6").emits_flat_reasoning_effort
     assert not reasoning_contract_for(
         "fireworks", "accounts/fireworks/models/minimax-m3"
     ).emits_flat_reasoning_effort

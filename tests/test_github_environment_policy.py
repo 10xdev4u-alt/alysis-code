@@ -33,7 +33,7 @@ def _environment() -> dict[str, object]:
 
 
 def _policies() -> dict[str, object]:
-    return {"total_count": 1, "branch_policies": [{"id": 3, "name": "v*"}]}
+    return {"total_count": 1, "branch_policies": [{"id": 3, "name": "v*", "type": "tag"}]}
 
 
 def _validate(environment: dict[str, object], policies: dict[str, object]) -> None:
@@ -47,6 +47,41 @@ def _validate(environment: dict[str, object], policies: dict[str, object]) -> No
 
 def test_accepts_self_review_protected_exact_tag_environment() -> None:
     _validate(_environment(), _policies())
+
+
+@pytest.mark.parametrize("ref_type", ["branch", None, "", True])
+def test_rejects_branch_or_unspecified_rule_even_when_its_name_matches(ref_type: object) -> None:
+    policies = _policies()
+    policies["branch_policies"][0]["type"] = ref_type
+    with pytest.raises(EnvironmentPolicyError, match="as a tag rule"):
+        _validate(_environment(), policies)
+
+
+def test_accepts_owner_authorized_single_maintainer_self_review() -> None:
+    environment = _environment()
+    rule = environment["protection_rules"][0]
+    rule["prevent_self_review"] = False
+    rule["reviewers"] = [{"type": "User", "reviewer": {"id": 190930654, "login": "Perdikis10"}}]
+    _validate(environment, _policies())
+
+
+@pytest.mark.parametrize("user_id", [190930655, True])
+def test_solo_review_does_not_trust_a_matching_login_with_a_different_id(user_id: int) -> None:
+    environment = _environment()
+    rule = environment["protection_rules"][0]
+    rule["prevent_self_review"] = False
+    rule["reviewers"] = [{"type": "User", "reviewer": {"id": user_id, "login": "Perdikis10"}}]
+    with pytest.raises(EnvironmentPolicyError):
+        _validate(environment, _policies())
+
+
+def test_solo_review_cannot_enable_self_review_for_additional_reviewers() -> None:
+    environment = _environment()
+    rule = environment["protection_rules"][0]
+    rule["prevent_self_review"] = False
+    rule["reviewers"].append({"type": "User", "reviewer": {"id": 190930654}})
+    with pytest.raises(EnvironmentPolicyError, match="prevent self review"):
+        _validate(environment, _policies())
 
 
 @pytest.mark.parametrize(

@@ -6,12 +6,15 @@ import logging
 import re
 import threading
 from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
+from datetime import datetime, timezone
 from time import monotonic
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 
-from ..cancellation import raise_if_cancelled
+from ..cancellation import CooperativeCancellationError
 from ..error_text import sanitize_error_text_for_output
 from ..execution_deadline import DeadlineExhausted
 from ..failure_category import provider_unavailable_retry_reason
@@ -23,6 +26,7 @@ from ..reasoning_contracts import (
     OPTIONAL,
     WIRE_CHAT_TEMPLATE_ENABLE_THINKING,
     WIRE_REASONING_EFFORT,
+    WIRE_REASONING_ENABLED,
     WIRE_THINKING_LEVEL,
     WIRE_THINKING_TYPE,
     reasoning_contract_for,
@@ -30,6 +34,7 @@ from ..reasoning_contracts import (
 from ..request_estimation import estimate_provider_payload_tokens
 from ..run_provenance import active_sampling_settings, apply_sampling_to_payload
 from ..transport_retry import RETRY_REASON_TRANSPORT_CONNECTION_DROP
+from .base import RequiredToolCallingUnsupportedError, required_tool_names_for_client
 from .cache_capabilities import (
     CACHE_CONTROL_FIELD,
     OPENROUTER_SESSION_ID_FIELD,
@@ -44,18 +49,16 @@ from .cache_control_blocks import (
     strip_cache_control_blocks,
 )
 from .cache_policy import merge_cache_policy_metadata
+from .cancellable_http import cancellation_aware_httpx_client, provider_httpx_client
+from .hosted_request_limits import hosted_chat_capacity_ratio, validate_hosted_chat_capacity
+from .http_cancellation import cancellable_httpx_request, raise_if_cancelled
 from .metadata import (
     DEEPSEEK_REASONING_CONTENT_KEY as _DEEPSEEK_REASONING_CONTENT_KEY,
 )
 from .metadata import MISTRAL_CONTENT_CHUNKS_KEY as _MISTRAL_CONTENT_CHUNKS_KEY
 from .metadata import MISTRAL_PROVIDER_METADATA_KEY as _MISTRAL_PROVIDER_KEY
 from .metadata import (
-    OPENROUTER_REASONING_DETAILS_KEY as _OPENROUTER_REASONING_DETAILS_KEY,
-)
-from .metadata import (
-    OPENROUTER_REASONING_KEY as _OPENROUTER_REASONING_KEY,
-)
-from .metadata import (
+    OPENAI_COMPAT_REASONING_METADATA_KEY,
     PROVIDER_METADATA_KEY,
     QWEN_PROVIDER_METADATA_KEY,
     ProviderRouteIdentity,
@@ -68,6 +71,12 @@ from .metadata import (
     merge_canonical_headers,
     stamp_response_for_route,
     strip_provider_metadata_from_message,
+)
+from .metadata import (
+    OPENROUTER_REASONING_DETAILS_KEY as _OPENROUTER_REASONING_DETAILS_KEY,
+)
+from .metadata import (
+    OPENROUTER_REASONING_KEY as _OPENROUTER_REASONING_KEY,
 )
 from .metadata import (
     TOOL_CALL_PROVIDER_METADATA_KEY as _TOOL_CALL_PROVIDER_METADATA_KEY,
@@ -83,18 +92,30 @@ from .metadata import (
 )
 from .protocols import (
     OPENAI_COMPAT_PROTOCOL,
+    ReasoningTraceCapability,
+    reasoning_trace_callback,
+    resolve_reasoning_trace_capability,
     validate_reasoning_trace_adapter_for_protocol,
 )
 from .provider_limits import (
     DEFAULT_PROVIDER_CONCURRENCY_CAPS,
+    DEFAULT_PROVIDER_RETRY_WALL_CLOCK_CAP_SECONDS,
     ProviderRetrySettings,
     best_effort_provider_key,
     mark_provider_call_non_retryable,
     run_provider_limited_call,
 )
-from .request_plan import LLMRequestPlan, RequestCachePlan
+from .reasoning_trace import CompatibleReasoningTrace
+from .request_plan import LLMRequestPlan, RequestCachePlan, WireRequestDiagnostics
 from .request_shape import build_request_shape_report
-from .streaming import decode_text_chunks, iter_lines_from_text_chunks
+from .streaming import (
+    STREAM_ASSEMBLY_AUTO,
+    STREAM_ASSEMBLY_CONCAT,
+    STREAM_ASSEMBLY_CUMULATIVE,
+    STREAM_ASSEMBLY_SETTINGS,
+    decode_text_chunks,
+    iter_lines_from_text_chunks,
+)
 from .temperature_compat import documented_temperature_omit_reason
 from .types import (
     InputTokenCount,
@@ -103,7 +124,6 @@ from .types import (
     LLMStreamNoProgressError,
     LLMUsage,
     ReasoningOutput,
-    ReasoningOutputKind,
     ToolCall,
     UsageConfidence,
     UsageContract,
@@ -128,11 +148,121 @@ _REASONING_PROVIDER_BY_ADAPTER: dict[str, str] = {
     "mistral_thinking": _MISTRAL_PROVIDER_KEY,
     "moonshot_reasoning": _MOONSHOT_PROVIDER_KEY,
     "nvidia_reasoning": _NVIDIA_PROVIDER_KEY,
+    "glm_reasoning": "zai_coding_plan",
 }
+# Hosts whose reasoning wire is the DeepSeek dialect, applied when the
+# configured adapter is "auto" (an explicit adapter always wins). Xiaomi MiMo
+# documents ``thinking: {"type": "enabled" | "disabled"}`` as its thinking
+# switch and requires the ``reasoning_content`` of an assistant turn that made
+# tool calls to be sent back on later requests ("Deep Thinking", mimo.mi.com).
+_DEEPSEEK_REASONING_DIALECT_HOSTS = frozenset(
+    {"api.xiaomimimo.com", "token-plan-ams.xiaomimimo.com"}
+)
 _GEMINI_REASONING_EFFORTS = frozenset({"minimal", "low", "medium", "high"})
 _DEFAULT_ACCEPT_ENCODING = "identity"
 _DEFAULT_CONNECT_TIMEOUT_S = 2.0
 _LOGGER = logging.getLogger(__name__)
+
+
+class _StreamProtocolError(LLMError):
+    """Invalid response framing/content, distinct from interrupted transport."""
+
+
+class _StreamClientError(LLMError):
+    """Local parsing/callback failure; retrying a provider cannot repair it."""
+
+
+def _utc_timestamp_ms() -> str:
+    """Wall-clock UTC time as ISO-8601 with milliseconds (``...T09:15:30.123Z``)."""
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+class _HTTPAttempt:
+    def __init__(self, *, stream: bool) -> None:
+        self.started = monotonic()
+        self.values: dict[str, Any] = {
+            "stream": stream,
+            # Wall clock, so an attempt lines up with provider and harness logs;
+            # the *_ms fields stay monotonic offsets from this instant.
+            "request_started_at": _utc_timestamp_ms(),
+            "usage_source": "none",
+        }
+        if stream:
+            self.values.update(
+                dict.fromkeys(
+                    (
+                        "body_bytes_received",
+                        "byte_chunk_count",
+                        "line_count",
+                        "data_line_count",
+                        "event_count",
+                        "text_delta_count",
+                        "reasoning_delta_count",
+                        "tool_delta_count",
+                    ),
+                    0,
+                )
+            )
+
+    def elapsed_ms(self) -> int:
+        return max(0, round((monotonic() - self.started) * 1000))
+
+    def increment(self, key: str, amount: int = 1) -> None:
+        self.values[key] = self.values.get(key, 0) + amount
+
+    def first(self, key: str) -> None:
+        if key not in self.values:
+            self.values[key] = self.elapsed_ms()
+
+
+def _stream_events(lines: Iterator[str], attempt: _HTTPAttempt) -> Iterator[dict[str, Any] | None]:
+    """Decode data events, including multiline JSON and legacy unseparated events.
+
+    Complete JSON on one data line remains accepted without an intervening blank
+    line. Incomplete JSON is accumulated until the SSE frame ends; it must never
+    be silently discarded, even if a later frame is a valid DONE marker.
+    """
+    pending: list[str] = []
+
+    def invalid() -> _StreamProtocolError:
+        attempt.values["terminal_reason"] = "malformed_event"
+        error = _StreamProtocolError("LLM stream returned a malformed JSON event")
+        mark_provider_call_non_retryable(error)
+        return error
+
+    for line in lines:
+        attempt.increment("line_count")
+        if not line:
+            if pending:
+                raise invalid()
+            continue
+        if not line.startswith("data:"):
+            continue
+        attempt.increment("data_line_count")
+        data = line[5:].removeprefix(" ")
+        if not data.strip() and not pending:
+            continue
+        if data.strip() == "[DONE]":
+            if pending:
+                raise invalid()
+            attempt.values["done_received"] = True
+            yield None
+            return
+        pending.append(data)
+        try:
+            event = json.loads("\n".join(pending))
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            raise invalid()
+        pending.clear()
+        attempt.increment("event_count")
+        attempt.first("first_event_ms")
+        yield event
+    # An unfinished event at EOF may be a transport truncation. The caller
+    # requires DONE and records that separately from a malformed complete frame.
+
+
 _TEMPERATURE_DEFAULT_VALUE = 1.0
 _TEMPERATURE_COMPAT_MODE_DEFAULT = "default_temperature"
 _TEMPERATURE_COMPAT_MODE_OMIT = "omit_temperature"
@@ -203,9 +333,8 @@ _TOOL_CALLING_REJECTION_TERMS = (
     "functions",
     "function calling",
     "function_call",
-    "model",
 )
-_PROVIDER_RETRY_WALL_CLOCK_CAP_SECONDS = 60.0
+_PROVIDER_RETRY_WALL_CLOCK_CAP_SECONDS = DEFAULT_PROVIDER_RETRY_WALL_CLOCK_CAP_SECONDS
 _ERROR_BODY_DISPLAY_LIMIT = 1000
 
 
@@ -289,7 +418,35 @@ def _looks_like_alternate_cumulative_restart(*, previous: str, incoming: str) ->
     return common_prefix < (min(len(previous), len(incoming)) // 2)
 
 
+# Providers that need "cumulative" stream assembly when the setting is "auto".
+# Empty: the de-duplication heuristics below date from April 2026, and the
+# provider they were written for was never recorded. Until one is identified,
+# cumulative assembly is reached only through an explicit
+# ``llm_stream_assembly=cumulative``.
+_CUMULATIVE_STREAM_PROVIDER_KEYS: frozenset[str] = frozenset()
+
+
+def resolve_stream_assembly(setting: str | None, *, provider_key: str | None) -> str:
+    """Resolve a stream assembly setting to ``concat`` or ``cumulative``.
+
+    ``auto`` (and unset) is ``cumulative`` only for a provider listed in
+    ``_CUMULATIVE_STREAM_PROVIDER_KEYS``, otherwise ``concat``. An unknown
+    setting is an error rather than a silent fallback.
+    """
+    normalized = str(setting or STREAM_ASSEMBLY_AUTO).strip().casefold()
+    if normalized not in STREAM_ASSEMBLY_SETTINGS:
+        allowed = ", ".join(STREAM_ASSEMBLY_SETTINGS)
+        raise ValueError(f"stream assembly must be one of: {allowed} (got {setting!r})")
+    if normalized != STREAM_ASSEMBLY_AUTO:
+        return normalized
+    key = _normalize_provider_key(provider_key)
+    if key and key in _CUMULATIVE_STREAM_PROVIDER_KEYS:
+        return STREAM_ASSEMBLY_CUMULATIVE
+    return STREAM_ASSEMBLY_CONCAT
+
+
 def _stream_delta_suffix(*, previous: str, incoming: str) -> str:
+    """The part of ``incoming`` not already in ``previous``; cumulative assembly only."""
     if not incoming:
         return ""
     if not previous:
@@ -368,6 +525,16 @@ def _transport_provider_key(
     model: str | None,
 ) -> str:
     from_url = _provider_key_from_base_url(base_url)
+    # The hosted gateway now serves multiple vendors. GLM uses the Alysis
+    # contract so DeepSeek's thinking toggle and replay dialect cannot leak in.
+    if str(model or "").casefold() == "glm-5.3-flash":
+        from ..provider_url import is_alysis_gateway_url
+
+        if (
+            is_alysis_gateway_url(str(base_url or ""))
+            or _normalize_provider_key(provider_key) == "alysis"
+        ):
+            return "alysis"
     if from_url:
         return from_url
     normalized_provider = _normalize_provider_key(provider_key)
@@ -397,6 +564,17 @@ def _reasoning_transport_provider_key(
     if adapter == "auto":
         return _normalize_provider_key(transport_provider_key) or None
     return _REASONING_PROVIDER_BY_ADAPTER.get(adapter)
+
+
+def _reasoning_trace_adapter_for_route(adapter: str, *, base_url: str) -> str:
+    """Resolve an ``auto`` adapter for hosts with a documented reasoning dialect."""
+    if adapter != "auto":
+        return adapter
+    try:
+        host = (urlsplit(base_url).hostname or "").rstrip(".").casefold()
+    except ValueError:
+        return adapter
+    return "deepseek_reasoning" if host in _DEEPSEEK_REASONING_DIALECT_HOSTS else adapter
 
 
 def _is_deepseek_provider(provider_key: str | None) -> bool:
@@ -688,45 +866,20 @@ def _openrouter_reasoning_provider_metadata(
     return {_OPENROUTER_PROVIDER_KEY: payload}
 
 
-def _text_from_reasoning_detail(detail: dict[str, Any]) -> tuple[str, ReasoningOutputKind] | None:
-    detail_type = str(detail.get("type") or "").strip().lower()
-    if detail_type == "reasoning.summary":
-        value = detail.get("summary")
-        kind = ReasoningOutputKind.SUMMARY
-    elif detail_type == "reasoning.text":
-        value = detail.get("text")
-        kind = ReasoningOutputKind.PROVIDER_REASONING
-    else:
-        return None
-    if not isinstance(value, str) or not value.strip():
-        return None
-    return value, kind
-
-
 def _reasoning_outputs_from_message(
     message: dict[str, Any],
     *,
     provider_key: str | None,
+    trace_adapter: str | None = None,
 ) -> tuple[ReasoningOutput, ...]:
-    provider = _normalize_provider_key(provider_key) or None
-    outputs: list[ReasoningOutput] = []
-    seen: set[tuple[ReasoningOutputKind, str]] = set()
-
-    details = message.get(_OPENROUTER_REASONING_DETAILS_KEY)
-    if isinstance(details, list):
-        for detail in details:
-            parsed = _text_from_reasoning_detail(detail) if isinstance(detail, dict) else None
-            if parsed is None:
-                continue
-            text, kind = parsed
-            if kind != ReasoningOutputKind.SUMMARY:
-                continue
-            dedupe_key = (kind, text)
-            if dedupe_key in seen:
-                continue
-            seen.add(dedupe_key)
-            outputs.append(ReasoningOutput(text=text, kind=kind, provider=provider))
-    return tuple(outputs)
+    if trace_adapter is None:
+        trace_adapter = resolve_reasoning_trace_capability(
+            provider_key=provider_key or "",
+            protocol=OPENAI_COMPAT_PROTOCOL,
+        ).adapter
+    trace = CompatibleReasoningTrace(trace_adapter, provider=provider_key)
+    trace.feed(message)
+    return trace.outputs
 
 
 def _provider_metadata_for_reasoning(
@@ -734,6 +887,7 @@ def _provider_metadata_for_reasoning(
     provider_key: str | None,
     message: dict[str, Any],
     model: str | None = None,
+    reasoning_content_message: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     if _is_together_deepseek_pro(provider_key, model):
         reasoning = message.get(_OPENROUTER_REASONING_KEY)
@@ -769,6 +923,17 @@ def _provider_metadata_for_reasoning(
         )
     if _is_mistral_provider(provider_key):
         return _mistral_content_provider_metadata(message.get("content"))
+    if reasoning_contract_for(provider_key, model).replay_reasoning_content:
+        # Streaming display/legacy dialects may combine aliases. The generic
+        # replay capability accepts only the actual reasoning_content field.
+        source = message if reasoning_content_message is None else reasoning_content_message
+        reasoning = source.get(_DEEPSEEK_REASONING_CONTENT_KEY)
+        if isinstance(reasoning, str):
+            return {
+                OPENAI_COMPAT_REASONING_METADATA_KEY: {
+                    _DEEPSEEK_REASONING_CONTENT_KEY: reasoning,
+                }
+            }
     return None
 
 
@@ -944,6 +1109,20 @@ def _message_for_transport(
         )
         if _is_gemini_provider(provider_key):
             _reattach_gemini_tool_call_extra_content(copied, metadata)
+    if reasoning_contract_for(reasoning_provider_key, model).replay_reasoning_content:
+        protocol_state = (
+            metadata.get(OPENAI_COMPAT_REASONING_METADATA_KEY)
+            if isinstance(metadata, dict)
+            else None
+        )
+        reasoning = (
+            protocol_state.get(_DEEPSEEK_REASONING_CONTENT_KEY)
+            if isinstance(protocol_state, dict)
+            else None
+        )
+        if isinstance(reasoning, str):
+            copied[_DEEPSEEK_REASONING_CONTENT_KEY] = reasoning
+            return copied
     together_deepseek_transport = _is_together_deepseek_pro(provider_key, model)
     deepseek_transport = _is_deepseek_provider(reasoning_provider_key)
     replay_all_deepseek_turns = reasoning_contract_for(
@@ -1024,7 +1203,7 @@ def _normalize_assistant_content_to_text(raw: Any) -> str:
 
 
 def _append_mistral_stream_content(chunks: list[dict[str, Any]], raw: Any) -> bool:
-    """Reconstruct replayable Mistral content without exposing ThinkChunk text."""
+    """Reconstruct Mistral replay content independently of trace presentation."""
 
     if isinstance(raw, str):
         incoming: list[Any] = [{"type": "text", "text": raw}] if raw else []
@@ -1179,7 +1358,7 @@ def _json_error_payload(body: str) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
-# Friendly, user-facing copy for the Alysis Code MiMo trial proxy's error codes.
+# Friendly, user-facing copy for the Alysis hosted gateway and legacy trial codes.
 # The proxy (Supabase Edge Function) returns an OpenAI-shaped envelope
 # {"error": {"message": ..., "type": ..., "code": "<reason>"}} with these string
 # codes; upstream/other-provider errors use different codes and fall through.
@@ -1187,6 +1366,29 @@ _ALYSIS_PROXY_ERROR_MESSAGES: dict[str, str] = {
     "invalid_key": (
         "Your Alysis Code session is invalid or has been reset. "
         "Run `alysis login` to reconnect your account."
+    ),
+    "account_restricted": (
+        "Your Alysis account requires review. Contact products@alysisai.com for help."
+    ),
+    "billing_review_required": (
+        "A previous Alysis hosted request needs a billing review before you can continue. "
+        "Contact products@alysisai.com for help."
+    ),
+    "billing_pending": (
+        "Alysis could not confirm the usage of this hosted request. "
+        "Billing reconciliation is pending; contact products@alysisai.com if it persists."
+    ),
+    "email_verification_required": (
+        "Confirm your Alysis account email before using free hosted credits. "
+        "Check your inbox for the verification link."
+    ),
+    "free_mailbox_conflict": (
+        "Free hosted credits are already linked to another account for this mailbox. "
+        "Sign in to your original Alysis account or contact products@alysisai.com."
+    ),
+    "model_not_allowed": (
+        "This model is not available on your Alysis hosted plan. "
+        "Choose an available model with /config or manage your plan at {account_url}"
     ),
     "trial_expired": ("Your 10-day free MiMo trial has ended. See your options at {account_url}"),
     "quota_exhausted": (
@@ -1200,6 +1402,15 @@ _ALYSIS_PROXY_ERROR_MESSAGES: dict[str, str] = {
     "rate_limit_exceeded": (
         "You're sending requests too quickly. Please wait a moment and try again."
     ),
+    "hosted_capacity_exceeded": (
+        "The Alysis hosted model is unavailable or at capacity. "
+        "If this persists, its server route needs checking. "
+        "No generation was started and no credits were charged."
+    ),
+    "hosted_routing_unavailable": (
+        "Hosted model routing is temporarily unavailable. Please retry shortly. "
+        "No generation was started and your reserved credits were released."
+    ),
     "global_budget_exceeded": (
         "The free MiMo trial is at capacity right now. Please try again shortly."
     ),
@@ -1208,7 +1419,7 @@ _ALYSIS_PROXY_ERROR_MESSAGES: dict[str, str] = {
 
 
 def alysis_trial_error_message(err: LLMError) -> str | None:
-    """Friendly message for an Alysis Code MiMo proxy error, or None if not ours.
+    """Friendly message for an Alysis hosted/legacy proxy error, or None if not ours.
 
     Maps the proxy's known error ``code`` (trial_expired, quota_exhausted, ...) to
     human copy so a user whose trial ended sees a clear next step instead of a raw
@@ -1221,6 +1432,32 @@ def alysis_trial_error_message(err: LLMError) -> str | None:
     if not isinstance(error, dict):
         return None
     code = str(error.get("code") or "").strip()
+    # The current hosted gateway distinguishes account concurrency, rolling caps,
+    # and reservation budget in its message, while retaining the OpenAI error code.
+    # Preserve that explanation instead of mislabeling every limit as excess RPM.
+    message = error.get("message")
+    if (
+        code == "hosted_capacity_exceeded"
+        and isinstance(message, str)
+        and message.startswith("Hosted model capacity is busy. Retry in ")
+    ):
+        return message[:2048]
+    if (
+        code == "rate_limit_exceeded"
+        and isinstance(message, str)
+        and message.startswith(
+            (
+                "5-hour fair-use limit reached (",
+                "Weekly fair-use limit reached (",
+                "Four hosted requests are already running for your account.",
+                "Your account has reached its hosted request limit.",
+                "Your account has reached the 20 requests per minute limit.",
+                "Available credits cannot cover this request while other usage or reservations apply.",
+                "Your available credit allowance is exhausted.",
+            )
+        )
+    ):
+        return message[:2048]
     template = _ALYSIS_PROXY_ERROR_MESSAGES.get(code)
     if template is None or "{account_url}" not in template:
         # str.format would also choke on any literal brace in an unrelated
@@ -1307,8 +1544,10 @@ def _tool_calling_unsupported_error(err: LLMError) -> bool:
         param = str(error.get("param") or "").strip().casefold()
         code = str(error.get("code") or "").strip().casefold()
         message = str(error.get("message") or "").strip().casefold()
-        if param in _TOOL_CALLING_REJECTION_PARAMS:
-            return True
+        if param:
+            # A rejected sampling/model field is not evidence that tools are
+            # unsupported, even when the explanatory message mentions them.
+            return param in _TOOL_CALLING_REJECTION_PARAMS
         combined = f"{param} {code} {message}"
     if "tool_choice" in combined:
         return False
@@ -1464,6 +1703,27 @@ def _cache_param_rejected_fields(
     return ()
 
 
+def _compatible_cache_policy_metadata(
+    base_policy: Mapping[str, Any] | None,
+    *,
+    prompt_cache_key: str | None,
+    prompt_cache_retention: str | None,
+) -> dict[str, Any] | None:
+    active = RequestCachePlan(
+        strategy="openai_prompt_cache",
+        mode="automatic",
+        prompt_cache_key=prompt_cache_key,
+        prompt_cache_retention=prompt_cache_retention,
+    ).openai_prompt_cache_policy_metadata()
+    if active is not None and isinstance(base_policy, Mapping):
+        declared_strategy = str(base_policy.get("strategy") or "").strip()
+        if declared_strategy and declared_strategy != "none":
+            # Compatible key fields describe request activation, not provider
+            # cache identity. Keep usage and static-policy calibration aligned.
+            active["strategy"] = declared_strategy
+    return merge_cache_policy_metadata(base_policy, active)
+
+
 def _cache_policy_after_fields_disabled(
     cache_policy: Mapping[str, Any] | None,
     *,
@@ -1553,6 +1813,54 @@ def _error_from_status_body(*, status_code: int, body: str) -> LLMError:
     return err
 
 
+# Error codes and types that providers send in the ``error`` object of an SSE
+# event, mapped to the HTTP status whose retry class they share. Numeric codes
+# are used as they are; any other value leaves the error to be classified from
+# its text, like every other provider error.
+_STREAM_ERROR_STATUS_BY_CODE = {
+    "rate_limit_exceeded": 429,
+    "rate_limit_error": 429,
+    "server_error": 500,
+    "internal_server_error": 500,
+    "api_error": 500,
+    "overloaded_error": 503,
+    "service_unavailable": 503,
+}
+
+
+def _stream_error_event_status(error: Any) -> int | None:
+    if not isinstance(error, Mapping):
+        return None
+    for key in ("code", "status", "status_code"):
+        value = error.get(key)
+        if isinstance(value, str) and value.strip().isdigit():
+            value = int(value.strip())
+        if isinstance(value, int) and not isinstance(value, bool) and 400 <= value <= 599:
+            return value
+    for key in ("code", "type"):
+        value = error.get(key)
+        if isinstance(value, str):
+            status = _STREAM_ERROR_STATUS_BY_CODE.get(value.strip().casefold())
+            if status is not None:
+                return status
+    return None
+
+
+def _error_from_stream_error_event(error: Any) -> LLMError:
+    """An error a provider sent inside a stream that began with HTTP 200.
+
+    Classified like the HTTP error with the provider's code, so a throttle or
+    server error takes the same retry path as its HTTP twin and a permanent
+    error stays permanent. Raising discards whatever the stream had delivered.
+    """
+    body = json.dumps({"error": error}, ensure_ascii=False, default=str)
+    status_code = _stream_error_event_status(error)
+    if status_code is not None:
+        return _error_from_status_body(status_code=status_code, body=body)
+    safe_body = sanitize_error_text_for_output(body)
+    return LLMError(f"LLM stream returned an error event: {_display_error_body(safe_body)}")
+
+
 def _response_with_stream_restart_metadata(
     response: LLMResponse,
     *,
@@ -1576,6 +1884,8 @@ def _response_with_stream_restart_metadata(
 
 class OpenAICompatClient:
     supports_forced_tool_choice = True
+    # Later system/developer messages stay in the ordered message stream.
+    preserves_late_system_message_position = True
 
     def __init__(
         self,
@@ -1605,6 +1915,7 @@ class OpenAICompatClient:
         stream_no_progress_timeout_s: float = 240.0,
         stream_progress_clock: Callable[[], float] | None = None,
         inflight_deadline_grace_s: float = 10.0,
+        stream_assembly: str | None = STREAM_ASSEMBLY_AUTO,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
@@ -1619,11 +1930,23 @@ class OpenAICompatClient:
         self.enable_thinking = enable_thinking
         self.reasoning_effort = str(reasoning_effort or "").strip().lower() or None
         self._transport = transport
+        self._wire_request_diagnostics = WireRequestDiagnostics()
         self.extra_headers = canonicalize_extra_headers(extra_headers)
         self.provider_key = str(provider_key or "").strip() or None
-        self.reasoning_trace_adapter = validate_reasoning_trace_adapter_for_protocol(
-            protocol=OPENAI_COMPAT_PROTOCOL,
-            adapter=reasoning_trace_adapter,
+        self.reasoning_trace_adapter = _reasoning_trace_adapter_for_route(
+            validate_reasoning_trace_adapter_for_protocol(
+                protocol=OPENAI_COMPAT_PROTOCOL,
+                adapter=reasoning_trace_adapter,
+            ),
+            base_url=self.base_url,
+        )
+        self.stream_assembly = resolve_stream_assembly(
+            stream_assembly,
+            provider_key=_transport_provider_key(
+                base_url=self.base_url,
+                provider_key=self.provider_key,
+                model=self.model,
+            ),
         )
         self.route_identity = route_identity or build_provider_route_identity(
             protocol=OPENAI_COMPAT_PROTOCOL,
@@ -1709,6 +2032,21 @@ class OpenAICompatClient:
             reasoning_effort=self.reasoning_effort,
         )
 
+    def _timeout_belongs_to_run_deadline(self, exc: BaseException) -> bool:
+        """Whether a transport timeout is the run budget's narrowed allowance expiring.
+
+        ``temporarily_clamp_client_timeout`` shrinks an attempt's timeout to the
+        remaining run budget and installs the probe read here; a timeout after
+        that allowance ran out is a budget stop, not a provider stall.
+        """
+        probe = getattr(self, "_run_deadline_limited_timeout_elapsed", None)
+        if not callable(probe) or not isinstance(exc, httpx.TimeoutException):
+            return False
+        try:
+            return bool(probe())
+        except Exception:  # noqa: BLE001 - classification must not change the failure
+            return False
+
     def _temperature_compat_key(self, provider_key: str | None) -> tuple[str, str]:
         provider = _normalize_provider_key(provider_key) or _normalize_provider_key(self.base_url)
         model = str(self.model or "").strip().casefold()
@@ -1792,23 +2130,11 @@ class OpenAICompatClient:
             self._tool_calling_compat_key(provider_key)
         )
 
-    def count_input_tokens(
+    def _prompt_payload_for_estimation(
         self,
-        *,
         messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]] | None = None,
-        tool_choice: Any | None = None,
-    ) -> InputTokenCount:
-        """Estimate the prompt-bearing payload that this compatibility route sends.
-
-        OpenAI-compatible wire format does not imply a shared tokenizer or a
-        standard preflight counting endpoint. This method therefore exposes the
-        adapter's provider-transformed payload through the common counting
-        contract while explicitly retaining ``local_estimate`` / ``estimated``
-        provenance. Response usage and overflow recovery remain the authority.
-        """
-
-        del tool_choice  # The chat estimator intentionally excludes control-only fields.
+        tools: list[dict[str, Any]] | None,
+    ) -> tuple[dict[str, Any], str | None]:
         messages = gate_messages_for_provider_route(messages, self.route_identity)
         transport_provider_key = _transport_provider_key(
             base_url=self.base_url,
@@ -1836,14 +2162,10 @@ class OpenAICompatClient:
             model=self.model,
         )
         if CACHE_CONTROL_FIELD in active_cache_field_values:
-            cache_policy = merge_cache_policy_metadata(
+            cache_policy = _compatible_cache_policy_metadata(
                 self.prompt_cache_policy_metadata,
-                RequestCachePlan(
-                    strategy="openai_prompt_cache",
-                    mode="automatic",
-                    prompt_cache_key=self.prompt_cache_key,
-                    prompt_cache_retention=self.prompt_cache_retention,
-                ).openai_prompt_cache_policy_metadata(),
+                prompt_cache_key=self.prompt_cache_key,
+                prompt_cache_retention=self.prompt_cache_retention,
             )
             provider_messages = apply_openai_compatible_cache_control_breakpoint(
                 provider_messages,
@@ -1854,6 +2176,40 @@ class OpenAICompatClient:
         if effective_tools:
             prompt_payload["tools"] = effective_tools
         prompt_payload = _sanitize_transport_value(prompt_payload)
+        return prompt_payload, transport_provider_key
+
+    def request_capacity_ratio(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+    ) -> float:
+        """Measure hosted admission pressure separately from token accounting."""
+        provider = _transport_provider_key(
+            base_url=self.base_url,
+            provider_key=self.provider_key,
+            model=self.model,
+        )
+        if provider != "alysis":
+            return 0.0
+        prompt_payload, _ = self._prompt_payload_for_estimation(messages, tools)
+        # Control fields are small; reserve headroom for their exact wire shape.
+        return hosted_chat_capacity_ratio(
+            {**prompt_payload, "model": self.model, "stream": True},
+            headroom=4096,
+        )
+
+    def count_input_tokens(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: Any | None = None,
+    ) -> InputTokenCount:
+        """Estimate provider-shaped prompt tokens with explicit local provenance."""
+        prompt_payload, transport_provider_key = self._prompt_payload_for_estimation(
+            messages, tools
+        )
         return InputTokenCount(
             input_tokens=estimate_provider_payload_tokens(prompt_payload),
             source=UsageSource.LOCAL_ESTIMATE,
@@ -1867,6 +2223,16 @@ class OpenAICompatClient:
                 "message_count": len(prompt_payload.get("messages") or []),
                 "tool_count": len(prompt_payload.get("tools") or []),
             },
+        )
+
+    def _trace_capability(self, provider_key: str | None) -> ReasoningTraceCapability:
+        capability = getattr(self, "reasoning_trace_capability", None)
+        if capability is not None:
+            return capability
+        return resolve_reasoning_trace_capability(
+            provider_key=provider_key or "",
+            protocol=OPENAI_COMPAT_PROTOCOL,
+            adapter_override=self.reasoning_trace_adapter,
         )
 
     def chat(
@@ -1883,6 +2249,16 @@ class OpenAICompatClient:
         max_tokens: int | None = None,
         cancellation_token: Any | None = None,
     ) -> LLMResponse:
+        wire_diagnostics = self._wire_request_diagnostics.begin_request()
+        on_reasoning_delta = reasoning_trace_callback(
+            on_reasoning_delta,
+            capability=self._trace_capability(
+                _transport_provider_key(
+                    base_url=self.base_url, provider_key=self.provider_key, model=self.model
+                )
+            ),
+            stream=stream,
+        )
         messages = gate_messages_for_provider_route(messages, self.route_identity)
         url = f"{self.base_url}/chat/completions"
         headers = merge_canonical_headers(
@@ -1916,6 +2292,7 @@ class OpenAICompatClient:
             self.model,
             provider_key=transport_provider_key,
             thinking_enabled=deepseek_thinking_enabled,
+            reasoning_effort=self.reasoning_effort,
         )
         temperature_key = self._temperature_compat_key(transport_provider_key)
         cached_temperature_compat_mode = self._temperature_compat_mode_for(temperature_key)
@@ -2068,13 +2445,23 @@ class OpenAICompatClient:
                 if reasoning_effort:
                     payload["reasoning_effort"] = reasoning_effort
         elif _is_openrouter_provider(reasoning_provider_key):
+            always_thinking = reasoning_contract.mode == ALWAYS_ON
+            if always_thinking and (
+                self.enable_thinking is False
+                or str(self.reasoning_effort or "").strip().casefold() == "none"
+            ):
+                raise LLMError(
+                    f"OpenRouter model {self.model!r} does not support disabling thinking"
+                )
             reasoning = _openrouter_reasoning_payload(
                 enable_thinking=self.enable_thinking,
                 reasoning_effort=self.reasoning_effort,
             )
             if reasoning is not None:
                 payload["reasoning"] = reasoning
-            thinking_active = reasoning is not None and reasoning.get("enabled") is not False
+            thinking_active = always_thinking or (
+                reasoning is not None and reasoning.get("enabled") is not False
+            )
         elif _is_gemini_provider(reasoning_provider_key):
             reasoning_effort = _gemini_reasoning_effort(
                 model=self.model,
@@ -2109,6 +2496,21 @@ class OpenAICompatClient:
                 chat_template_kwargs["enable_thinking"] = thinking_enabled
             if chat_template_kwargs:
                 payload["chat_template_kwargs"] = chat_template_kwargs
+        elif reasoning_contract.wire == WIRE_THINKING_TYPE and reasoning_contract.toggleable:
+            thinking_type = self.reasoning_effort
+            if thinking_type not in reasoning_contract.values:
+                thinking_type = (
+                    "disabled"
+                    if self.enable_thinking is False
+                    else reasoning_contract.default or "enabled"
+                )
+            if self.enable_thinking is not None or self.reasoning_effort:
+                payload["thinking"] = {"type": thinking_type}
+            thinking_active = self.enable_thinking is not False
+        elif reasoning_contract.wire == WIRE_REASONING_ENABLED and reasoning_contract.toggleable:
+            if self.enable_thinking is not None:
+                payload["reasoning"] = {"enabled": self.enable_thinking}
+            thinking_active = self.enable_thinking is not False
         else:
             # Any researched provider contract that uses the flat Chat
             # Completions effort field can opt in here without another
@@ -2143,6 +2545,14 @@ class OpenAICompatClient:
             tool_choice = None
             transport_metadata["tool_choice_omitted"] = True
             transport_metadata["tool_choice_omit_reason"] = "cached_provider_rejection"
+        if cached_tool_calling_compat_disabled:
+            required_tool_names = required_tool_names_for_client(self)
+            if required_tool_names:
+                raise RequiredToolCallingUnsupportedError(
+                    "The selected model or provider does not support the required Computer Use "
+                    f"tools ({', '.join(required_tool_names)}). Choose a tool-capable model or "
+                    "provider."
+                )
         if cached_tool_calling_compat_disabled and (tools or tool_choice is not None):
             tools = None
             tool_choice = None
@@ -2174,22 +2584,10 @@ class OpenAICompatClient:
                 model=self.model,
             )
         )
-        cache_policy = merge_cache_policy_metadata(
+        cache_policy = _compatible_cache_policy_metadata(
             self.prompt_cache_policy_metadata,
-            RequestCachePlan(
-                strategy=(
-                    "openai_prompt_cache"
-                    if active_prompt_cache_key or active_prompt_cache_retention
-                    else "none"
-                ),
-                mode=(
-                    "automatic"
-                    if active_prompt_cache_key or active_prompt_cache_retention
-                    else "manual"
-                ),
-                prompt_cache_key=active_prompt_cache_key,
-                prompt_cache_retention=active_prompt_cache_retention,
-            ).openai_prompt_cache_policy_metadata(),
+            prompt_cache_key=active_prompt_cache_key,
+            prompt_cache_retention=active_prompt_cache_retention,
         )
         if CACHE_CONTROL_FIELD in active_cache_field_values:
             application = apply_openai_compatible_cache_control_breakpoint(
@@ -2226,6 +2624,8 @@ class OpenAICompatClient:
         if applied_sampling_fields:
             transport_metadata["sampling_fields_applied"] = list(applied_sampling_fields)
         payload = _sanitize_transport_value(payload)
+        if transport_provider_key == "alysis":
+            validate_hosted_chat_capacity(payload)
         prompt_estimation_payload = {
             "messages": payload.get("messages", []),
         }
@@ -2269,6 +2669,7 @@ class OpenAICompatClient:
             sent_provider_payload=prompt_estimation_payload,
             cache_policy_metadata=cache_policy,
         )
+        request_plan_metadata.update(wire_diagnostics(payload, history_key="messages"))
         token_reconciliation = {
             "input_estimate_tokens": input_estimate_tokens,
             "sent_input_estimate_tokens": input_estimate_tokens,
@@ -2295,6 +2696,10 @@ class OpenAICompatClient:
         stream_restart_count = 0
         stream_restart_reason = ""
         any_text_delta_emitted = False
+        # Provider-level attempts that actually began: _send_request runs once
+        # per attempt. A retry scheduled by the retry loop but cancelled during
+        # its backoff never gets here, so it is not counted as a retry.
+        provider_attempts_started = 0
 
         def _record_retry(attempt: int, reason: str, wait_seconds: float) -> None:
             nonlocal stream_restart_count, stream_restart_reason, any_text_delta_emitted
@@ -2320,23 +2725,97 @@ class OpenAICompatClient:
                     except Exception:  # noqa: BLE001
                         _LOGGER.debug("stream_restart_hook_failed", exc_info=True)
 
+        @contextmanager
+        def _recorded_request(**kwargs: Any) -> Iterator[tuple[httpx.Response, _HTTPAttempt]]:
+            # Recompute from the final payload, including compatibility fallbacks;
+            # the comparator remains the previous logical request across retries.
+            request_plan_metadata.update(wire_diagnostics(payload, history_key="messages"))
+            telemetry.set_request_plan(request_plan_metadata)
+            attempt = _HTTPAttempt(stream=bool(kwargs.get("stream")))
+            # 0 for the first provider-level attempt, n for its n-th retry;
+            # compatibility re-sends inside one attempt share its index.
+            attempt.values["retry_index"] = max(0, provider_attempts_started - 1)
+            try:
+                with cancellable_httpx_request(**kwargs) as resp:
+                    attempt.values["status_code"] = resp.status_code
+                    if resp.status_code >= 400:
+                        # Error bodies are consumed by the existing error parser,
+                        # outside the streaming byte observer. Their size is unknown.
+                        attempt.values["body_bytes_received"] = None
+                        attempt.values["byte_chunk_count"] = None
+                    yield resp, attempt
+                    attempt.values["terminal_reason"] = "done" if stream else "response"
+            except BaseException as exc:
+                if isinstance(exc, (KeyboardInterrupt, CooperativeCancellationError)):
+                    reason = "cancelled"
+                elif isinstance(exc, DeadlineExhausted) or self._timeout_belongs_to_run_deadline(
+                    exc
+                ):
+                    reason = "budget_abort"
+                elif isinstance(exc, (LLMStreamNoProgressError, httpx.ReadTimeout)):
+                    # A stall once the first event has arrived; before it the
+                    # provider never answered. A non-streaming response is its
+                    # own first event, so its timeouts are all first-event ones.
+                    reason = (
+                        "timeout_stall"
+                        if "first_event_ms" in attempt.values
+                        else "timeout_first_event"
+                    )
+                elif attempt.values.get("status_code", 0) >= 400:
+                    reason = "http_error"
+                elif isinstance(exc, httpx.RequestError):
+                    reason = "transport_error"
+                elif isinstance(exc, LLMError):
+                    reason = "invalid_response"
+                else:
+                    reason = "client_error"
+                attempt.values.setdefault("terminal_reason", reason)
+                if isinstance(exc, Exception) and not isinstance(
+                    exc,
+                    (LLMError, httpx.RequestError, DeadlineExhausted, CooperativeCancellationError),
+                ):
+                    error = _StreamClientError("LLM response processing failed in the client")
+                    mark_provider_call_non_retryable(error)
+                    raise error from exc
+                raise
+            finally:
+                attempt.values["latency_ms"] = attempt.elapsed_ms()
+                telemetry.record_attempt(attempt.values)
+
         def _send_request() -> LLMResponse:
             nonlocal cache_policy, request_plan_metadata, request_shape, token_reconciliation
-            nonlocal stream_restart_count, stream_restart_reason
+            nonlocal stream_restart_count, stream_restart_reason, provider_attempts_started
+            telemetry.note_attempt_started(retry_index=provider_attempts_started)
+            provider_attempts_started += 1
             temperature_retry_count = 0
             temperature_retry_modes: set[str] = set()
             cache_param_retry_used = False
             try:
-                with httpx.Client(
-                    timeout=_httpx_request_timeout(self.timeout_s),
-                    transport=self._transport,
-                ) as client:
+                client_context = (
+                    cancellation_aware_httpx_client(
+                        timeout_s=_httpx_request_timeout(self.timeout_s),
+                        transport=self._transport,
+                        cancellation_token=cancellation_token,
+                    )
+                    if cancellation_token is not None and not stream
+                    else provider_httpx_client(
+                        timeout=_httpx_request_timeout(self.timeout_s),
+                        transport=self._transport,
+                    )
+                )
+                with client_context as client:
                     while True:
                         try:
                             if stream:
-                                with client.stream(
-                                    "POST", url, headers=headers, json=payload
-                                ) as resp:
+                                with _recorded_request(
+                                    client=client,
+                                    cancellation_token=cancellation_token,
+                                    method="POST",
+                                    url=url,
+                                    stream=True,
+                                    headers=headers,
+                                    json=payload,
+                                ) as (resp, attempt):
                                     # Before parsing: the routing headers are
                                     # the evidence for which backend answered,
                                     # and they must survive a stream that then
@@ -2355,7 +2834,15 @@ class OpenAICompatClient:
                                         if delta:
                                             any_text_delta_emitted = True
                                         if telemetry_on_text_delta is not None:
-                                            telemetry_on_text_delta(delta)
+                                            try:
+                                                telemetry_on_text_delta(delta)
+                                            except Exception as exc:
+                                                attempt.values["terminal_reason"] = "callback_error"
+                                                error = _StreamClientError(
+                                                    "LLM text callback failed"
+                                                )
+                                                mark_provider_call_non_retryable(error)
+                                                raise error from exc
 
                                     def _attempt_reasoning_delta(
                                         delta: str,
@@ -2366,7 +2853,15 @@ class OpenAICompatClient:
                                     ) -> None:
                                         _attempt_reasoning_deltas.append(delta)
                                         if telemetry_on_reasoning_delta is not None:
-                                            telemetry_on_reasoning_delta(delta)
+                                            try:
+                                                telemetry_on_reasoning_delta(delta)
+                                            except Exception as exc:
+                                                attempt.values["terminal_reason"] = "callback_error"
+                                                error = _StreamClientError(
+                                                    "LLM reasoning callback failed"
+                                                )
+                                                mark_provider_call_non_retryable(error)
+                                                raise error from exc
 
                                     try:
                                         response = self._parse_stream_response(
@@ -2383,6 +2878,8 @@ class OpenAICompatClient:
                                             ),
                                             provider_key=reasoning_provider_key,
                                             cancellation_token=cancellation_token,
+                                            manage_abort_callback=False,
+                                            attempt=attempt,
                                         )
                                     except Exception as stream_error:
                                         if isinstance(stream_error, DeadlineExhausted):
@@ -2429,21 +2926,40 @@ class OpenAICompatClient:
                                             reason=stream_restart_reason,
                                         )
                             else:
-                                resp = client.post(url, headers=headers, json=payload)
-                                # Captured before the status check so a 4xx/5xx
-                                # keeps its request id, which is usually the
-                                # only handle a provider accepts when asked
-                                # what happened to a specific call.
-                                telemetry.set_response_headers(resp.headers)
-                                if resp.status_code >= 400:
-                                    raise self._error_from_response(resp)
-                                response = self._parse_non_stream_response(
-                                    resp,
-                                    provider_key=reasoning_provider_key,
-                                    model=self.model,
-                                )
+                                with _recorded_request(
+                                    client=client,
+                                    cancellation_token=cancellation_token,
+                                    method="POST",
+                                    url=url,
+                                    stream=False,
+                                    headers=headers,
+                                    json=payload,
+                                ) as (resp, attempt):
+                                    # Captured before the status check so a 4xx/5xx
+                                    # keeps its request id, which is usually the
+                                    # only handle a provider accepts when asked
+                                    # what happened to a specific call.
+                                    telemetry.set_response_headers(resp.headers)
+                                    if resp.status_code >= 400:
+                                        raise self._error_from_response(resp)
+                                    response = self._parse_non_stream_response(
+                                        resp,
+                                        provider_key=reasoning_provider_key,
+                                        model=self.model,
+                                        trace_adapter=self._trace_capability(
+                                            reasoning_provider_key
+                                        ).adapter,
+                                    )
+                                    attempt.values["usage"] = response.usage
+                                    attempt.values["usage_observed"] = response.usage is not None
+                                    if response.usage is not None:
+                                        attempt.values["usage_source"] = "provider"
                         except LLMError as e:
-                            if stream and _is_stream_options_unsupported_error(e):
+                            if (
+                                stream
+                                and "stream_options" in payload
+                                and _is_stream_options_unsupported_error(e)
+                            ):
                                 payload.pop("stream_options", None)
                                 continue
                             rejected_cache_fields = _cache_param_rejected_fields(
@@ -2534,9 +3050,17 @@ class OpenAICompatClient:
                                 )
                                 continue
                             if "tools" in payload and _tool_calling_unsupported_error(e):
+                                self._mark_tool_calling_compat_disabled(tool_calling_key)
+                                required_tool_names = required_tool_names_for_client(self)
+                                if required_tool_names:
+                                    raise RequiredToolCallingUnsupportedError(
+                                        "The selected model or provider rejected the required "
+                                        "Computer Use tools "
+                                        f"({', '.join(required_tool_names)}). Choose a "
+                                        "tool-capable model or provider."
+                                    ) from e
                                 payload.pop("tools", None)
                                 payload.pop("tool_choice", None)
-                                self._mark_tool_calling_compat_disabled(tool_calling_key)
                                 fallback_prompt_payload: dict[str, Any] = {
                                     "messages": payload.get("messages", []),
                                 }
@@ -2636,8 +3160,7 @@ class OpenAICompatClient:
                             raise
                         if not stream and telemetry_on_reasoning_delta is not None:
                             for reasoning_output in response.reasoning:
-                                if reasoning_output.kind == ReasoningOutputKind.SUMMARY:
-                                    telemetry_on_reasoning_delta(reasoning_output.text)
+                                telemetry_on_reasoning_delta(reasoning_output.text)
                         return _merge_transport_metadata(
                             _merge_request_plan_metadata(
                                 response,
@@ -2645,15 +3168,19 @@ class OpenAICompatClient:
                             ),
                             transport_metadata=transport_metadata,
                         )
+            except CooperativeCancellationError:
+                raise
             except LLMError:
                 raise
             except DeadlineExhausted:
                 raise
             except httpx.DecodingError as e:
+                raise_if_cancelled(cancellation_token)
                 raise LLMError(
                     f"LLM response decompression failed: {sanitize_error_text_for_output(e)}"
                 ) from e
             except Exception as e:  # noqa: BLE001 - network errors vary
+                raise_if_cancelled(cancellation_token)
                 if _is_connect_failure(e):
                     raise LLMError(
                         "LLM request failed for "
@@ -2684,6 +3211,7 @@ class OpenAICompatClient:
                         "_provider_retry_wall_clock_cap_seconds",
                         _PROVIDER_RETRY_WALL_CLOCK_CAP_SECONDS,
                     ),
+                    cancellation_token=cancellation_token,
                 )
             ),
             self.route_identity,
@@ -2695,6 +3223,7 @@ class OpenAICompatClient:
         *,
         provider_key: str | None,
         model: str | None = None,
+        trace_adapter: str | None = None,
     ) -> LLMResponse:
         try:
             data = resp.json()
@@ -2726,7 +3255,9 @@ class OpenAICompatClient:
                 message=msg,
                 model=model,
             ),
-            reasoning=_reasoning_outputs_from_message(msg, provider_key=provider_key),
+            reasoning=_reasoning_outputs_from_message(
+                msg, provider_key=provider_key, trace_adapter=trace_adapter
+            ),
         )
 
     @staticmethod
@@ -2745,11 +3276,44 @@ class OpenAICompatClient:
         on_reasoning_delta: Callable[[str], None] | None = None,
         provider_key: str | None,
         cancellation_token: Any | None = None,
+        manage_abort_callback: bool = True,
+        attempt: _HTTPAttempt | None = None,
     ) -> LLMResponse:
         if resp.status_code >= 400:
             body = self._safe_error_body(resp)
             raise _error_from_status_body(status_code=resp.status_code, body=body)
 
+        # Register response.close only for the lifetime of this parse. Every
+        # exit path (success, provider error, timeout, deadline or cancel) must
+        # release the callback so the token cannot retain a stale response.
+        set_abort = getattr(cancellation_token, "set_abort_callback", None)
+        clear_abort = getattr(cancellation_token, "clear_abort_callback", None)
+        if manage_abort_callback and callable(set_abort):
+            set_abort(resp.close)
+        try:
+            return self._parse_stream_response_body(
+                resp,
+                on_text_delta=on_text_delta,
+                on_reasoning_delta=on_reasoning_delta,
+                provider_key=provider_key,
+                cancellation_token=cancellation_token,
+                attempt=attempt,
+            )
+        finally:
+            if manage_abort_callback and callable(clear_abort):
+                clear_abort()
+
+    def _parse_stream_response_body(
+        self,
+        resp: httpx.Response,
+        *,
+        on_text_delta: Callable[[str], None] | None,
+        on_reasoning_delta: Callable[[str], None] | None = None,
+        provider_key: str | None,
+        cancellation_token: Any | None = None,
+        attempt: _HTTPAttempt | None = None,
+    ) -> LLMResponse:
+        attempt = attempt or _HTTPAttempt(stream=True)
         content_parts: list[str] = []
         tool_chunks: dict[int, dict[str, Any]] = {}
         event_count = 0
@@ -2762,17 +3326,29 @@ class OpenAICompatClient:
         usage: LLMUsage | None = None
         accumulated_content = ""
         reasoning_parts: list[str] = []
+        native_reasoning_content_parts: list[str] = []
+        saw_reasoning_content = False
         reasoning_details: list[Any] = []
-        reasoning_summary_parts: dict[str, str] = {}
         mistral_content_chunks: list[dict[str, Any]] = []
         saw_done = False
         progress_clock = self._stream_progress_clock
         last_meaningful_progress = progress_clock()
+        # Chunks are appended as received unless this client was opted in to
+        # cumulative assembly (see resolve_stream_assembly).
+        cumulative_chunks = (
+            getattr(self, "stream_assembly", STREAM_ASSEMBLY_CONCAT) == STREAM_ASSEMBLY_CUMULATIVE
+        )
 
-        _set_abort = getattr(cancellation_token, "set_abort_callback", None)
-        _clear_abort = getattr(cancellation_token, "clear_abort_callback", None)
-        if callable(_set_abort):
-            _set_abort(resp.close)
+        trace = CompatibleReasoningTrace(
+            self._trace_capability(provider_key).adapter,
+            provider=provider_key,
+            cumulative=cumulative_chunks,
+        )
+
+        def _chunk_suffix(previous: str, incoming: str) -> str:
+            if cumulative_chunks:
+                return _stream_delta_suffix(previous=previous, incoming=incoming)
+            return incoming
 
         def _check_stream_liveness(*, check_progress: bool) -> None:
             raise_if_cancelled(cancellation_token)
@@ -2794,6 +3370,10 @@ class OpenAICompatClient:
 
         def _observed_byte_chunks() -> Iterator[bytes]:
             for chunk in resp.iter_bytes():
+                attempt.increment("byte_chunk_count")
+                attempt.increment("body_bytes_received", len(chunk))
+                if chunk:
+                    attempt.first("first_byte_ms")
                 _check_stream_liveness(check_progress=True)
                 yield chunk
 
@@ -2801,25 +3381,22 @@ class OpenAICompatClient:
             _observed_byte_chunks(),
             encoding=resp.encoding or "utf-8",
         )
-        try:
+
+        def _observed_lines() -> Iterator[str]:
             for text in iter_lines_from_text_chunks(text_chunks):
                 _check_stream_liveness(check_progress=False)
-                if not text.startswith("data:"):
-                    continue
-                payload = text[5:].strip()
-                if not payload:
-                    continue
-                if payload == "[DONE]":
+                yield text
+
+        try:
+            for event in _stream_events(_observed_lines(), attempt):
+                if event is None:
                     last_meaningful_progress = progress_clock()
                     saw_done = True
                     break
 
-                try:
-                    event = json.loads(payload)
-                except json.JSONDecodeError:
-                    continue
-                if not isinstance(event, dict):
-                    continue
+                if event.get("error") is not None:
+                    attempt.values["terminal_reason"] = "provider_error"
+                    raise _error_from_stream_error_event(event.get("error"))
 
                 event_progress = False
                 event_count += 1
@@ -2836,48 +3413,39 @@ class OpenAICompatClient:
                     system_fingerprint = chunk_fingerprint
                     event_progress = True
                 parsed_usage = _parse_usage(event.get("usage"), provider_key=provider_key)
+                if parsed_usage is not None:
+                    attempt.values["usage_observed"] = True
+                    attempt.values["usage_source"] = "provider"
+                    attempt.values["usage"] = parsed_usage
                 if parsed_usage is not None and parsed_usage != usage:
                     usage = parsed_usage
                     event_progress = True
 
                 choices = event.get("choices") or []
                 choice0 = choices[0] if isinstance(choices, list) and choices else None
+                if isinstance(choice0, dict) and choice0.get("finish_reason") is not None:
+                    attempt.values["finish_reason_observed"] = True
                 delta = choice0.get("delta") if isinstance(choice0, dict) else None
                 if isinstance(delta, dict):
                     reasoning_delta = delta.get(_DEEPSEEK_REASONING_CONTENT_KEY)
+                    if isinstance(reasoning_delta, str):
+                        saw_reasoning_content = True
+                        native_reasoning_content_parts.append(reasoning_delta)
                     if not isinstance(reasoning_delta, str):
                         reasoning_delta = delta.get(_OPENROUTER_REASONING_KEY)
                     if isinstance(reasoning_delta, str) and reasoning_delta:
+                        attempt.increment("reasoning_delta_count")
                         reasoning_parts.append(reasoning_delta)
                         event_progress = True
                     details_delta = delta.get(_OPENROUTER_REASONING_DETAILS_KEY)
                     if isinstance(details_delta, list) and details_delta:
+                        attempt.increment("reasoning_delta_count")
                         reasoning_details.extend(details_delta)
                         event_progress = True
-                        for detail_index, detail in enumerate(details_delta):
-                            parsed = (
-                                _text_from_reasoning_detail(detail)
-                                if isinstance(detail, dict)
-                                else None
-                            )
-                            if parsed is None:
-                                continue
-                            detail_text, detail_kind = parsed
-                            if detail_kind != ReasoningOutputKind.SUMMARY:
-                                continue
-                            key = str(
-                                detail.get("id") or detail.get("index") or f"summary_{detail_index}"
-                            )
-                            previous = reasoning_summary_parts.get(key, "")
-                            suffix = _stream_delta_suffix(
-                                previous=previous,
-                                incoming=detail_text,
-                            )
-                            if not suffix:
-                                continue
-                            reasoning_summary_parts[key] = previous + suffix
-                            if on_reasoning_delta is not None:
-                                on_reasoning_delta(suffix)
+                    for reasoning_delta in trace.feed(delta):
+                        event_progress = True
+                        if on_reasoning_delta is not None:
+                            on_reasoning_delta(reasoning_delta.text)
 
                     raw_content_delta = delta.get("content")
                     if _is_mistral_provider(provider_key) and _append_mistral_stream_content(
@@ -2887,11 +3455,9 @@ class OpenAICompatClient:
                         event_progress = True
                     content_delta = _normalize_assistant_content_to_text(raw_content_delta)
                     if content_delta:
-                        content_suffix = _stream_delta_suffix(
-                            previous=accumulated_content,
-                            incoming=content_delta,
-                        )
+                        content_suffix = _chunk_suffix(accumulated_content, content_delta)
                         if content_suffix:
+                            attempt.increment("text_delta_count")
                             content_parts.append(content_suffix)
                             accumulated_content += content_suffix
                             event_progress = True
@@ -2906,6 +3472,7 @@ class OpenAICompatClient:
                             idx = raw_tc.get("index")
                             if not isinstance(idx, int):
                                 continue
+                            attempt.increment("tool_delta_count")
                             entry = tool_chunks.setdefault(
                                 idx,
                                 {
@@ -2943,10 +3510,7 @@ class OpenAICompatClient:
                                 event_progress = True
                             args_piece = fn.get("arguments")
                             if isinstance(args_piece, str):
-                                args_suffix = _stream_delta_suffix(
-                                    previous=entry["arguments"],
-                                    incoming=args_piece,
-                                )
+                                args_suffix = _chunk_suffix(entry["arguments"], args_piece)
                                 if args_suffix:
                                     entry["arguments"] += args_suffix
                                     event_progress = True
@@ -2956,13 +3520,11 @@ class OpenAICompatClient:
         except Exception:
             raise_if_cancelled(cancellation_token)
             raise
-        finally:
-            if callable(_clear_abort):
-                _clear_abort()
 
         # A transport abort can end the stream as clean EOF instead of raising.
         _check_stream_liveness(check_progress=False)
         if not saw_done:
+            attempt.values["terminal_reason"] = "stream_truncated"
             raise LLMError("LLM stream truncated before [DONE]")
         streamed_tool_calls = _parse_stream_tool_calls(tool_chunks)
         streamed_content = "".join(content_parts)
@@ -2987,11 +3549,15 @@ class OpenAICompatClient:
                 provider_key=provider_key,
                 message=reasoning_message,
                 model=self.model,
+                reasoning_content_message=(
+                    {
+                        _DEEPSEEK_REASONING_CONTENT_KEY: "".join(native_reasoning_content_parts),
+                    }
+                    if saw_reasoning_content
+                    else {}
+                ),
             ),
-            reasoning=_reasoning_outputs_from_message(
-                reasoning_message,
-                provider_key=provider_key,
-            ),
+            reasoning=trace.outputs,
         )
 
     @staticmethod

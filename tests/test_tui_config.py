@@ -31,12 +31,13 @@ from alysis_code.config import (
 )
 from alysis_code.profile_presets import PROFILE_PRESETS, make_profile_from_preset
 from alysis_code.profiles import ProfileSpec
-from alysis_code.provider_auth import ProviderAccountStatus
+from alysis_code.provider_auth import ProviderAccountStatus, ProviderModel, ProviderReasoningEffort
 
 # --------------------------------------------------------------------------- helpers
 
 
 def _config_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ALYSIS_CLOUD_API_URL", "https://cloud.example.invalid/api")
     monkeypatch.setenv("ALYSIS_CONFIG_DIR", os.fspath(tmp_path / "config"))
     monkeypatch.setenv("ALYSIS_DATA_DIR", os.fspath(tmp_path / "data"))
     for var in (
@@ -75,12 +76,12 @@ def _cfg_with_subscription_profile() -> AppConfig:
     profile = ProfileSpec(
         name="chatgpt-codex",
         protocol="openai_responses",
-        base_url="https://chatgpt.com/backend-api/codex",
+        base_url="https://api.openai.com/v1",
         auth_provider="openai-codex",
         default_model="gpt-5.4",
         reasoning_effort="high",
     )
-    cfg = AppConfig(model=profile.default_model)
+    cfg = AppConfig(model=profile.default_model, base_url=profile.base_url)
     cfg.extra_fields = {
         "profiles": {profile.name: profile.to_dict()},
         "active_profile": profile.name,
@@ -101,6 +102,43 @@ def _cfg_with_alysis_profile() -> AppConfig:
         "active_profile": profile.name,
     }
     return cfg
+
+
+@pytest.fixture
+def subscription_auth(monkeypatch):
+    class FakeSubscriptionAuth:
+        profile_name = "chatgpt-codex"
+        protocol = "openai_responses"
+        base_url = "https://api.openai.com/v1"
+        display_name = "ChatGPT subscription"
+        connected = False
+
+        def account_status(self):
+            return ProviderAccountStatus(connected=self.connected)
+
+        def login(self, *, method, output_write):
+            assert method == "browser"
+            self.connected = True
+            return self.account_status()
+
+        def list_models(self, *, refresh=False):
+            return (
+                ProviderModel(
+                    id="gpt-5.4",
+                    label="GPT-5.4",
+                    reasoning_efforts=(
+                        ProviderReasoningEffort("low", "Low"),
+                        ProviderReasoningEffort("high", "High"),
+                    ),
+                ),
+            )
+
+    adapter = FakeSubscriptionAuth()
+    monkeypatch.setattr(flow_mod, "create_provider_auth", lambda _provider_id: adapter)
+    monkeypatch.setattr(
+        "alysis_code.provider_auth.create_provider_auth", lambda _provider_id: adapter
+    )
+    return adapter
 
 
 # --------------------------------------------------------------------------- menu
@@ -172,7 +210,7 @@ def test_execution_backend_flow_creates_native_subscription_profile():
     assert rows["execution"].label == "Model Access"
     # Grouped menu shows the one key fact; the "AI subscription ·" prefix moved
     # into the Model Access section screen.
-    assert rows["execution"].description == "ChatGPT Codex subscription"
+    assert rows["execution"].description == "ChatGPT subscription"
 
 
 def test_execution_backend_flow_saves_native_subscription_profile(
@@ -198,7 +236,7 @@ def test_execution_backend_flow_saves_native_subscription_profile(
     assert saved.extra_fields["active_profile"] == "chatgpt-codex"
     assert saved.extra_fields["profiles"]["chatgpt-codex"]["auth_provider"] == "openai-codex"
     assert saved.model == ""
-    assert saved.base_url == "https://chatgpt.com/backend-api/codex"
+    assert saved.base_url == "https://api.openai.com/v1"
     assert saved.extra_fields["subscription_model_selection_required"] == "openai-codex"
 
 
@@ -242,7 +280,13 @@ def test_model_access_manages_subscription_account(monkeypatch: pytest.MonkeyPat
     flow.run_busy()
     assert flow.stage == "subscription_account"
     assert adapter.login_calls == 1
-    assert [row.value for row in flow.screen().rows] == ["connect", "disconnect", "back"]
+    assert [row.value for row in flow.screen().rows] == [
+        "connect",
+        "disconnect",
+        "__save__",
+        "back",
+    ]
+    assert "Press s" in flow.status
 
     flow.choose("disconnect")
     assert flow.stage == "subscription_disconnect_confirm"
@@ -252,6 +296,123 @@ def test_model_access_manages_subscription_account(monkeypatch: pytest.MonkeyPat
     assert flow.stage == "subscription_account"
     assert adapter.logout_calls == 1
     assert [row.value for row in flow.screen().rows] == ["connect", "back"]
+
+
+@pytest.mark.parametrize("configured", [False, True])
+@pytest.mark.parametrize("already_connected", [False, True])
+def test_subscription_account_save_returns_to_chat(
+    tmp_path, monkeypatch, subscription_auth, configured, already_connected
+):
+    _config_env(tmp_path, monkeypatch)
+    subscription_auth.connected = already_connected
+    flow = ConfigFlow(cfg=_cfg_with_subscription_profile() if configured else _cfg_with_profiles())
+    flow.choose("execution")
+    flow.choose("delegated")
+    flow.choose("openai-codex")
+    if not already_connected:
+        flow.choose("connect")
+        flow.run_busy()
+
+    assert flow.stage == "subscription_account"
+    assert "__save__" in [row.value for row in flow.screen().rows]
+    flow.choose("__save__")
+    if not configured:
+        assert flow.stage == "model"
+        flow.choose("gpt-5.4")
+        assert flow.stage == "model_thinking"
+        flow.choose("high")
+    assert flow.stage == "saving"
+    flow.run_busy()
+
+    assert flow.stage == "done" and flow.saved and flow.success
+    saved = load_config()
+    assert saved.execution.backend == "native"
+    assert saved.extra_fields["active_profile"] == "chatgpt-codex"
+    profile = saved.extra_fields["profiles"]["chatgpt-codex"]
+    assert profile["auth_provider"] == "openai-codex"
+    assert profile["default_model"] == saved.model == "gpt-5.4"
+    assert profile["reasoning_effort"] == "high"
+    assert "subscription_model_selection_required" not in saved.extra_fields
+    if not configured:
+        assert "openai" in saved.extra_fields["profiles"]
+
+
+def test_subscription_save_model_back_cancels_continuation(
+    tmp_path, monkeypatch, subscription_auth
+):
+    _config_env(tmp_path, monkeypatch)
+    subscription_auth.connected = True
+    flow = ConfigFlow(cfg=_cfg())
+    flow.choose("execution")
+    flow.choose("delegated")
+    flow.choose("openai-codex")
+    flow.choose("__save__")
+    flow.choose("gpt-5.4")
+    flow.back()
+    assert flow.stage == "model"
+    flow.back()
+    assert flow.stage == "subscription_account" and not flow.saved
+
+    flow.choose("back")
+    flow.choose("default")
+    flow.choose("gpt-5.4")
+    flow.choose("high")
+    assert flow.stage == "menu" and not flow.saved
+
+
+def test_subscription_account_save_failure_keeps_changes_for_retry(
+    tmp_path, monkeypatch, subscription_auth
+):
+    _config_env(tmp_path, monkeypatch)
+    subscription_auth.connected = True
+    flow = ConfigFlow(cfg=_cfg_with_subscription_profile())
+    flow.choose("execution")
+    flow.choose("delegated")
+    flow.choose("openai-codex")
+    flow.choose("__save__")
+
+    def fail_save(_cfg):
+        raise PermissionError("read-only config")
+
+    monkeypatch.setattr(flow_mod, "save_config", fail_save)
+    flow.run_busy()
+    assert flow.stage == "menu" and not flow.saved
+    assert "read-only config" in flow.status
+    assert flow.state.active_profile == "chatgpt-codex"
+
+
+def test_subscription_save_shortcut_matches_visible_action(
+    tmp_path, monkeypatch, subscription_auth
+):
+    from prompt_toolkit.formatted_text import fragment_list_to_text
+    from prompt_toolkit.key_binding import KeyBindings
+
+    from alysis_code.cli_impl.tui.config_overlay import ConfigOverlay
+
+    _config_env(tmp_path, monkeypatch)
+    flow = ConfigFlow(cfg=_cfg_with_subscription_profile())
+    flow.choose("execution")
+    flow.choose("delegated")
+    flow.choose("openai-codex")
+    overlay = ConfigOverlay(flow_factory=lambda: flow)
+    overlay.open()
+    kb = KeyBindings()
+    overlay.register(kb)
+    save_binding = kb.get_bindings_for_keys(("s",))[0]
+
+    assert not save_binding.filter()
+    assert "s save" not in fragment_list_to_text(overlay._footer_fragments())
+    subscription_auth.connected = True
+    flow._refresh_subscription_account_status()
+    assert save_binding.filter()
+    assert "s save" in fragment_list_to_text(overlay._footer_fragments())
+    for stage in ("api_key", "subscription_disconnect_confirm", "subscription_connecting"):
+        flow._goto(stage)
+        assert not save_binding.filter()
+    flow._goto("menu")
+    assert save_binding.filter()
+    overlay._open["on"] = False
+    assert not save_binding.filter()
 
 
 @pytest.mark.parametrize("connected", [False, True])
@@ -328,7 +489,7 @@ def test_alysis_login_replaces_previous_provider_state_and_preserves_gateway(
     assert flow.stage == "subscription_account"
     assert flow.state.active_profile == "alysis"
     assert flow.state.fields["base_url"] == alysis_cloud.gateway_base_url()
-    assert flow.state.fields["model"] == "deepseek-v4-flash"
+    assert flow.state.fields["model"] == "deepseek-flash"
     assert flow.state.execution_backend == "native"
     assert flow.state.profiles["openai"] == previous_profile
     if finish == "save":
@@ -371,7 +532,7 @@ def test_advanced_submenu_holds_subagent_and_forge():
     flow.choose("advanced")
     assert flow.stage == "advanced" and flow.current_mode() == "list"
     values = [r.value for r in flow.screen().rows]
-    assert values == ["subagents", "forge", "back"]
+    assert values == ["request_timeout", "subagents", "forge", "back"]
     flow.choose("back")
     assert flow.stage == "menu"
 
@@ -422,7 +583,9 @@ def test_sandbox_section_sets_field_and_returns_to_menu():
 
 
 def test_default_model_full_flow():
-    flow = ConfigFlow(cfg=_cfg(model="gpt-4o"))
+    cfg = _cfg(model="gpt-4o")
+    cfg.llm_timeout_s = 95.5
+    flow = ConfigFlow(cfg=cfg)
     flow.choose("default")
     assert flow.stage == "model"
     flow.choose(flow.screen().rows[0].value)  # current model row
@@ -430,10 +593,8 @@ def test_default_model_full_flow():
     flow.submit_input("")  # keep current base_url
     assert flow.stage == "model_thinking"
     flow.choose("high")
-    assert flow.stage == "model_timeout"
-    flow.submit_input("45")
     assert flow.stage == "menu"
-    assert flow.state.fields["llm_timeout_s"] == "45"
+    assert flow.state.fields["llm_timeout_s"] == "95.5"
     assert flow.state.thinking_label == "high"
 
 
@@ -475,31 +636,58 @@ def test_default_model_custom_path():
     assert flow.state.fields["model"] == "my-custom-model"
 
 
-@pytest.mark.parametrize("custom", [False, True])
 @pytest.mark.parametrize("gateway_override", [None, "https://gateway.example.test/v1"])
-def test_alysis_model_flow_skips_managed_endpoint_in_both_directions(
-    tmp_path, monkeypatch, custom, gateway_override
+def test_alysis_model_flow_shows_free_models_and_keeps_managed_endpoint(
+    tmp_path, monkeypatch, gateway_override
 ):
     _config_env(tmp_path, monkeypatch)
     if gateway_override:
         monkeypatch.setenv("ALYSIS_GATEWAY_URL", gateway_override)
-    monkeypatch.setattr(account_login, "list_trial_models", lambda _cfg: [])
     flow = ConfigFlow(cfg=_cfg_with_alysis_profile())
     gateway = flow.state.fields["base_url"]
     flow.choose("default")
-    if custom:
-        flow.choose(flow_mod._CUSTOM_MODEL_VALUE)
-        flow.submit_input("future-hosted-model")
-    else:
-        flow.choose("deepseek-v4-flash")
+    assert [(row.value, row.label) for row in flow.screen().rows] == [
+        ("deepseek-flash", "DeepSeek V4.1 Flash"),
+        ("glm-5.3-flash", "GLM 5.3 Flash"),
+        ("gpt-6-luna", "GPT-6 Luna"),
+        ("claude-haiku-5-5", "Claude Haiku 5.5"),
+    ]
+    flow.choose_current()
     assert flow.stage == "model_thinking"
+    assert flow.state.fields["model"] == "deepseek-flash"
     flow.back()
     assert flow.stage == "model"
-    flow.choose("deepseek-v4-flash")
+    assert flow.screen().rows[0].current is True
+    flow.choose_current()
+    timeout = flow.state.fields["llm_timeout_s"]
     flow.choose("auto")
-    flow.submit_input("45")
+    assert flow.stage == "menu"
+    assert flow.state.fields["llm_timeout_s"] == timeout
+    assert (
+        next(row for row in flow.screen().rows if row.value == "default").description
+        == "DeepSeek V4.1 Flash"
+    )
+    assert flow.state.fields["base_url"] == gateway
+
+
+def test_alysis_model_flow_selects_glm_with_required_thinking(tmp_path, monkeypatch):
+    _config_env(tmp_path, monkeypatch)
+    flow = ConfigFlow(cfg=_cfg_with_alysis_profile())
+    gateway = flow.state.fields["base_url"]
+    flow.choose("default")
+    flow.choose("glm-5.3-flash")
+    assert flow.state.fields["model"] == "glm-5.3-flash"
+    assert flow.stage == "model_thinking"
+    options = {row.value for row in flow.screen().rows}
+    assert "none" not in options
+    assert "off" not in options
+    flow.choose("high")
     assert flow.stage == "menu"
     assert flow.state.fields["base_url"] == gateway
+    assert (
+        next(row for row in flow.screen().rows if row.value == "default").description
+        == "GLM 5.3 Flash"
+    )
 
 
 def test_alysis_profile_editor_keeps_endpoint_managed(tmp_path, monkeypatch):
@@ -512,18 +700,39 @@ def test_alysis_profile_editor_keeps_endpoint_managed(tmp_path, monkeypatch):
     assert not flow.state.dirty
 
 
-def test_model_timeout_rejects_non_positive():
+@pytest.mark.parametrize("invalid", ["0", "-1", "nan", "inf", "abc"])
+def test_advanced_request_timeout_rejects_invalid_values(invalid):
     flow = ConfigFlow(cfg=_cfg())
-    flow.choose("default")
-    flow.choose(flow.screen().rows[0].value)
-    flow.submit_input("")  # base_url
-    flow.choose("auto")  # thinking
-    flow.submit_input("0")  # invalid timeout
-    assert flow.stage == "model_timeout"  # stayed
+    timeout = flow.state.fields["llm_timeout_s"]
+    flow.choose("advanced")
+    flow.choose("request_timeout")
+    flow.submit_input(invalid)
+    assert flow.stage == "request_timeout"
     assert flow.status_tone == "err"
+    assert flow.state.fields["llm_timeout_s"] == timeout
 
 
-# --------------------------------------------------------------------------- context & cache
+def test_advanced_request_timeout_can_be_changed_or_cancelled():
+    cfg = _cfg()
+    flow = ConfigFlow(cfg=cfg)
+    timeout = flow.state.fields["llm_timeout_s"]
+    flow.choose("advanced")
+    flow.choose("request_timeout")
+    assert flow.screen().input_default == timeout
+    flow.back()
+    assert flow.stage == "advanced"
+    assert flow.state.fields["llm_timeout_s"] == timeout
+    flow.choose("request_timeout")
+    flow.submit_input("95.5")
+    assert flow.stage == "advanced"
+    assert flow.state.fields["llm_timeout_s"] == "95.5"
+    assert (
+        next(row for row in flow.screen().rows if row.value == "request_timeout").description
+        == "95.5 seconds"
+    )
+    result = flow.state.commit_to(cfg)
+    assert result.saved
+    assert cfg.llm_timeout_s == 95.5
 
 
 def test_web_search_flow_and_save(monkeypatch, tmp_path):
@@ -858,6 +1067,34 @@ def test_provider_switch_rows_show_model_host_and_what_needs_attention():
     assert remove_rows["qwen-intl"].description == rows["qwen-intl"].description
 
 
+def test_provider_switch_rows_hide_gateway_host_and_url_credentials(monkeypatch):
+    """The hosted gateway's host is a Supabase project ref, and a custom base URL
+    can carry a token as userinfo; neither belongs in the picker."""
+    monkeypatch.setenv("ALYSIS_CLOUD_API_URL", "https://cloud.example.invalid/api")
+    alysis_url = alysis_cloud.gateway_base_url()
+    cfg = AppConfig(model="deepseek-flash", base_url=alysis_url)
+    cfg.extra_fields = {
+        "profiles": {
+            "alysis": {"base_url": alysis_url, "default_model": "deepseek-flash"},
+            "proxy": {
+                "base_url": "https://team:s3cret-token@proxy.example.com:8443/v1",
+                "default_model": "my-model",
+            },
+        },
+        "active_profile": "alysis",
+    }
+    flow = ConfigFlow(cfg=cfg)
+    flow.choose("profile")
+    flow.choose("switch")
+    rows = {row.value: row for row in flow.screen().rows}
+
+    assert rows["alysis"].description == "active · deepseek-flash · Alysis Code gateway"
+    assert rows["proxy"].description == "my-model · proxy.example.com:8443"
+    shown = " ".join(row.description for row in rows.values())
+    assert "supabase" not in shown
+    assert "s3cret-token" not in shown
+
+
 def test_provider_add_preset_with_base_url():
     flow = ConfigFlow(cfg=AppConfig(model="x"))
     flow.choose("profile")
@@ -1043,7 +1280,7 @@ def test_provider_add_custom_cannot_overwrite_subscription_profile():
         flow.state.profiles["chatgpt-codex"],
     )
     assert preserved.auth_provider == "openai-codex"
-    assert preserved.base_url == "https://chatgpt.com/backend-api/codex"
+    assert preserved.base_url == "https://api.openai.com/v1"
 
 
 def test_provider_add_custom_rejects_empty_url():
@@ -1444,6 +1681,71 @@ def test_headless_config_can_open_on_start():
     assert transcript == []
 
 
+@pytest.mark.parametrize("save_keys", ["s", "S", "3", "\x1b[B\x1b[B\r"])
+@pytest.mark.parametrize("configured", [False, True])
+def test_headless_connected_subscription_saves_and_reloads_before_chat(
+    tmp_path, monkeypatch, subscription_auth, save_keys, configured
+):
+    _config_env(tmp_path, monkeypatch)
+    subscription_auth.connected = True
+    opened = threading.Event()
+    reloaded = threading.Event()
+    worked = threading.Event()
+    flows = []
+
+    def factory():
+        flow = ConfigFlow(cfg=_cfg_with_subscription_profile() if configured else _cfg())
+        flow.choose("execution")
+        flow.choose("delegated")
+        flow.choose("openai-codex")
+        flows.append(flow)
+        opened.set()
+        return flow
+
+    def on_saved():
+        saved = load_config()
+        assert saved.extra_fields["active_profile"] == "chatgpt-codex"
+        assert saved.model == "gpt-5.4"
+        assert "subscription_model_selection_required" not in saved.extra_fields
+        reloaded.set()
+        return ConfigReloadOutcome.APPLIED
+
+    class Session(_FakeSession):
+        def run_turn(self, text, *, cancellation_token=None):
+            assert reloaded.is_set()
+            assert text == "hello"
+            worked.set()
+            return 0
+
+    def runner(_session, text, _width):
+        if text == "/exit":
+            return "exit", "", None, None
+        return "run", "", text, {}
+
+    def feed(pipe):
+        assert opened.wait(timeout=5)
+        pipe.send_text(save_keys)
+        if not configured:
+            # Pick the subscription model, then its high reasoning effort.
+            pipe.send_text("13")
+        assert reloaded.wait(timeout=5)
+        pipe.send_text("hello\r")
+        assert worked.wait(timeout=5)
+        pipe.send_text("/exit\r")
+
+    result, _transcript = _run_live_headless(
+        feed,
+        config_flow_factory=factory,
+        open_config_on_start=True,
+        on_config_saved=on_saved,
+        session_builder=Session,
+        command_runner=runner,
+        background_turns=False,
+    )
+    assert result == "/exit"
+    assert flows[0].stage == "done" and flows[0].saved
+
+
 def test_config_input_plain_selection_backspace_cuts_and_enter_accepts(monkeypatch):
     from prompt_toolkit.application import Application as PromptToolkitApplication
     from prompt_toolkit.selection import SelectionType
@@ -1456,7 +1758,7 @@ def test_config_input_plain_selection_backspace_cuts_and_enter_accepts(monkeypat
     class InputFlow(ConfigFlow):
         def __init__(self):
             super().__init__(cfg=_cfg())
-            self.stage = "model_timeout"
+            self.stage = "request_timeout"
 
         def submit_input(self, text):
             submitted.append(text)
@@ -1622,7 +1924,10 @@ def test_mid_turn_config_saves_coalesce_reload_before_queued_turn() -> None:
     assert result == "/exit"
     assert reload_calls["n"] == 1
     assert events.index("reload") < events.index("turn:queued")
-    assert sum("running session will reload" in text for _role, text in transcript) == 2
+    assert (
+        sum("Session reload applies at your next message" in text for _role, text in transcript)
+        == 2
+    )
     assert any("could not be reloaded" in text for role, text in transcript if role == "error")
 
 

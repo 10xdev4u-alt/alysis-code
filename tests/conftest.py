@@ -22,6 +22,17 @@ from alysis_code.error_text import redact_sensitive_error_text
 from alysis_code.mcp.oauth import build_pkce_challenge
 from alysis_code.mcp.transport_stdio import live_stdio_transport_diagnostics
 
+
+@pytest.fixture
+def configured_hosted_api(monkeypatch: pytest.MonkeyPatch) -> str:
+    """Explicit deployment configuration for offline hosted-service tests."""
+    api_url = "https://hosted.example.invalid/api"
+    monkeypatch.setenv("ALYSIS_CLOUD_API_URL", api_url)
+    for name in ("ALYSIS_GATEWAY_URL", "ALYSIS_SUPABASE_URL", "ALYSIS_CLOUD_PUBLIC_KEY"):
+        monkeypatch.delenv(name, raising=False)
+    return api_url
+
+
 _FORGE_EXECUTION_TEST_FILES = {
     "test_forge_exec.py",
     "test_forge_swarm.py",
@@ -35,6 +46,19 @@ _FORGE_WATCHDOG_LOCK_SCAN_LIMIT = 25
 _FORGE_WATCHDOG_WORKTREE_SCAN_LIMIT = 12
 _FORGE_WATCHDOG_CHILD_PROCESS_SCAN_LIMIT = 25
 _FORGE_WATCHDOG_GIT_PROBE_TIMEOUT_S = 0.2
+
+
+@pytest.fixture
+def require_symlinks(tmp_path: Path) -> None:
+    """Run link-boundary checks wherever the host permits creating real symlinks."""
+    target = tmp_path / "symlink-probe-target"
+    target.write_text("probe", encoding="utf-8")
+    try:
+        (tmp_path / "symlink-probe").symlink_to(target)
+    except OSError as exc:
+        if getattr(exc, "winerror", None) == 1314:
+            pytest.skip("Windows symlink creation requires Developer Mode or elevated privilege")
+        raise
 
 
 @pytest.fixture(scope="session", autouse=True)

@@ -5,7 +5,6 @@ import shlex
 import subprocess
 import sys
 import threading
-import time
 from pathlib import Path
 
 import pytest
@@ -218,6 +217,18 @@ def test_shell_wait_tool_returns_output_and_preserves_cursor(
         assert result["timed_out"] is False
         assert [line["text"] for line in result["lines"]] == ["ready\n"]
         assert result["next_seq"] >= 1
+        quiet = session.tools["shell_wait"].run(
+            {"process_id": started["process_id"], "wait_seconds": 0.02}
+        )
+        assert quiet["lines"] == []
+        assert quiet["timed_out"] is True
+        assert quiet["meaningful_progress"] is False
+        assert quiet["wake_reason"] == "interval_elapsed"
+        assert quiet["since"] == result["next_seq"]
+        replay = session.tools["shell_wait"].run(
+            {"process_id": started["process_id"], "since": 0, "wait_seconds": 0}
+        )
+        assert [line["text"] for line in replay["lines"]] == ["ready\n"]
     finally:
         session.close()
 
@@ -313,6 +324,68 @@ def test_shell_wait_deadline_clamps_wait(
         session.close()
 
 
+def test_shell_wait_accepts_long_wait_and_returns_early_on_exit(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    # A large wait_seconds must be accepted (not rejected, and not silently
+    # capped to the old 60s ceiling) and must still return the instant the
+    # process exits, so a slow build costs a single wait rather than a poll
+    # loop. auto_exit makes the fake report "exited" immediately, so a 600s
+    # request returns at once and the call cannot actually block the test.
+    session = _session_with_runner(
+        monkeypatch,
+        tmp_path,
+        _FakeBackgroundRunner(stdout_text="done\n", auto_exit=True),
+    )
+    try:
+        started = session.tools["shell_background"].run({"cmd": "fake"})
+        result = session.tools["shell_wait"].run(
+            {
+                "process_id": started["process_id"],
+                "since": 0,
+                "until": "process_exited",
+                "wait_seconds": 600,
+            }
+        )
+
+        assert result["timed_out"] is False
+        assert result["status"] == "exited"
+        # No deadline in this session, so the full request survives coercion
+        # (the old ceiling would have reported 60.0 here).
+        assert result["wait_seconds_requested"] == 600
+        assert result["wait_seconds_effective"] == 600.0
+    finally:
+        session.close()
+
+
+def test_shell_wait_seconds_capped_at_ceiling(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    # Above the ceiling the request is capped, not rejected: the tool stays
+    # usable and the wait is simply bounded.
+    session = _session_with_runner(
+        monkeypatch,
+        tmp_path,
+        _FakeBackgroundRunner(stdout_text="done\n", auto_exit=True),
+    )
+    try:
+        started = session.tools["shell_background"].run({"cmd": "fake"})
+        result = session.tools["shell_wait"].run(
+            {
+                "process_id": started["process_id"],
+                "since": 0,
+                "until": "process_exited",
+                "wait_seconds": 5000,
+            }
+        )
+
+        assert result["wait_seconds_effective"] == 900.0
+    finally:
+        session.close()
+
+
 def test_shell_output_existing_callers_remain_immediate(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -325,13 +398,14 @@ def test_shell_output_existing_callers_remain_immediate(
     try:
         started = session.tools["shell_background"].run({"cmd": "fake"})
         result = session.tools["shell_output"].run({"process_id": started["process_id"]})
-        for _ in range(50):
-            if result["lines"]:
-                break
-            time.sleep(0.01)
-            result = session.tools["shell_output"].run({"process_id": started["process_id"]})
 
         assert "waited" not in result
+        # The immediate snapshot can race the output reader. Wait separately
+        # for the line without changing shell_output's nonblocking behavior.
+        if not result["lines"]:
+            result = session.tools["shell_wait"].run(
+                {"process_id": started["process_id"], "since": 0, "wait_seconds": 1}
+            )
         assert [line["text"] for line in result["lines"]] == ["one\n"]
     finally:
         session.close()

@@ -114,7 +114,7 @@ params or contradictory options fails in CI instead of reaching users.
 VS Code slash aliases stay on typed protocol methods: `/clear` maps to `session.clear`, `/context`
 (with `/ctx` as an alias) maps to
 `session.context`, `/status` to `session.status`, `/feedback` to `report.create`, `/model-info`
-to `session.modelInfo`, and the IDE-only `/subagent status|on|off` aliases to
+to `session.modelInfo`, and the IDE-only `/subagents status|on|off` aliases to
 `session.subagents.*`; those bridge methods survive independently of the terminal
 chat command. `/trace` maps to
 `session.trace.*`, `/terminals` to `session.terminals.*`, and `/paste-image` to the same path-only
@@ -187,7 +187,28 @@ The bridge emits structured event envelopes derived from the existing `surface.e
 Supported event types are the existing surface event types, including `message_delta`,
 `message_end`, `tool_call_started`, `tool_call_completed`, `status_update`,
 `plan_node_updated`, `swarm_worker_state_changed`, `subagent_state_changed`, `verify_gate_result`,
-`review_gate_decision`, `error_raised`, `prompt_for_input`, and `config_form_request`.
+`review_gate_decision`, `approval_reviewed`, `error_raised`, `prompt_for_input`,
+`config_form_request`, and the opt-in reasoning events below.
+
+`reasoning_started {block_id}`, `reasoning_delta {block_id, text}` and `reasoning_ended
+{block_id}` stream the provider's reasoning display text: a safe summary (OpenAI Responses,
+Anthropic, Gemini, OpenRouter) or the provider-returned reasoning text (DeepSeek, Qwen/DashScope,
+Kimi/Moonshot, Mistral, NVIDIA, GLM and other compatible routes), the same text the terminal shows
+as `thinking…`. One block covers one provider call; a turn can have several. Encrypted reasoning
+state and signatures are never sent, payloads pass the usual secret redaction, and there is no
+reasoning record in the session log. The events are sent only for sessions created with
+`reasoning_trace: true` and only while the session's
+trace level is not `off`. At `off` the engine attaches no reasoning sink, so routes that need a
+request flag are not asked for summaries. Clients advertise support by checking
+`features.reasoning_trace` in `health`/`getCapabilities`. A block may end without
+`reasoning_ended` when a turn is cancelled, so clients should also close an open block on
+`message_end` or when the job ends.
+
+`approval_reviewed` reports an approval that the reviewer answered in `auto` ("Approve for me")
+instead of a person: `outcome` is `allow`, `deny` or `ask_person` (a normal approval
+`prompt_for_input` follows), with `subject` (the command or action), `reason`, `risk`
+(`low`/`medium`/`high`) and `approval_kind`. The decision is already final when the event
+arrives; it is for display, not for answering.
 
 Sequence numbers are monotonically increasing per bridge session surface. A new session may start at
 sequence `1` even if an older session previously reached a higher sequence, so clients must track
@@ -250,6 +271,11 @@ exact process-tree kill only if the bounded graceful attempt fails.
 
 ### session.create
 
+Optional `sandbox_profile` accepts `default`, `strict`, `warn` or `off`. It applies to the new
+session's shell and verification configuration; runtime environment policy takes precedence.
+The response includes `sandbox_mode` with the resolved shell mode. Existing sessions keep their
+policy until a new session is created.
+
 Creates an Alysis Code session bound to a workspace. Client-provided `session_id` values are optional;
 the bridge rejects duplicate active ids instead of replacing an existing session. Client-provided ids
 must be 1-128 characters and use only letters, digits, `_`, `-`, `.`, or `:`.
@@ -273,6 +299,12 @@ non-interactive mode; broad or blocked paths are rejected instead of prompting.
 
 `base_url`, when provided, must be an absolute HTTP(S) URL and must not include username, password,
 or other userinfo.
+
+Optional `reasoning_trace` (boolean, default `false`) asks for the reasoning events described in
+[Event Format](#event-format). The response
+echoes the effective value as `reasoning_trace`, and `session.trace.status` reports it as
+`reasoning_events`. `session.trace.setLevel` with `off` stops the events for later provider calls;
+`compact` or `full` resumes them.
 
 ### chat.send
 
@@ -303,7 +335,30 @@ one redacted prompt record, and `chat.queue.delete` cancels a pending prompt. Ru
 fenced leases so a stale bridge process cannot complete a prompt claimed by a replacement process.
 Pending and expired-running prompts are recovered when a retained session is resumed.
 
+### chat.steer, chat.steer.take
+
+`chat.steer` (`session_id`, `message`) adds a user message to the turn that is running now, the
+same way Enter does in the TUI. The turn reads it at its next step boundary, adds it to history as
+`[Mid-turn message from the user] <text>`, and logs `steer_message_delivered` with the text in
+`messages`; `session.resume` replays it at that position. The result reports `pending` (messages
+waiting), `dropped` (older waiting messages this call pushed out; at most 16 wait) and `truncated`
+(messages longer than 4000 characters are shortened). Without a running turn the call fails with
+`session_idle`; send the message with `chat.send` instead. While a job that is not a chat turn runs
+(Forge, code review) it fails with `session_busy`.
+
+A turn can end before it reads a message. The bridge then holds the message for the session, so
+the next turn (for example a queued `chat.send`) never reads it. `chat.steer.take` (`session_id`)
+returns held messages, oldest first, so the host can send them as a turn of their own, as the TUI
+does. A running turn's own messages stay with it. `session.clear` discards held messages.
+
+
 ### checkpoint.list, checkpoint.diff, checkpoint.revert, checkpoint.redo, checkpoint.branch
+
+Audited file and native Git reads do not initialize snapshots. Before the first tool that may
+change files, the bridge waits up to ten seconds for a restore baseline, with cancellation checks.
+If setup is pending or failed, that action is not executed (`checkpoint_unavailable`); reads remain
+available. The next request reuses a pending worker or retries failed storage. A background worker
+never attaches a baseline after tool execution has begun. The extension shows a recovery card.
 
 Successful real-session turns capture a bounded change checkpoint in Alysis Code-owned external
 storage; the workspace's own Git repository and refs are never modified. Sensitive files and files
@@ -347,6 +402,11 @@ corrupt policy fails closed.
 `permission.session.list` exposes privacy-safe ids for exact, session-only approval grants.
 `permission.session.revoke` immediately removes one such grant. It does not reveal command text or
 file-set contents, and it never converts a one-time sensitive-file approval into a reusable grant.
+The approval executor rechecks sensitive/external paths before consulting session grants. Explicit
+Ask rules require a fresh decision even if the same scope was previously approved for the session.
+Mandatory one-time approvals never create reusable grants, including when a client requests
+`allow_for_session: true`; the response reports the effective one-time decision. Policy evaluation
+errors deny the operation, and a revoked grant cannot be recreated by a delayed approval waiter.
 
 ### run.start
 
@@ -590,6 +650,8 @@ pretending compaction occurred. Provider/model failures are returned as structur
 
 ### session.resume
 
+The optional `emit_history: true` replays bounded user/assistant dialogue as `message_end` events for a cold IDE window. Resumed history is persisted in the destination log, so subsequent restarts keep the same conversation.
+
 Replays bounded retained-session log history into a live IDE session using the existing CLI resume
 helpers. `session_id` is the active live IDE session that receives the replay, and
 `target_session_id` is the retained/historical session selected by the user. Creating the live IDE
@@ -599,11 +661,16 @@ capped by the bridge. The result reports `bounded`, `history_count`, `history_co
 `resume_context_loaded`, `resume_context_skipped_reason`, and `source:
 "retained_session_log_replay"`. When the retained history exceeds `max_messages`, the bridge skips
 the auxiliary resume-context summary so it cannot reintroduce unbounded history into model context.
-Clients must not replay terminal output to simulate a resume.
+Workspace verification evidence is restored into a fresh live runtime. Saved objective
+records are ignored. Clients must not replay terminal output to simulate a resume.
 
 ```json
 {"protocol_version":"1","id":"resume-1","method":"session.resume","params":{"session_id":"20260519T100000Z_abcd1234","target_session_id":"20260518T090000Z_deadbeef"}}
 ```
+
+### session.fork
+
+Copies dialogue from a live `source_session_id` into a fresh `session_id`. Both sessions must be trusted, idle, and belong to different worktrees of the same Git repository. Returns `session_id`, `source_session_id`, and `history_count`. Transfer is limited to 200 text messages and 256,000 UTF-8 bytes; messages are redacted before persistence and emitted as `message_end` events. Destination startup instructions remain authoritative. Tool calls/results, approvals, queued jobs, browser ownership, and checkpoint lineage are not transferred. A nonempty or already-forked destination is rejected. The source conversation remains intact.
 
 ### session.images.list
 
@@ -642,6 +709,15 @@ Changes the live bridge session mode to `readonly`, `review`, or `auto` and retu
 {"protocol_version":"1","id":"mode-1","method":"session.setMode","params":{"session_id":"20260519T100000Z_abcd1234","mode":"readonly"}}
 ```
 
+### session.setProfile
+
+Switch an idle conversation and the saved default to a configured provider. Requires
+`session_id`, profile `name`, and `workspace_trusted=true`; optional `model` also
+updates that profile's default model. The method replaces protocol-specific clients
+and credentials while preserving history, workspace, and permissions. A running turn
+returns `session_busy`. Configuration or persistence failures keep the prior live
+provider. Clients must check method support before offering a live provider switch.
+
 ### session.setModel
 
 Changes the live session model and optional `base_url` override. Secret-bearing URL userinfo is
@@ -650,6 +726,21 @@ rejected.
 ```json
 {"protocol_version":"1","id":"model-1","method":"session.setModel","params":{"session_id":"20260519T100000Z_abcd1234","model":"gpt-4o-mini"}}
 ```
+
+### session.fork
+
+Copies user and assistant dialogue from `source_session_id` into the fresh target
+`session_id`. Both sessions must be trusted, idle, and in different worktrees of
+the same repository. Approvals, tool state, and checkpoints are not copied.
+
+### session.setProfile
+
+Switches an idle, trusted live session to the saved provider profile named by
+`name`, with an optional `model` override. The request requires `session_id`.
+It preserves the conversation, workspace, permissions, and budgets, rebuilds the
+provider clients, persists the active profile, and returns session status. An
+unknown profile or active task is rejected; a failed configuration update restores
+the previous live clients.
 
 ### session.personas.list
 
@@ -669,6 +760,14 @@ execution mode, never raise it, and a write-scoped persona runs at review at mos
 task is running (`persona_change_busy`), for unknown names (`invalid_persona`), and when persona
 modes are disabled (`persona_modes_disabled`). A successful change emits `persona_changed`; setting
 the already-active persona returns `changed:false` and emits nothing.
+
+A new session starts on the persona `alysis chat` would start it on. When its log already records a
+persona (a session created with the `session_id` of an existing chat), that persona is applied
+again, as `/resume` does, and `session.personas.list` reports `active_source: "resume"`. Otherwise
+the configured `default_persona` is applied. Either way the persona's mode, write scope and model
+role are in effect before `session.create` answers, its `mode` is the narrowed mode, and a
+`persona_changed` event may arrive before that answer. `session.resume` from another session
+applies that session's persona the same way, unless a task is running.
 
 ```json
 {"protocol_version":"1","id":"persona-1","method":"session.persona.set","params":{"session_id":"20260519T100000Z_abcd1234","persona":"architect"}}
@@ -1670,8 +1769,8 @@ Regenerates the active persisted Forge plan through the typed planner adapter. I
 `changed`, redacted `summary`, `warnings`, validation metadata, `redacted: true`, and
 `secret_values_included: false`. A stale `expected_revision` returns a structured
 `stale_plan_revision` error instead of overwriting newer plan state. This is the IDE route for
-Forge-context `/plan` regeneration via `/plan regenerate` and `/forge plan regenerate`; global
-`/plan <instruction>` remains new plan creation. The method does not expose Forge swarm, broad
+Forge-context plan regeneration via `/forge plan regenerate`;
+`/forge plan <instruction>` remains new plan creation. The method does not expose Forge swarm, broad
 execution, auto/fullaccess execution, terminal scraping, or arbitrary shell execution.
 
 The bridge runs the planner outside its dispatch state lock (snapshot → compute → commit): other
@@ -2048,3 +2147,59 @@ snapshots are `null` until a runtime path records them as explicit artifacts.
 Diff protocol payloads are review previews, so the bridge applies the same protocol secret
 redaction used for other responses and events. The underlying Forge artifact on disk is not modified
 by preview redaction.
+
+## Composer catalog and explicit skills
+
+`commands.list` is a read-only management method. With `mode: "chat"` (default)
+it returns `commands: [{name, usage, description}]` from the CLI slash command
+catalog. `mode: "forge"` additionally includes Forge commands. Hosts must expose
+only entries they can execute or map to a native UI action; this endpoint does
+not execute terminal commands.
+
+`skill.list` and `skill.info` include `available` for each skill: lifecycle-enabled,
+allowed by the effective plugin activation and existing workspace trust, and enabled
+in configuration. Reading the catalog never grants trust. `enabled` continues to
+describe the skill lifecycle setting.
+
+`skill.list` additionally returns the effective configuration's `skills_enabled`
+flag. Existing entry `enabled` fields continue to describe lifecycle state.
+
+The capability `features.explicit_skill_invocation` advertises version 1,
+field `skill`, and scope `turn`. Ordinary `chat.send` accepts:
+
+```json
+{"session_id":"example","message":"The prepared chat instruction","skill":{"name":"code-review","arguments":"Review these changes"}}
+```
+
+The engine resolves the name or alias against the session's effective,
+plugin-filtered skill registry and uses the same bounded context builder as CLI
+`/skill`. Arguments are the current user task, without host-added history or
+attachments. Skill text is never accepted from the renderer. Missing, disabled,
+and sensitive host-context selections fail before enqueueing. The normalized
+selection is part of durable prompt identity and is resolved again at execution;
+it contributes ephemeral context to that turn only. `skill_invoke` activity names
+the selected skill. Hosts with kept sessions should refresh discovery before an
+explicit invocation when local skills may have changed.
+
+
+## Host integration additions in 0.15
+
+These methods require a compatible host and negotiated capabilities. Their
+presence does not mean that every editor exposes a control for them.
+
+- `agents.list` returns the effective subagent and role model settings.
+- `feedback.prepare` builds a redacted report for review. `feedback.send` sends
+  the reviewed report ID; diagnostics are optional.
+- `browser_start.respond`, `computer.respond`, and `task_budget.respond` return
+  host decisions for the matching active operation. Nonces and expiry checks
+  bind responses to their session and job.
+- `host.action.dispatched` records dispatch using the host action ID, workspace
+  fence, and capability fingerprint. Stale or duplicate receipts are rejected.
+- `session.userQuestions.get` reads questions for a session and job.
+  `session.userQuestions.answer` submits answers for a request ID, and
+  `session.userQuestions.touch` keeps an active question request alive.
+  Responses for an ended or cancelled job are rejected.
+
+The VS Code typed client supports subagent settings queries and feedback calls.
+Computer Use, browser-start consent, task budgets, dispatch receipts, and the
+structured user-question UI require a host that implements those interfaces.

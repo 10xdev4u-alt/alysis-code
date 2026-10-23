@@ -221,11 +221,6 @@ def _pick_source(
     """
     resolved_env_name = env_name
     raw_env = _clean_text(environ.get(env_name))
-    if not raw_env and env_name.startswith("ALYSIS_"):
-        legacy_env_name = "SYLLIPTOR_" + env_name.removeprefix("ALYSIS_")
-        raw_env = _clean_text(environ.get(legacy_env_name))
-        if raw_env:
-            resolved_env_name = legacy_env_name
     if raw_env:
         return raw_env, f"env:{resolved_env_name}"
     if config_key in config_values:
@@ -639,7 +634,15 @@ def fingerprint_drift_payload(calls: Any) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 CONFIG_SNAPSHOT_EVENT = "config_snapshot"
-CONFIG_SNAPSHOT_SCHEMA_VERSION = 1
+# Version 2 adds the ``effective`` section: values the session will actually
+# enforce, resolved through their full precedence chain (CLI/env/config/
+# default), each paired with the source that won. Version 1 recorded only the
+# raw config dump, and a reader who took ``config.llm_timeout_s`` as the
+# enforced timeout got the unset field default while an environment override
+# silently governed the run -- an 89-task campaign was misdiagnosed exactly
+# that way. The raw dump stays, unchanged, for drift comparison; the
+# ``effective`` section answers the question readers were actually asking.
+CONFIG_SNAPSHOT_SCHEMA_VERSION = 2
 
 #: Config/env key names whose *value* is masked structurally, before any
 #: text-level redaction. Exact names first so that ordinary settings which
@@ -750,12 +753,20 @@ def config_snapshot_payload(
     sampling: SamplingSettings | None = None,
     response_header_allowlist: ResponseHeaderAllowlist | None = None,
     environ: Mapping[str, str] | None = None,
+    effective_values: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the once-per-run ``config_snapshot`` session-log event payload.
 
     Takes an already-dumped config mapping (``AppConfig.model_dump()``) rather
     than the model itself, which keeps this module free of pydantic and lets
     the tests exercise it in a bare interpreter.
+
+    ``effective_values`` carries settings as the session will actually enforce
+    them, resolved through their full precedence chain, each ideally paired
+    with a ``*_source`` key naming the layer that won. It is the caller's
+    statement of enforcement, recorded verbatim (after the same secret
+    scrubbing as the config dump): this module cannot re-derive precedence
+    without importing the config machinery it deliberately stays free of.
     """
     allowlist = (
         DEFAULT_RESPONSE_HEADER_ALLOWLIST
@@ -770,5 +781,6 @@ def config_snapshot_payload(
         "sampling": effective_sampling.session_event_payload(),
         "response_header_allowlist": allowlist.describe(),
         "config": scrub_config_values(dict(config_values or {})),
+        "effective": scrub_config_values(dict(effective_values or {})),
         "environment": snapshot_environment(environ=environ),
     }
