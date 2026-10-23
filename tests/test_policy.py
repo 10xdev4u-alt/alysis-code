@@ -55,7 +55,7 @@ def test_policy_blocks_rm_indirection_and_expansion_variants(cmd: str) -> None:
         "find . -exec rm {} +",
         "python -c 'import shutil; shutil.rmtree(\"/\")'",
         "perl -e unlink",
-        "shred -u secrets.txt",
+        "shred -u ordinary.txt",
         "mv ledger.db /dev/null",
         # Permission and resource attacks outside the pattern lists.
         "chmod -R 777 ~",
@@ -75,3 +75,9 @@ def test_policy_advisory_scope_documents_ungated_shapes(cmd: str) -> None:
     d = evaluate_shell_command(cmd)
     assert d.allowed is True
     assert d.needs_confirm is False
+
+
+def test_policy_credential_file_guard_applies_to_ungated_deleters() -> None:
+    decision = evaluate_shell_command("shred -u secrets.txt")
+    assert decision.allowed is True
+    assert decision.needs_confirm is True
